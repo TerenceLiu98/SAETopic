@@ -1,0 +1,76 @@
+[build-system]
+requires = ["hatchling >= 1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "saetopic"
+version = "0.1.0"
+description = "BERTopic-style topic modeling with sparse autoencoder topic atoms"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [
+    {name = "SAETopic contributors"},
+]
+keywords = ["topic-modeling", "nlp", "sparse-autoencoder", "bertopic"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "torch",
+    "sentence-transformers",
+    "pandas",
+    "huggingface-hub",
+    "safetensors",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+viz = ["plotly"]
+train = ["datasets", "accelerate"]
+dev = ["pytest", "ruff", "mypy", "pytest-cov"]
+all = ["plotly", "datasets", "accelerate"]
+
+[project.scripts]
+saetopic = "saetopic.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/yourusername/saetopic"
+Documentation = "https://github.com/yourusername/saetopic#readme"
+Repository = "https://github.com/yourusername/saetopic"
+"Bug Tracker" = "https://github.com/yourusername/saetopic/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/saetopic"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["saetopic"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
