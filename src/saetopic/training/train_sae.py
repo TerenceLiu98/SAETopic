@@ -8,6 +8,7 @@ for training SAE models on embedding datasets.
 from __future__ import annotations
 
 import json
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -818,61 +819,127 @@ def compute_and_save_embeddings(
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be greater than 0")
 
-    all_embeddings = []
     n_total = 0
     dim = None
     batch_count = 0
+    chunk_arrays = []
+    chunk_paths: list[tuple[Path, int]] = []
+    chunk_pending = 0
+    chunk_index = 0
 
     print(f"Computing embeddings and saving to {output_path}")
     print("Note: This may take a while for large datasets...")
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TimeRemainingColumn(),
-    ) as progress:
-        task = progress.add_task(
-            "[cyan]Computing embeddings...", total=None
-        )
+    total_samples = getattr(dataset, "max_samples", None)
 
-        for batch in dataset:
-            if dim is None:
-                dim = batch.shape[1]
+    with tempfile.TemporaryDirectory(
+        prefix=f".{output_path.stem}_chunks_",
+        dir=output_path.parent,
+    ) as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
 
-            # CRITICAL: Move to CPU immediately to avoid GPU memory leak
-            if batch.device.type != "cpu":
-                batch = batch.cpu()
+        def flush_chunk() -> None:
+            nonlocal chunk_arrays, chunk_index, chunk_pending
 
-            all_embeddings.append(batch.numpy())
-            n_total += batch.shape[0]
-            batch_count += 1
+            if not chunk_arrays:
+                return
 
-            # Progress update
-            progress.update(
-                task,
-                completed=n_total,
-                total=getattr(dataset, "max_samples", None),
+            chunk = np.concatenate(chunk_arrays, axis=0)
+            chunk_path = temp_dir / f"chunk_{chunk_index:06d}.npy"
+            np.save(chunk_path, chunk)
+            chunk_paths.append((chunk_path, chunk.shape[0]))
+
+            chunk_arrays = []
+            chunk_pending = 0
+            chunk_index += 1
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TextColumn("• {task.fields[remaining]} remaining"),
+            TimeRemainingColumn(),
+        ) as progress:
+            task = progress.add_task(
+                "[cyan]Computing embeddings...",
+                total=total_samples,
+                remaining="unknown",
             )
 
-            # Print progress periodically
-            if batch_count % 10 == 0:
-                progress.refresh()
+            for batch in dataset:
+                if dim is None:
+                    dim = batch.shape[1]
 
-            # Clear GPU cache periodically to prevent memory buildup
-            if batch_count % 100 == 0:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # CRITICAL: Move to CPU immediately to avoid GPU memory leak
+                if batch.device.type != "cpu":
+                    batch = batch.cpu()
 
-    # Concatenate all embeddings and save
-    print("Concatenating embeddings...")
-    final_embeddings = np.concatenate(all_embeddings, axis=0)
-    np.save(output_path, final_embeddings)
+                batch_np = batch.numpy()
+                batch_start = 0
+                while batch_start < batch_np.shape[0]:
+                    remaining_space = chunk_size - chunk_pending
+                    batch_end = min(batch_start + remaining_space, batch_np.shape[0])
 
-    print(f"[green]✓[/green] Saved {n_total} embeddings ({final_embeddings.shape}) to {output_path}")
+                    chunk_arrays.append(batch_np[batch_start:batch_end].copy())
+                    chunk_pending += batch_end - batch_start
+                    batch_start = batch_end
+
+                    if chunk_pending >= chunk_size:
+                        flush_chunk()
+
+                n_total += batch.shape[0]
+                batch_count += 1
+
+                # Progress update
+                if total_samples is None:
+                    remaining = "unknown"
+                else:
+                    remaining = f"{max(total_samples - n_total, 0):,}"
+
+                progress.update(
+                    task,
+                    completed=n_total,
+                    remaining=remaining,
+                )
+
+                # Print progress periodically
+                if batch_count % 10 == 0:
+                    progress.refresh()
+
+                # Clear GPU cache periodically to prevent memory buildup
+                if batch_count % 100 == 0:
+                    import torch
+
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+        flush_chunk()
+
+        if dim is None:
+            raise ValueError("No embeddings were produced from the dataset")
+
+        print("Writing final embeddings file...")
+        final_embeddings = np.lib.format.open_memmap(
+            output_path,
+            mode="w+",
+            dtype=np.float32,
+            shape=(n_total, dim),
+        )
+
+        offset = 0
+        for chunk_path, n_chunk in chunk_paths:
+            chunk = np.load(chunk_path, mmap_mode="r")
+            final_embeddings[offset : offset + n_chunk] = chunk
+            offset += n_chunk
+
+        final_embeddings.flush()
+        del final_embeddings
+
+    print(f"[green]✓[/green] Saved {n_total} embeddings ({(n_total, dim)}) to {output_path}")
 
     return n_total, dim
 
