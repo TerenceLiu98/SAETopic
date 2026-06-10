@@ -33,7 +33,7 @@ dependencies = [
     "pandas",
     "huggingface-hub",
     "safetensors",
-    "tqdm",
+    "rich",
 ]
 
 [project.optional-dependencies]
@@ -44,6 +44,7 @@ all = ["plotly", "datasets", "accelerate"]
 
 [project.scripts]
 saetopic = "saetopic.cli:main"
+saetopic-train = "saetopic.training.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/yourusername/saetopic"
