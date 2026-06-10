@@ -402,5 +402,4 @@ def create_streaming_dataset(
         buffer_size=buffer_size,
         embedding_batch_size=embedding_batch_size,
         max_samples=max_samples,
-        task=task,
     )

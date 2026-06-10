@@ -140,7 +140,7 @@ trainer = train_sae(
 )
 
 
-## test
+## testing spec
 # PYTHONPATH=./src python
 from datasets import load_dataset
 from sentence_transformers import SentenceTransformer
@@ -149,28 +149,40 @@ from saetopic.training.train_sae import TrainingConfig
 import torch
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 1. 加载 embedder
-embedder = SentenceTransformer("jinaai/jina-embeddings-v5-text-small", 
+# 1. load embedder
+embedder = SentenceTransformer("jinaai/jina-embeddings-v5-text-nano",
     trust_remote_code=True,
     device=device,
-    model_kwargs={"dtype": torch.bfloat16})
+    model_kwargs={"dtype": torch.bfloat16} if device.type == "cuda" else {},
+    truncate_dim=128          #For mathyoshka embedding, please check: https://sbert.net/examples/sentence_transformer/training/matryoshka/README.html#inference
+)
 
-# 2. 创建流式数据集
+# 2. create streaming dataset
 streaming_dataset = create_streaming_dataset(
     dataset_name="HuggingFaceFW/finewiki",
     split="train",
     embedder=embedder,
-    buffer_size=500,
-    max_samples=1000,
+    buffer_size=1000,         
+    embedding_batch_size=32,  
+    max_samples=5000,
 )
 
-# 3. 训练
+# 3. Training Config
 config = TrainingConfig(
-    input_dim=1024,
-    expansion_factor=32,
-    top_k=32,
-    n_epochs=100,
-    output_dir="/home/jovyan/helloworld-datavol-1/SAETopic/checkpoints/jina-v5-sae-small-finewiki",
+    input_dim=128,            # same as the truncate_dim or model's dim
+    expansion_factor=4,       
+    top_k=16,
+    architecture="batch_topk",
+    learning_rate=1e-4,
+    batch_size=32,            
+    n_epochs=1, 
+    device="auto",
+    seed=42,
+    save_frequency=5,
+    output_dir="/home/jovyan/helloworld-datavol-1/SAETopic/checkpoints/jina-v5-nano-test",
+    checkpoint_name="jina-v5-sae-nano-test",
+    dataset_name="HuggingFaceFW/finewiki",
+    dataset_license="CC-BY-SA 4.0 / Apache 2.0",
 )
 
 trainer = train_sae(dataset=streaming_dataset, config=config)

@@ -300,7 +300,6 @@ class SAETrainer:
             TaskProgressColumn(show_speed=True),
             TimeRemainingColumn(),
             TextColumn("• loss: {task.fields[loss]}"),
-            console=None,  # Use default console
         ) as progress:
             task = progress.add_task(
                 f"[cyan]Epoch {epoch}",
@@ -498,11 +497,9 @@ class SAETrainer:
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
-                BarColumn(show_eta=False),
+                BarColumn(),
                 TaskProgressColumn(show_speed=True),
                 TextColumn("• loss: {task.fields[loss]}"),
-                TimeRemainingColumn(),
-                console=None,
             ) as progress:
                 task = progress.add_task(
                     f"[cyan]Epoch {epoch} (streaming)",
@@ -746,9 +743,13 @@ def train_sae(
 
         dataset = EmbeddingDataset.from_file(embeddings_path)
 
-    # Update input_dim from dataset if not set
-    if config.input_dim == 1024 and hasattr(dataset, "embedding_dim"):
-        config.input_dim = dataset.embedding_dim
+    # Auto-detect and validate input_dim from dataset
+    if hasattr(dataset, "embedding_dim"):
+        actual_dim = dataset.embedding_dim
+        if config.input_dim != actual_dim:
+            print(f"[yellow]Warning: config.input_dim={config.input_dim} but detected {actual_dim} from dataset. Using {actual_dim}.[/yellow]")
+            config.input_dim = actual_dim
+        print(f"Detected embedding dim: {config.input_dim}")
 
     # Create model
     from saetopic.sae.modules import create_sae

@@ -20,12 +20,14 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # Load embedding model
-# Note: jina-embeddings-v5-text-small is smaller and faster for testing
+# Note: jina-embeddings-v5-text-nano is fastest for testing
 # For production, use jinaai/jina-embeddings-v5-text-small
+model_kwargs = {"dtype": torch.bfloat16} if device.type == "cuda" else {}
 embedder = SentenceTransformer(
-    "jinaai/jina-embeddings-v5-text-small",
+    "jinaai/jina-embeddings-v5-text-nano",
     trust_remote_code=True,
     device=device,
+    model_kwargs=model_kwargs,
 )
 
 # Create streaming dataset
@@ -34,27 +36,27 @@ streaming_dataset = create_streaming_dataset(
     split="train",
     embedder=embedder,
     text_column="text",
-    buffer_size=50000,  # Shuffle buffer size
+    buffer_size=10000,  # Shuffle buffer size
     embedding_batch_size=256,  # Batch size for encoding
-    max_samples=500000,  # Limit samples for testing (None for unlimited)
+    max_samples=50000,  # 50k samples for testing (~5-10 minutes)
 )
 
 print(f"Streaming dataset created (embedding_dim will be detected on first batch)")
 
 # Create training config
 config = TrainingConfig(
-    input_dim=1024,  # Will be auto-detected from embedder
-    expansion_factor=32,
-    top_k=32,
+    input_dim=768,  # nano model is 768-dim (will be auto-detected)
+    expansion_factor=16,  # 768 * 16 = 12288 features
+    top_k=16,
     architecture="batch_topk",
     learning_rate=1e-4,
     batch_size=256,
-    n_epochs=5,  # Fewer epochs for testing
+    n_epochs=5,  # Quick test
     device="auto",
     seed=42,
-    save_frequency=2,
-    output_dir="checkpoints/jina-v5-sae-streaming",
-    checkpoint_name="jina-v5-sae-small",
+    save_frequency=5,  # Save only at end
+    output_dir="checkpoints/jina-v5-sae-nano-test",
+    checkpoint_name="jina-v5-sae-nano-test",
     dataset_name="HuggingFaceFW/finewiki",
     dataset_license="CC-BY-SA 4.0 / Apache 2.0",
 )
@@ -88,9 +90,10 @@ streaming_dataset = StreamingEmbeddingDataset(
     embedder=embedder,
     text_column="text",
     buffer_size=10000,  # Additional buffer after HF shuffle
-    embedding_batch_size=128,
+    embedding_batch_size=256,  # Larger batch for efficiency
     normalize=True,
-    max_samples=100000,  # Limit for testing
+    max_samples=50000,  # 50k for testing (~5-10 minutes)
+    task="clustering",  # Required for Jina v5
 )
 
 # Train

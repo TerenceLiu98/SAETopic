@@ -283,8 +283,8 @@ class BatchTopKSAE(TopKSAE):
         # Auxiliary loss: encourage uniform feature usage
         # Measures how evenly features are activated across the batch
         feature_usage = (f > 0).float().sum(dim=0)  # (n_features,)
-        target_usage = self.top_k
-        aux_loss = F.mse_loss(feature_usage, torch.full_like(feature_usage, target_usage.float()))
+        target_usage = float(self.top_k)
+        aux_loss = F.mse_loss(feature_usage, torch.full_like(feature_usage, target_usage))
 
         # Total loss
         total_loss = (
