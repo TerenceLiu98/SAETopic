@@ -171,7 +171,10 @@ class StreamingEmbeddingDataset:
     buffer_size : int, default=10000
         Number of samples to buffer for shuffling
     embedding_batch_size : int, default=256
-        Batch size for embedding computation
+        Number of texts to accumulate before yielding embeddings
+    encode_batch_size : int, default=32
+        Internal batch size for embedder.encode() (to avoid OOM)
+        Set lower if you get CUDA OOM errors
     normalize : bool, default=True
         Whether to L2-normalize embeddings
     seed : int, default=42
@@ -198,7 +201,8 @@ class StreamingEmbeddingDataset:
     ...     hf_ds,
     ...     embedder,
     ...     buffer_size=50000,
-    ...     task="clustering",  # Required for Jina v5
+    ...     encode_batch_size=32,  # Lower if OOM
+    ...     task="clustering",
     ... )
     >>>
     >>> # Use in training (iterator mode)
@@ -214,6 +218,7 @@ class StreamingEmbeddingDataset:
         text_column: str = "text",
         buffer_size: int = 10000,
         embedding_batch_size: int = 256,
+        encode_batch_size: int = 32,
         normalize: bool = True,
         seed: int = 42,
         max_samples: int | None = None,
@@ -224,6 +229,7 @@ class StreamingEmbeddingDataset:
         self.text_column = text_column
         self.buffer_size = buffer_size
         self.embedding_batch_size = embedding_batch_size
+        self.encode_batch_size = encode_batch_size
         self.normalize = normalize
         self.max_samples = max_samples
         self.seed = seed
@@ -286,7 +292,7 @@ class StreamingEmbeddingDataset:
                     # Encode
                     embeddings = self.embedder.encode(
                         batch_texts,
-                        batch_size=len(batch_texts),
+                        batch_size=self.encode_batch_size,
                         task=self.task,
                         show_progress_bar=False,
                     )
@@ -309,7 +315,7 @@ class StreamingEmbeddingDataset:
                 batch_texts = texts_buffer[i : i + self.embedding_batch_size]
                 embeddings = self.embedder.encode(
                     batch_texts,
-                    batch_size=len(batch_texts),
+                    batch_size=self.encode_batch_size,
                     show_progress_bar=False,
                 )
                 embeddings = torch.from_numpy(embeddings).float()
@@ -321,11 +327,13 @@ class StreamingEmbeddingDataset:
 
 def create_streaming_dataset(
     dataset_name: str = "HuggingFaceFW/finewiki",
+    subset: str | None = None,
     split: str = "train",
     embedder=None,
     text_column: str = "text",
     buffer_size: int = 10000,
     embedding_batch_size: int = 256,
+    encode_batch_size: int = 32,
     streaming: bool = True,
     max_samples: int | None = None,
     task: str = "clustering",
@@ -341,6 +349,9 @@ def create_streaming_dataset(
     ----------
     dataset_name : str, default="HuggingFaceFW/finewiki"
         HuggingFace dataset name
+    subset : str or None, default=None
+        Dataset subset/config name (e.g., "en_us" for google/fleurs)
+        See: https://huggingface.co/docs/datasets/loading#subset-selection
     split : str, default="train"
         Dataset split
     embedder : callable
@@ -350,7 +361,10 @@ def create_streaming_dataset(
     buffer_size : int, default=10000
         Shuffle buffer size
     embedding_batch_size : int, default=256
-        Batch size for embedding computation
+        Number of texts to accumulate before yielding embeddings
+    encode_batch_size : int, default=32
+        Internal batch size for embedder.encode() (to avoid OOM)
+        Set lower if you get CUDA OOM errors
     streaming : bool, default=True
         Use streaming mode (set to False for small datasets)
     max_samples : int or None, default=None
@@ -370,11 +384,18 @@ def create_streaming_dataset(
     >>> from sentence_transformers import SentenceTransformer
     >>> embedder = SentenceTransformer("jinaai/jina-embeddings-v5-text-small")
     >>>
+    >>> # Basic usage
     >>> dataset = create_streaming_dataset(
     ...     embedder=embedder,
     ...     buffer_size=50000,
     ...     max_samples=1000000,
-    ...     task="clustering",  # Required for Jina v5
+    ... )
+    >>>
+    >>> # With subset (for datasets with multiple configs)
+    >>> dataset = create_streaming_dataset(
+    ...     dataset_name="google/fleurs",
+    ...     subset="en_us",
+    ...     embedder=embedder,
     ... )
     """
     try:
@@ -388,8 +409,13 @@ def create_streaming_dataset(
         raise ValueError("embedder must be provided")
 
     # Load HF dataset
+    # Note: subset is passed as the second positional argument to load_dataset
+    load_args = [dataset_name]
+    if subset is not None:
+        load_args.append(subset)
+
     hf_dataset = load_dataset(
-        dataset_name,
+        *load_args,
         split=split,
         streaming=streaming,
         **hf_kwargs,
@@ -401,5 +427,6 @@ def create_streaming_dataset(
         text_column=text_column,
         buffer_size=buffer_size,
         embedding_batch_size=embedding_batch_size,
+        encode_batch_size=encode_batch_size,
         max_samples=max_samples,
     )

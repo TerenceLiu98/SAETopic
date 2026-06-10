@@ -10,7 +10,13 @@ from saetopic.training.data import (
     create_streaming_dataset,
     load_embeddings_from_hf,
 )
-from saetopic.training.train_sae import SAEOptimizer, SAETrainer, train_sae
+from saetopic.training.train_sae import (
+    SAEOptimizer,
+    SAETrainer,
+    compute_and_save_embeddings,
+    save_embeddings,
+    train_sae,
+)
 
 __all__ = [
     "SAETrainer",
@@ -20,4 +26,6 @@ __all__ = [
     "StreamingEmbeddingDataset",
     "create_streaming_dataset",
     "load_embeddings_from_hf",
+    "compute_and_save_embeddings",
+    "save_embeddings",
 ]

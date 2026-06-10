@@ -16,12 +16,13 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
+import numpy as np
 
 if TYPE_CHECKING:
     from torch import Tensor
 
     from saetopic.sae.modules import TopKSAE
-    from saetopic.training.data import EmbeddingDataset
+    from saetopic.training.data import EmbeddingDataset, StreamingEmbeddingDataset
 
 
 @dataclass
@@ -772,3 +773,119 @@ def train_sae(
     trainer.fit(dataset)
 
     return trainer
+
+
+def compute_and_save_embeddings(
+    dataset: StreamingEmbeddingDataset,
+    output_path: str | Path,
+    chunk_size: int = 10000,
+) -> tuple[int, int]:
+    """
+    Compute embeddings from streaming dataset and save to .npy file.
+
+    This is useful for pre-computing embeddings once and reusing them
+    for multiple training runs with different hyperparameters.
+
+    Parameters
+    ----------
+    dataset : StreamingEmbeddingDataset
+        Streaming dataset that computes embeddings on-the-fly
+    output_path : str or Path
+        Path to save embeddings (.npy or .pt)
+    chunk_size : int, default=10000
+        Number of embeddings to accumulate before saving to disk
+
+    Returns
+    -------
+    n_embeddings : int
+        Total number of embeddings computed
+    embedding_dim : int
+        Dimension of each embedding
+
+    Examples
+    --------
+    >>> from saetopic.training import create_streaming_dataset, compute_and_save_embeddings
+    >>> from sentence_transformers import SentenceTransformer
+    >>>
+    >>> embedder = SentenceTransformer("jinaai/jina-embeddings-v5-text-nano")
+    >>> dataset = create_streaming_dataset(
+    ...     dataset_name="HuggingFaceFW/finewiki",
+    ...     embedder=embedder,
+    ...     max_samples=100000,
+    ... )
+    >>> n, dim = compute_and_save_embeddings(dataset, "finewiki_embeddings.npy")
+    >>> print(f"Saved {n} embeddings of dimension {dim}")
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    all_embeddings = []
+    n_total = 0
+    dim = None
+    batch_count = 0
+
+    print(f"Computing embeddings and saving to {output_path}")
+    print("Note: This may take a while for large datasets...")
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+    ) as progress:
+        task = progress.add_task(
+            "[cyan]Computing embeddings...", total=None
+        )
+
+        for batch in dataset:
+            if dim is None:
+                dim = batch.shape[1]
+
+            # CRITICAL: Move to CPU immediately to avoid GPU memory leak
+            if batch.device.type != "cpu":
+                batch = batch.cpu()
+
+            all_embeddings.append(batch.numpy())
+            n_total += batch.shape[0]
+            batch_count += 1
+
+            # Progress update
+            progress.update(
+                task,
+                completed=n_total,
+                total=getattr(dataset, "max_samples", None),
+            )
+
+            # Print progress periodically
+            if batch_count % 10 == 0:
+                progress.refresh()
+
+            # Clear GPU cache periodically to prevent memory buildup
+            if batch_count % 100 == 0:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+    # Concatenate all embeddings and save
+    print("Concatenating embeddings...")
+    final_embeddings = np.concatenate(all_embeddings, axis=0)
+    np.save(output_path, final_embeddings)
+
+    print(f"[green]✓[/green] Saved {n_total} embeddings ({final_embeddings.shape}) to {output_path}")
+
+    return n_total, dim
+
+
+def save_embeddings(
+    streaming_dataset: StreamingEmbeddingDataset,
+    output_path: str | Path,
+    batch_size: int = 10000,
+    show_progress: bool = True,
+) -> tuple[int, int]:
+    """
+    Alias for compute_and_save_embeddings for backward compatibility.
+    """
+    return compute_and_save_embeddings(
+        streaming_dataset, output_path, chunk_size=batch_size
+    )

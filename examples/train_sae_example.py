@@ -11,17 +11,65 @@ from saetopic.training import train_sae
 from saetopic.training.train_sae import TrainingConfig
 from saetopic.training.data import EmbeddingDataset
 
-# Example 1: Train from embeddings file
+# Example 1: Complete pipeline - HuggingFace dataset → embeddings → training
 # -------------------------------------------------
-# This assumes you have pre-computed embeddings saved as .npy or .pt
+# Recommended workflow for large-scale training
 
-# Path to your embeddings file
-embeddings_path = "path/to/embeddings.npy"
+from datasets import load_dataset
+from sentence_transformers import SentenceTransformer
+from saetopic.training import train_sae, compute_and_save_embeddings
+from saetopic.training.train_sae import TrainingConfig
+import torch
 
-# Create training configuration
+# Setup
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+output_dir = "/home/jovyan/helloworld-datavol-1/SAETopic/embeddings"
+embeddings_path = f"{output_dir}/finewiki_embeddings.npy"
+
+# Step 1: Load embedding model
+# -----------------------------
+# jina-embeddings-v5-text-nano: 768-dim, fastest for testing
+# jina-embeddings-v5-text-small: 1024-dim, good balance
+# jina-embeddings-v5-text-base: 1024-dim, best quality
+embedder = SentenceTransformer(
+    "jinaai/jina-embeddings-v5-text-small",
+    trust_remote_code=True,
+    device=device,
+    model_kwargs={"dtype": torch.bfloat16} if device.type == "cuda" else {},
+)
+
+# Step 2: Load and stream HuggingFace dataset
+# --------------------------------------------
+from saetopic.training import create_streaming_dataset
+
+streaming_dataset = create_streaming_dataset(
+    dataset_name="HuggingFaceFW/finewiki",
+    split="train",
+    embedder=embedder,
+    buffer_size=10000,          # Shuffle buffer size
+    embedding_batch_size=8,    # Texts to accumulate before yielding
+    encode_batch_size=8,        # Internal batch for embedder.encode() (lower if OOM)
+    max_samples=100000,         # Adjust based on your needs
+)
+
+# Step 3: Compute and save embeddings (one-time setup)
+# -----------------------------------------------------
+# This saves embeddings to disk so you can train multiple times
+# without recomputing embeddings each run.
+n_embeddings, embedding_dim = compute_and_save_embeddings(
+    dataset=streaming_dataset,
+    output_path=embeddings_path,
+    chunk_size=10000,
+)
+print(f"Saved {n_embeddings} embeddings of dimension {embedding_dim}")
+
+# Step 4: Train SAE on saved embeddings
+# --------------------------------------
+# Now you can experiment with different hyperparameters
+# without recomputing embeddings!
 config = TrainingConfig(
-    input_dim=1024,  # Jina v5 embedding dimension
-    expansion_factor=32,  # n_features = 1024 * 32 = 32768
+    input_dim=embedding_dim,  # Auto-detected from saved embeddings
+    expansion_factor=32,
     top_k=32,
     architecture="batch_topk",
     learning_rate=1e-4,
@@ -35,7 +83,6 @@ config = TrainingConfig(
     dataset_license="CC-BY-SA 4.0 / Apache 2.0",
 )
 
-# Train the model
 trainer = train_sae(
     embeddings_path=embeddings_path,
     config=config,
@@ -140,49 +187,174 @@ trainer = train_sae(
 )
 
 
-## testing spec
-# PYTHONPATH=./src python
+# Example 5: Streaming embeddings from HuggingFace (no pre-computation)
+# -------------------------------------------------
+# Train an SAE without pre-computing all embeddings.
+# The embeddings are computed on-the-fly during training using HF Datasets streaming mode.
+
+import torch
 from datasets import load_dataset
 from sentence_transformers import SentenceTransformer
-from saetopic.training import create_streaming_dataset, train_sae
+from saetopic.training import create_streaming_dataset, train_sae, compute_and_save_embeddings
 from saetopic.training.train_sae import TrainingConfig
-import torch
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from saetopic.training.data import StreamingEmbeddingDataset
 
-# 1. load embedder
-embedder = SentenceTransformer("jinaai/jina-embeddings-v5-text-nano",
+# Setup device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Load embedding model
+# Note: jina-embeddings-v5-text-nano is fastest for testing
+# For production, use jinaai/jina-embeddings-v5-text-small
+model_kwargs = {"dtype": torch.bfloat16} if device.type == "cuda" else {}
+embedder = SentenceTransformer(
+    "jinaai/jina-embeddings-v5-text-nano",
     trust_remote_code=True,
     device=device,
-    model_kwargs={"dtype": torch.bfloat16} if device.type == "cuda" else {},
-    truncate_dim=128          #For mathyoshka embedding, please check: https://sbert.net/examples/sentence_transformer/training/matryoshka/README.html#inference
+    model_kwargs=model_kwargs,
 )
 
-# 2. create streaming dataset
+# Option A: Basic streaming training (simple, but slower)
+# --------------------------------------------------------
 streaming_dataset = create_streaming_dataset(
     dataset_name="HuggingFaceFW/finewiki",
     split="train",
     embedder=embedder,
-    buffer_size=1000,         
-    embedding_batch_size=32,  
-    max_samples=5000,
+    text_column="text",
+    buffer_size=10000,  # Shuffle buffer size
+    embedding_batch_size=256,  # Texts to accumulate before yielding
+    encode_batch_size=32,  # Internal batch for embedder.encode() (lower if OOM)
+    max_samples=50000,  # 50k samples for testing
 )
 
-# 3. Training Config
+print(f"Streaming dataset created (embedding_dim will be detected on first batch)")
+
 config = TrainingConfig(
-    input_dim=128,            # same as the truncate_dim or model's dim
-    expansion_factor=4,       
+    input_dim=768,  # nano model is 768-dim (will be auto-detected)
+    expansion_factor=16,
     top_k=16,
     architecture="batch_topk",
     learning_rate=1e-4,
-    batch_size=32,            
-    n_epochs=1, 
+    batch_size=256,
+    n_epochs=5,
     device="auto",
-    seed=42,
-    save_frequency=5,
-    output_dir="/home/jovyan/helloworld-datavol-1/SAETopic/checkpoints/jina-v5-nano-test",
-    checkpoint_name="jina-v5-sae-nano-test",
-    dataset_name="HuggingFaceFW/finewiki",
-    dataset_license="CC-BY-SA 4.0 / Apache 2.0",
+    output_dir="checkpoints/jina-v5-sae-nano-test",
 )
 
 trainer = train_sae(dataset=streaming_dataset, config=config)
+
+
+# Option B: Custom streaming setup (more control)
+# ------------------------------------------------
+# Load HF dataset with custom settings
+hf_ds = load_dataset(
+    "HuggingFaceFW/finewiki",
+    split="train",
+    streaming=True,
+)
+
+# Add shuffle buffer at HF level (recommended)
+# This shuffles before encoding
+hf_ds = hf_ds.shuffle(buffer_size=10000, seed=42)
+
+# Create streaming dataset
+streaming_dataset = StreamingEmbeddingDataset(
+    hf_dataset=hf_ds,
+    embedder=embedder,
+    text_column="text",
+    buffer_size=10000,
+    embedding_batch_size=256,
+    encode_batch_size=32,  # Internal batch for embedder.encode() (lower if OOM)
+    normalize=True,
+    max_samples=50000,
+    task="clustering",  # Required for Jina v5
+)
+
+
+# Option C: Save embeddings first, then train (RECOMMENDED for development)
+# --------------------------------------------------------------------------
+# This approach saves embeddings once, then you can train multiple times
+# with different hyperparameters without recomputing embeddings.
+
+streaming_dataset = create_streaming_dataset(
+    dataset_name="HuggingFaceFW/finewiki",
+    split="train",
+    embedder=embedder,
+    buffer_size=10000,
+    embedding_batch_size=256,
+    encode_batch_size=32,  # Internal batch for embedder.encode() (lower if OOM)
+    max_samples=50000,
+)
+
+# Step 1: Compute and save embeddings (do this once!)
+n_embeddings, embedding_dim = compute_and_save_embeddings(
+    dataset=streaming_dataset,
+    output_path="data/finewiki_embeddings.npy",
+    chunk_size=10000,
+)
+print(f"Saved {n_embeddings} embeddings of dimension {embedding_dim}")
+
+# Step 2: Train from saved embeddings (fast, repeatable)
+# Now you can experiment with different hyperparameters!
+config = TrainingConfig(
+    input_dim=embedding_dim,  # Auto-detected
+    expansion_factor=16,
+    top_k=16,
+    batch_size=256,  # Larger batch OK since no encoding overhead
+    n_epochs=20,  # More epochs since setup is fast
+    output_dir="checkpoints/jina-v5-sae-nano",
+)
+
+trainer = train_sae(embeddings_path="data/finewiki_embeddings.npy", config=config)
+
+
+# Tips for streaming training:
+# -------------------------------------------------
+
+"""
+1. Buffer Size:
+   - Larger buffer = better shuffling but more memory
+   - HF shuffle buffer + dataset buffer = total shuffling capacity
+   - Recommended: buffer_size >= 10000
+
+2. Batch Sizes:
+   - embedding_batch_size: for encoding (can be larger, limited by GPU/CPU)
+   - training batch_size: for SAE training (in config)
+   - They can be different!
+
+3. Memory:
+   - Streaming uses less disk space (no pre-computed embeddings)
+   - But embedder model stays in memory
+   - Use smaller embedding model (nano/small) if GPU memory is limited
+
+4. Performance:
+   - Encoding is done by SentenceTransformers on the device you specify
+   - Training is done on GPU if available
+   - For large datasets, consider encoding on GPU too for speed
+
+5. Reproducibility:
+   - Set seed for both HF shuffle and dataset
+   - Each epoch will have different order due to buffering
+   - For exact reproducibility, pre-compute and save embeddings
+
+6. Save embeddings for faster iteration:
+   - Use compute_and_save_embeddings() to pre-compute once
+   - Then train from .npy file for fast hyperparameter tuning
+"""
+
+
+# Example 6: GPU-based encoding for faster streaming
+# ----------------------------------------------------
+# If you have a powerful GPU, encode on GPU too:
+"""
+from sentence_transformers import SentenceTransformer
+
+embedder = SentenceTransformer(
+    "jinaai/jina-embeddings-v5-text-small",
+    device="cuda",
+    model_kwargs={"torch_dtype": torch.float16},  # Use half precision
+)
+
+# In StreamingEmbeddingDataset, the encode call will use GPU
+# This is much faster but requires more GPU memory
+"""
