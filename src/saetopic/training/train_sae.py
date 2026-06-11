@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader
 if TYPE_CHECKING:
     from torch import Tensor
 
-    from saetopic.sae.modules import TopKSAE
+    from saetopic.sae.modules import BatchTopKSAE, JumpReLUSAE, StandardSAE, TopKSAE
     from saetopic.training.data import (
         EmbeddingDataset,
         ShardedEmbeddingDataset,
@@ -62,7 +62,7 @@ class TrainingConfig:
     device : str
         Device for training ("auto", "cpu", "cuda", "mps")
     architecture : str
-        SAE architecture ("topk", "batch_topk")
+        SAE architecture ("standard", "jumprelu", "topk", "batch_topk")
     seed : int
         Random seed for reproducibility
     save_frequency : int
@@ -81,9 +81,12 @@ class TrainingConfig:
     n_features: int | None = None
     expansion_factor: int = 32
     top_k: int = 32
-    learning_rate: float = 1e-4
+    learning_rate: float = 1e-3
     batch_size: int = 256
     n_epochs: int = 100
+    steps: int | None = None
+    warmup_ratio: float = 0.1
+    warmup_steps: int | None = None
     device: str = "auto"
     architecture: str = "batch_topk"
     seed: int = 42
@@ -91,7 +94,10 @@ class TrainingConfig:
     log_frequency: int = 10
     recon_loss_weight: float = 1.0
     sparsity_loss_weight: float = 1.0
-    aux_loss_weight: float = 0.001
+    sparsity_warmup_steps: int | None = 2000
+    aux_loss_weight: float = 1 / 32
+    bandwidth: float = 0.001
+    target_l0: float = 20.0
 
     # Additional model parameters
     decoder_bias: bool = True
@@ -116,11 +122,20 @@ class TrainingConfig:
             "learning_rate": self.learning_rate,
             "batch_size": self.batch_size,
             "n_epochs": self.n_epochs,
+            "steps": self.steps,
+            "warmup_ratio": self.warmup_ratio,
+            "warmup_steps": self.warmup_steps,
             "architecture": self.architecture,
             "seed": self.seed,
             "decoder_bias": self.decoder_bias,
             "encoder_bias": self.encoder_bias,
             "normalization": self.normalization,
+            "recon_loss_weight": self.recon_loss_weight,
+            "sparsity_loss_weight": self.sparsity_loss_weight,
+            "sparsity_warmup_steps": self.sparsity_warmup_steps,
+            "aux_loss_weight": self.aux_loss_weight,
+            "bandwidth": self.bandwidth,
+            "target_l0": self.target_l0,
         }
 
 
@@ -146,9 +161,10 @@ class TrainingState:
     best_loss: float = float("inf")
     losses: dict[str, list[float]] = field(default_factory=dict)
 
-    def update(self, losses: dict[str, float]) -> None:
+    def update(self, losses: dict[str, float], increment_step: bool = True) -> None:
         """Update training state with new losses."""
-        self.global_step += 1
+        if increment_step:
+            self.global_step += 1
         for key, value in losses.items():
             if key not in self.losses:
                 self.losses[key] = []
@@ -162,7 +178,9 @@ class SAEOptimizer:
     """
     Optimizer wrapper for SAE training.
 
-    Handles AdamW optimizer with optional learning rate scheduling.
+    Handles the SAE-TM optimizer path: Adam, linear warmup/optional decay,
+    decoder-gradient projection, gradient clipping, and decoder unit-norm
+    maintenance.
 
     Parameters
     ----------
@@ -188,12 +206,14 @@ class SAEOptimizer:
         use_scheduler: bool = True,
         warmup_steps: int = 1000,
         total_steps: int | None = None,
+        betas: tuple[float, float] = (0.9, 0.999),
     ):
-        self.optimizer = torch.optim.AdamW(
+        del weight_decay
+        self.model = model
+        self.optimizer = torch.optim.Adam(
             model.parameters(),
             lr=learning_rate,
-            weight_decay=weight_decay,
-            betas=(0.9, 0.999),
+            betas=betas,
         )
 
         self.use_scheduler = use_scheduler
@@ -201,24 +221,39 @@ class SAEOptimizer:
         self.total_steps = total_steps if total_steps is not None else 100_000
 
         if use_scheduler:
-            # Calculate pct_start (warmup percentage), capped at 0.3 (30%)
-            pct_start = min(0.3, warmup_steps / self.total_steps) if warmup_steps else 0.1
-            if pct_start >= 1.0:
-                pct_start = 0.3  # Cap at 30% if calculation gives > 100%
+            def lr_lambda(step: int) -> float:
+                if warmup_steps and step < warmup_steps:
+                    return step / warmup_steps
+                return 1.0
 
-            self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.scheduler = torch.optim.lr_scheduler.LambdaLR(
                 self.optimizer,
-                max_lr=learning_rate,
-                total_steps=self.total_steps,
-                pct_start=pct_start,
-                anneal_strategy="cos",
+                lr_lambda=lr_lambda,
             )
 
     def step(self, loss: Tensor) -> None:
         """Perform optimizer step."""
+        from saetopic.sae.modules import (
+            remove_gradient_parallel_to_decoder_directions,
+            remove_gradient_parallel_to_decoder_rows,
+            set_decoder_norm_to_unit_norm,
+            set_decoder_rows_to_unit_norm,
+        )
+
         self.optimizer.zero_grad()
         loss.backward()
+        decoder = getattr(self.model, "decoder", None)
+        jump_decoder = getattr(self.model, "W_dec", None)
+        if jump_decoder is not None:
+            remove_gradient_parallel_to_decoder_rows(jump_decoder)
+        elif decoder is not None and getattr(decoder, "weight", None) is not None:
+            remove_gradient_parallel_to_decoder_directions(decoder.weight)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
+        if jump_decoder is not None:
+            set_decoder_rows_to_unit_norm(jump_decoder.data)
+        elif decoder is not None and getattr(decoder, "weight", None) is not None:
+            set_decoder_norm_to_unit_norm(decoder.weight.data)
 
         if self.scheduler is not None:
             self.scheduler.step()
@@ -253,7 +288,7 @@ class SAETrainer:
 
     def __init__(
         self,
-        model: "TopKSAE",
+        model: "TopKSAE | BatchTopKSAE | StandardSAE | JumpReLUSAE",
         config: TrainingConfig,
         output_dir: str | None = None,
     ):
@@ -280,6 +315,43 @@ class SAETrainer:
         torch.manual_seed(config.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(config.seed)
+
+    def _train_batch(self, batch: Tensor) -> dict[str, Tensor]:
+        """Run one SAE-TM training step."""
+        batch = batch.to(self.device)
+        initialize_decoder_bias = cast(Any, getattr(self.model, "initialize_decoder_bias", None))
+        if self.state.global_step == 0 and callable(initialize_decoder_bias):
+            initialize_decoder_bias(batch)
+
+        x_recon, h, topk_values, topk_indices = self.model.forward_sparse(batch)
+        update_threshold = cast(Any, getattr(self.model, "update_threshold", None))
+        if callable(update_threshold):
+            update_threshold(topk_values, self.state.global_step)
+
+        sparsity_loss_weight = self.config.sparsity_loss_weight
+        if self.config.architecture in {"standard", "jumprelu"} and self.config.sparsity_warmup_steps:
+            sparsity_scale = min(
+                self.state.global_step / self.config.sparsity_warmup_steps,
+                1.0,
+            )
+            sparsity_loss_weight *= sparsity_scale
+
+        loss, losses = self.model.compute_loss_sparse(
+            batch,
+            x_recon,
+            h,
+            topk_values,
+            topk_indices,
+            recon_loss_weight=self.config.recon_loss_weight,
+            sparsity_loss_weight=sparsity_loss_weight,
+            aux_loss_weight=self.config.aux_loss_weight,
+        )
+
+        assert self.optimizer is not None
+        self.optimizer.step(loss)
+        self.state.global_step += 1
+
+        return losses
 
     def train_epoch(
         self,
@@ -322,26 +394,7 @@ class SAETrainer:
             )
 
             for batch in train_loader:
-                batch = batch.to(self.device)
-
-                # Forward pass without materializing dense sparse features.
-                x_recon, h, topk_values, topk_indices = self.model.forward_sparse(batch)
-
-                # Compute loss
-                loss, losses = self.model.compute_loss_sparse(
-                    batch,
-                    x_recon,
-                    h,
-                    topk_values,
-                    topk_indices,
-                    recon_loss_weight=self.config.recon_loss_weight,
-                    sparsity_loss_weight=self.config.sparsity_loss_weight,
-                    aux_loss_weight=self.config.aux_loss_weight,
-                )
-
-                # Optimizer step
-                assert self.optimizer is not None
-                self.optimizer.step(loss)
+                losses = self._train_batch(batch)
 
                 # Update statistics
                 n_batches += 1
@@ -373,7 +426,9 @@ class SAETrainer:
             Training dataset
         """
         # Calculate total steps based on dataset type
-        if hasattr(dataset, "__len__"):
+        if self.config.steps is not None:
+            total_steps = self.config.steps
+        elif hasattr(dataset, "__len__"):
             # Standard dataset - calculate exact steps
             n_samples = len(dataset)
             steps_per_epoch = max(1, math.ceil(n_samples / self.config.batch_size))
@@ -402,11 +457,18 @@ class SAETrainer:
             # Streaming dataset without known size - use default
             total_steps = 100_000
 
+        warmup_steps = (
+            self.config.warmup_steps
+            if self.config.warmup_steps is not None
+            else int(self.config.warmup_ratio * total_steps)
+        )
         self.optimizer = SAEOptimizer(
             self.model,
             learning_rate=self.config.learning_rate,
             use_scheduler=True,
+            warmup_steps=warmup_steps,
             total_steps=total_steps,
+            betas=(0.0, 0.999) if self.config.architecture == "jumprelu" else (0.9, 0.999),
         )
 
         print(f"Total training steps: {total_steps}")
@@ -461,13 +523,16 @@ class SAETrainer:
             pin_memory=self.device.type == "cuda",
         )
 
+        if self.config.steps is not None:
+            return self._fit_standard_steps(train_loader)
+
         for epoch in range(1, self.config.n_epochs + 1):
             # Train epoch
             epoch_losses = self.train_epoch(train_loader, epoch)
 
             # Update state
             self.state.epoch = epoch
-            self.state.update(epoch_losses)
+            self.state.update(epoch_losses, increment_step=False)
 
             # Print summary
             print(f"Epoch {epoch}/{self.config.n_epochs}")
@@ -495,6 +560,55 @@ class SAETrainer:
         # Save training config and state
         self.save_metadata()
 
+        return self.state
+
+    def _fit_standard_steps(self, train_loader: DataLoader) -> TrainingState:
+        """Train with a finite DataLoader cycled to a fixed number of SAE-TM steps."""
+        assert self.config.steps is not None
+        self.model.train()
+
+        running_losses = {key: 0.0 for key in ["total", "reconstruction", "sparsity", "auxiliary"]}
+        n_batches = 0
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(show_speed=True),
+            TimeRemainingColumn(),
+            TextColumn("• loss: {task.fields[loss]}"),
+        ) as progress:
+            task = progress.add_task(
+                "[cyan]Training SAE",
+                total=self.config.steps,
+                loss="0.0000",
+            )
+
+            while self.state.global_step < self.config.steps:
+                for batch in train_loader:
+                    if self.state.global_step >= self.config.steps:
+                        break
+
+                    losses = self._train_batch(batch)
+                    n_batches += 1
+                    for key in running_losses:
+                        running_losses[key] += losses[key].item()
+
+                    avg_loss = running_losses["total"] / n_batches
+                    progress.update(task, advance=1, loss=f"{avg_loss:.6f}")
+
+                    if (
+                        self.config.save_frequency > 0
+                        and self.state.global_step % self.config.save_frequency == 0
+                    ):
+                        self.save_checkpoint(f"checkpoint_step_{self.state.global_step}")
+
+        avg_losses = {key: value / max(1, n_batches) for key, value in running_losses.items()}
+        self.state.epoch = math.ceil(self.state.global_step / max(1, len(train_loader)))
+        self.state.update(avg_losses, increment_step=False)
+
+        self.save_checkpoint("final")
+        self.save_metadata()
         return self.state
 
     def _fit_streaming(
@@ -527,6 +641,9 @@ class SAETrainer:
         if hasattr(streaming_dataset, "embedding_dim"):
             print(f"Detected embedding dim: {streaming_dataset.embedding_dim}")
 
+        if self.config.steps is not None:
+            return self._fit_streaming_steps(streaming_dataset)
+
         for epoch in range(1, self.config.n_epochs + 1):
             self.model.train()
 
@@ -557,26 +674,7 @@ class SAETrainer:
                     # Split into smaller batches for training
                     for i in range(0, batch_embeddings.shape[0], self.config.batch_size):
                         batch = batch_embeddings[i : i + self.config.batch_size]
-                        batch = batch.to(self.device)
-
-                        # Forward pass without materializing dense sparse features.
-                        x_recon, h, topk_values, topk_indices = self.model.forward_sparse(batch)
-
-                        # Compute loss
-                        loss, losses = self.model.compute_loss_sparse(
-                            batch,
-                            x_recon,
-                            h,
-                            topk_values,
-                            topk_indices,
-                            recon_loss_weight=self.config.recon_loss_weight,
-                            sparsity_loss_weight=self.config.sparsity_loss_weight,
-                            aux_loss_weight=self.config.aux_loss_weight,
-                        )
-
-                        # Optimizer step
-                        assert self.optimizer is not None
-                        self.optimizer.step(loss)
+                        losses = self._train_batch(batch)
 
                         # Update statistics
                         n_batches += 1
@@ -587,22 +685,12 @@ class SAETrainer:
                         avg_loss = epoch_losses["total"] / n_batches
                         progress.update(task, advance=1, loss=f"{avg_loss:.6f}")
 
-                        # Update feature stats for BatchTopKSAE
-                        if hasattr(self.model, "update_feature_stats"):
-                            from saetopic.sae.modules import BatchTopKSAE
-
-                            if isinstance(self.model, BatchTopKSAE):
-                                self.model.update_feature_stats_sparse(
-                                    topk_values,
-                                    topk_indices,
-                                )
-
             # Average losses
             avg_losses = {k: v / n_batches for k, v in epoch_losses.items()}
 
             # Update state
             self.state.epoch = epoch
-            self.state.update(avg_losses)
+            self.state.update(avg_losses, increment_step=False)
 
             # Print summary
             print(f"Epoch {epoch}/{self.config.n_epochs} (streaming)")
@@ -620,6 +708,74 @@ class SAETrainer:
         # Save training config and state
         self.save_metadata()
 
+        return self.state
+
+    def _fit_streaming_steps(
+        self,
+        streaming_dataset: "StreamingEmbeddingDataset",
+    ) -> TrainingState:
+        """Train a streaming dataset for an exact fixed number of SAE-TM steps."""
+        assert self.config.steps is not None
+        self.model.train()
+
+        running_losses = {
+            "total": 0.0,
+            "reconstruction": 0.0,
+            "sparsity": 0.0,
+            "auxiliary": 0.0,
+        }
+        n_batches = 0
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(show_speed=True),
+            TimeRemainingColumn(),
+            TextColumn("• loss: {task.fields[loss]}"),
+        ) as progress:
+            task = progress.add_task(
+                "[cyan]Training SAE (streaming)",
+                total=self.config.steps,
+                loss="0.0000",
+            )
+
+            while self.state.global_step < self.config.steps:
+                made_progress = False
+                for batch_embeddings in streaming_dataset:
+                    for i in range(0, batch_embeddings.shape[0], self.config.batch_size):
+                        if self.state.global_step >= self.config.steps:
+                            break
+
+                        batch = batch_embeddings[i : i + self.config.batch_size]
+                        losses = self._train_batch(batch)
+                        made_progress = True
+
+                        n_batches += 1
+                        for key in running_losses:
+                            running_losses[key] += losses[key].item()
+
+                        avg_loss = running_losses["total"] / n_batches
+                        progress.update(task, advance=1, loss=f"{avg_loss:.6f}")
+
+                        if (
+                            self.config.save_frequency > 0
+                            and self.state.global_step % self.config.save_frequency == 0
+                        ):
+                            self.save_checkpoint(f"checkpoint_step_{self.state.global_step}")
+
+                    if self.state.global_step >= self.config.steps:
+                        break
+
+                if not made_progress:
+                    raise RuntimeError("Streaming dataset yielded no batches")
+
+        avg_losses = {key: value / max(1, n_batches) for key, value in running_losses.items()}
+        self.state.epoch = 1
+        self.state.update(avg_losses, increment_step=False)
+
+        self.save_checkpoint("final")
+        self.save_metadata()
         return self.state
 
     def save_checkpoint(
@@ -643,7 +799,7 @@ class SAETrainer:
 
             state_dict = self.model.state_dict()
             save_file(
-                {k: v.detach().cpu() for k, v in state_dict.items()},
+                {k: v.detach().cpu().contiguous() for k, v in state_dict.items()},
                 checkpoint_dir / "model.safetensors",
             )
         except ImportError:
@@ -722,8 +878,12 @@ for training experiments and future loader integration.
 ## Training
 
 - **Epochs**: {self.config.n_epochs}
+- **Steps**: {self.config.steps or "epoch-based"}
+- **Warmup Ratio**: {self.config.warmup_ratio}
 - **Batch Size**: {self.config.batch_size}
 - **Learning Rate**: {self.config.learning_rate}
+- **Sparsity Warmup Steps**: {self.config.sparsity_warmup_steps}
+- **AuxK Alpha**: {self.config.aux_loss_weight}
 - **Best Loss**: {self.state.best_loss:.6f}
 
 ## License
@@ -836,15 +996,26 @@ def train_sae(
     # Create model
     from saetopic.sae.modules import create_sae
 
+    model_kwargs: dict[str, Any] = {
+        "decoder_bias": config.decoder_bias,
+        "encoder_bias": config.encoder_bias,
+        "normalization": config.normalization,
+    }
+    if config.architecture == "jumprelu":
+        model_kwargs.update(
+            {
+                "bandwidth": config.bandwidth,
+                "target_l0": config.target_l0,
+            }
+        )
+
     model = create_sae(
         input_dim=config.input_dim,
         architecture=config.architecture,
         n_features=config.n_features,
         expansion_factor=config.expansion_factor,
         top_k=config.top_k,
-        decoder_bias=config.decoder_bias,
-        encoder_bias=config.encoder_bias,
-        normalization=config.normalization,
+        **model_kwargs,
     )
 
     # Create trainer

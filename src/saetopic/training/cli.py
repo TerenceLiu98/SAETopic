@@ -82,7 +82,7 @@ def main() -> None:
         "--architecture",
         type=str,
         default="batch_topk",
-        choices=["topk", "batch_topk"],
+        choices=["standard", "jumprelu", "topk", "batch_topk"],
         help="SAE architecture type",
     )
     train_parser.add_argument(
@@ -114,7 +114,7 @@ def main() -> None:
     train_parser.add_argument(
         "--learning-rate",
         type=float,
-        default=1e-4,
+        default=1e-3,
         help="Learning rate",
     )
     train_parser.add_argument(
@@ -128,6 +128,24 @@ def main() -> None:
         type=int,
         default=100,
         help="Number of training epochs",
+    )
+    train_parser.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help="Fixed number of SAE-TM training steps. If set, overrides epoch-based training",
+    )
+    train_parser.add_argument(
+        "--warmup-ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of training steps used for linear LR warmup",
+    )
+    train_parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=None,
+        help="Explicit LR warmup steps. Overrides --warmup-ratio when set",
     )
     train_parser.add_argument(
         "--device",
@@ -160,13 +178,31 @@ def main() -> None:
         "--sparsity-loss-weight",
         type=float,
         default=1.0,
-        help="Weight for sparsity loss",
+        help="L1 sparsity weight for standard SAE training",
+    )
+    train_parser.add_argument(
+        "--sparsity-warmup-steps",
+        type=int,
+        default=2000,
+        help="Linear L1 sparsity warmup steps for standard SAE training",
     )
     train_parser.add_argument(
         "--aux-loss-weight",
         type=float,
+        default=1 / 32,
+        help="Weight for SAE-TM dead-feature auxiliary loss",
+    )
+    train_parser.add_argument(
+        "--bandwidth",
+        type=float,
         default=0.001,
-        help="Weight for auxiliary loss",
+        help="JumpReLU threshold surrogate bandwidth",
+    )
+    train_parser.add_argument(
+        "--target-l0",
+        type=float,
+        default=20.0,
+        help="JumpReLU target average L0",
     )
 
     # Output arguments
@@ -425,12 +461,18 @@ def train_sae_from_args(args: argparse.Namespace) -> None:
         learning_rate=args.learning_rate,
         batch_size=args.batch_size,
         n_epochs=args.n_epochs,
+        steps=args.steps,
+        warmup_ratio=args.warmup_ratio,
+        warmup_steps=args.warmup_steps,
         device=args.device,
         seed=args.seed,
         save_frequency=args.save_frequency,
         recon_loss_weight=args.recon_loss_weight,
         sparsity_loss_weight=args.sparsity_loss_weight,
+        sparsity_warmup_steps=getattr(args, "sparsity_warmup_steps", 2000),
         aux_loss_weight=args.aux_loss_weight,
+        bandwidth=getattr(args, "bandwidth", 0.001),
+        target_l0=getattr(args, "target_l0", 20.0),
         output_dir=args.output,
         checkpoint_name=args.checkpoint_name,
         dataset_name=args.dataset_name,

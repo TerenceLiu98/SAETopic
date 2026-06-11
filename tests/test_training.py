@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from saetopic.sae.modules import BatchTopKSAE, TopKSAE, create_sae
+from saetopic.sae.modules import BatchTopKSAE, JumpReLUSAE, StandardSAE, TopKSAE, create_sae
 from saetopic.training.data import EmbeddingDataset
 from saetopic.training.train_sae import SAEOptimizer, SAETrainer, TrainingConfig, train_sae
 
@@ -43,6 +43,37 @@ def test_create_sae_batch_topk():
     assert model.top_k == 8
 
 
+def test_create_sae_standard():
+    """Test creating a StandardSAE model."""
+    model = create_sae(
+        input_dim=128,
+        architecture="standard",
+        n_features=256,
+        top_k=8,
+    )
+
+    assert isinstance(model, StandardSAE)
+    assert model.input_dim == 128
+    assert model.n_features == 256
+
+
+def test_create_sae_jumprelu():
+    """Test creating a JumpReLUSAE model."""
+    model = create_sae(
+        input_dim=128,
+        architecture="jumprelu",
+        n_features=256,
+        bandwidth=0.002,
+        target_l0=12.0,
+    )
+
+    assert isinstance(model, JumpReLUSAE)
+    assert model.input_dim == 128
+    assert model.n_features == 256
+    assert model.bandwidth == 0.002
+    assert model.target_l0 == 12.0
+
+
 def test_topk_sae_forward():
     """Test TopKSAE forward pass."""
     model = TopKSAE(input_dim=128, n_features=256, top_k=8)
@@ -60,7 +91,7 @@ def test_topk_sae_forward():
 
 
 def test_batch_topk_sae_forward():
-    """Test BatchTopKSAE forward pass."""
+    """Test BatchTopKSAE uses global batch top-k selection."""
     model = BatchTopKSAE(input_dim=128, n_features=256, top_k=8)
     x = torch.randn(4, 128)
 
@@ -69,7 +100,8 @@ def test_batch_topk_sae_forward():
     assert x_recon.shape == (4, 128)
     assert h.shape == (4, 256)
     assert f.shape == (4, 256)
-    assert topk_indices.shape == (4, 8)
+    assert topk_indices.shape == (4 * 8,)
+    assert (f > 0).sum().item() <= 4 * 8
 
 
 def test_sparse_forward_matches_dense_forward():
@@ -107,6 +139,44 @@ def test_sae_compute_loss():
         assert value.item() >= 0
 
 
+def test_standard_sae_compute_loss_uses_l1_sparsity():
+    """Test StandardSAE uses reconstruction plus L1 sparsity loss."""
+    model = StandardSAE(input_dim=16, n_features=32)
+    x = torch.randn(4, 16)
+
+    x_recon, h, f, _ = model(x)
+    loss, losses = model.compute_loss(
+        x,
+        x_recon,
+        h,
+        f,
+        sparsity_loss_weight=0.5,
+    )
+
+    expected = losses["reconstruction"] + 0.5 * losses["sparsity"]
+    assert torch.allclose(loss.detach(), expected)
+    assert losses["auxiliary"].item() == 0.0
+
+
+def test_jumprelu_sae_compute_loss_uses_target_l0_penalty():
+    """Test JumpReLUSAE uses reconstruction plus target-L0 sparsity penalty."""
+    model = JumpReLUSAE(input_dim=16, n_features=32, target_l0=4.0)
+    x = torch.randn(4, 16)
+
+    x_recon, h, f, _ = model(x)
+    loss, losses = model.compute_loss(
+        x,
+        x_recon,
+        h,
+        f,
+        sparsity_loss_weight=0.5,
+    )
+
+    expected = losses["reconstruction"] + 0.5 * losses["sparsity"]
+    assert torch.allclose(loss.detach(), expected)
+    assert losses["auxiliary"].item() == 0.0
+
+
 def test_sparse_loss_matches_dense_loss():
     """Test sparse loss matches dense loss without materializing dense f."""
     model = BatchTopKSAE(input_dim=32, n_features=64, top_k=4)
@@ -128,6 +198,33 @@ def test_sparse_loss_matches_dense_loss():
     assert torch.allclose(sparse_loss, dense_loss, atol=1e-6)
     for key in dense_losses:
         assert torch.allclose(sparse_losses[key], dense_losses[key], atol=1e-6)
+
+
+def test_auxiliary_loss_zero_for_balanced_feature_usage():
+    """Test usage-balance auxiliary loss uses an achievable per-feature target."""
+    model = TopKSAE(input_dim=4, n_features=8, top_k=2)
+    x = torch.zeros(4, 4)
+    x_recon = torch.zeros_like(x)
+    h = torch.zeros(4, 8)
+    topk_values = torch.ones(4, 2)
+    topk_indices = torch.tensor(
+        [
+            [0, 1],
+            [2, 3],
+            [4, 5],
+            [6, 7],
+        ]
+    )
+
+    _, losses = model.compute_loss_sparse(
+        x,
+        x_recon,
+        h,
+        topk_values,
+        topk_indices,
+    )
+
+    assert losses["auxiliary"].item() == 0.0
 
 
 def test_feature_stats():
@@ -298,6 +395,90 @@ def test_train_sae_function():
 
     assert trainer.state.epoch == 1
     assert trainer.state.global_step > 0
+
+
+def test_train_sae_steps_mode_runs_exact_steps(tmp_path):
+    """Test SAE-TM step-based training runs for the requested number of steps."""
+    embeddings = torch.randn(24, 16)
+    dataset = EmbeddingDataset(embeddings)
+
+    trainer = train_sae(
+        dataset=dataset,
+        input_dim=16,
+        n_features=32,
+        top_k=4,
+        steps=5,
+        batch_size=8,
+        output_dir=str(tmp_path / "steps_mode"),
+        save_frequency=100,
+    )
+
+    assert trainer.state.global_step == 5
+    assert trainer.state.epoch == 2
+
+
+def test_decoder_columns_remain_unit_norm_after_training(tmp_path):
+    """Test SAE-TM decoder unit-norm constraint is maintained after optimizer steps."""
+    embeddings = torch.randn(24, 16)
+    dataset = EmbeddingDataset(embeddings)
+
+    trainer = train_sae(
+        dataset=dataset,
+        input_dim=16,
+        n_features=32,
+        top_k=4,
+        steps=3,
+        batch_size=8,
+        output_dir=str(tmp_path / "decoder_norm"),
+        save_frequency=100,
+    )
+
+    column_norms = trainer.model.decoder.weight.norm(dim=0)
+    assert torch.allclose(column_norms, torch.ones_like(column_norms), atol=1e-5)
+
+
+def test_standard_sae_sparsity_warmup_starts_at_zero(tmp_path):
+    """Test StandardSAE L1 penalty is warmed up from zero like SAE-TM."""
+    embeddings = torch.randn(8, 4)
+    dataset = EmbeddingDataset(embeddings)
+    model = StandardSAE(input_dim=4, n_features=8)
+    config = TrainingConfig(
+        input_dim=4,
+        n_features=8,
+        architecture="standard",
+        batch_size=8,
+        steps=1,
+        sparsity_loss_weight=10.0,
+        sparsity_warmup_steps=2000,
+        output_dir=str(tmp_path / "standard_warmup"),
+        save_frequency=100,
+    )
+    trainer = SAETrainer(model, config)
+    trainer._create_optimizer(dataset)
+
+    losses = trainer._train_batch(embeddings)
+
+    assert torch.allclose(losses["total"], losses["reconstruction"])
+
+
+def test_jumprelu_training_keeps_decoder_rows_unit_norm(tmp_path):
+    """Test JumpReLUSAE keeps W_dec rows constrained like SAE-TM."""
+    embeddings = torch.randn(16, 8)
+    dataset = EmbeddingDataset(embeddings)
+
+    trainer = train_sae(
+        dataset=dataset,
+        input_dim=8,
+        n_features=16,
+        architecture="jumprelu",
+        steps=3,
+        batch_size=8,
+        output_dir=str(tmp_path / "jumprelu_norm"),
+        save_frequency=100,
+    )
+
+    row_norms = trainer.model.W_dec.norm(dim=1)
+    assert torch.allclose(row_norms, torch.ones_like(row_norms), atol=1e-5)
 
 
 def test_train_sae_respects_config_output_dir(tmp_path):
@@ -481,6 +662,9 @@ def test_cli_train_passes_mmap_and_normalize_flags(monkeypatch):
         learning_rate=1e-4,
         batch_size=32,
         n_epochs=1,
+        steps=None,
+        warmup_ratio=0.1,
+        warmup_steps=None,
         device="cpu",
         seed=42,
         save_frequency=100,

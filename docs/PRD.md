@@ -23,7 +23,7 @@ large text corpora such as FineWiki.
 - Save streamed embeddings to a single `.npy` file with chunked temporary
   writes, avoiding a full in-memory concatenation.
 - Load `.npy` embeddings with memory mapping for SAE training.
-- Train `topk` and `batch_topk` SAE variants.
+- Train `standard`, `jumprelu`, `topk`, and `batch_topk` SAE variants.
 - Use sparse top-k reconstruction during training to avoid materializing the
   dense `(batch_size, n_features)` activation tensor.
 - Save checkpoints, training metadata, model cards, and file checksums.
@@ -72,6 +72,15 @@ Required behavior:
 - `.npy` files should be memory-mapped by default.
 - Users should be able to skip re-normalization when embeddings were normalized
   during the embed step.
+- Standard, JumpReLU, TopK, and BatchTopK SAE training should follow the
+  referenced SAE-TM dictionary-learning trainers: Standard uses dense ReLU
+  activations with L1 sparsity warmup, JumpReLU uses learned thresholds with a
+  target-L0 penalty, TopK/BatchTopK use per-sample or global batch top-k
+  selection with dead-feature aux-k loss, and optimizers maintain constrained
+  decoder norms.
+- Step-based training through `TrainingConfig.steps` / `saetopic-train train
+  --steps` should be supported for SAE-TM-style long runs; epoch training is a
+  compatibility path for small local experiments.
 - The training output directory should follow `TrainingConfig.output_dir` unless
   explicitly overridden.
 - Checkpoints should include model weights, optimizer state, training state,

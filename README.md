@@ -176,7 +176,9 @@ saetopic-train train \
   --expansion-factor 32 \
   --top-k 32 \
   --batch-size 256 \
-  --n-epochs 100 \
+  --steps 800000 \
+  --warmup-ratio 0.1 \
+  --aux-loss-weight 0.03125 \
   --output checkpoints/jina-v5-sae-small \
   --dataset-name HuggingFaceFW/finewiki \
   --dataset-license "CC-BY-SA 4.0 / Apache 2.0"
