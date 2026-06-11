@@ -98,6 +98,10 @@ class TrainingConfig:
     aux_loss_weight: float = 1 / 32
     bandwidth: float = 0.001
     target_l0: float = 20.0
+    early_stopping: bool = False
+    early_stopping_patience: int = 5
+    early_stopping_min_delta: float = 1e-4
+    early_stopping_metric: str = "reconstruction"
 
     # Additional model parameters
     decoder_bias: bool = True
@@ -136,6 +140,10 @@ class TrainingConfig:
             "aux_loss_weight": self.aux_loss_weight,
             "bandwidth": self.bandwidth,
             "target_l0": self.target_l0,
+            "early_stopping": self.early_stopping,
+            "early_stopping_patience": self.early_stopping_patience,
+            "early_stopping_min_delta": self.early_stopping_min_delta,
+            "early_stopping_metric": self.early_stopping_metric,
         }
 
 
@@ -413,6 +421,44 @@ class SAETrainer:
         # Average losses
         return {k: v / n_batches for k, v in epoch_losses.items()}
 
+    def validate_epoch(self, val_loader: DataLoader) -> dict[str, float]:
+        """Evaluate one validation epoch without updating SAE training statistics."""
+        self.model.eval()
+
+        val_losses = {key: 0.0 for key in ["total", "reconstruction", "sparsity", "auxiliary"]}
+        n_batches = 0
+
+        sparsity_loss_weight = self.config.sparsity_loss_weight
+        if self.config.architecture in {"standard", "jumprelu"} and self.config.sparsity_warmup_steps:
+            sparsity_scale = min(
+                self.state.global_step / self.config.sparsity_warmup_steps,
+                1.0,
+            )
+            sparsity_loss_weight *= sparsity_scale
+
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = batch.to(self.device)
+                x_recon, h, topk_values, topk_indices = self.model.forward_sparse(batch)
+                _, losses = self.model.compute_loss_sparse(
+                    batch,
+                    x_recon,
+                    h,
+                    topk_values,
+                    topk_indices,
+                    recon_loss_weight=self.config.recon_loss_weight,
+                    sparsity_loss_weight=sparsity_loss_weight,
+                    aux_loss_weight=self.config.aux_loss_weight,
+                    update_stats=False,
+                )
+
+                n_batches += 1
+                for key in val_losses:
+                    val_losses[key] += losses[key].item()
+
+        self.model.train()
+        return {k: v / max(1, n_batches) for k, v in val_losses.items()}
+
     def _create_optimizer(
         self,
         dataset: "EmbeddingDataset | ShardedEmbeddingDataset | StreamingEmbeddingDataset",
@@ -522,6 +568,22 @@ class SAETrainer:
             num_workers=0,
             pin_memory=self.device.type == "cuda",
         )
+        val_loader = (
+            DataLoader(
+                val_dataset,
+                batch_size=self.config.batch_size,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=self.device.type == "cuda",
+            )
+            if val_dataset is not None
+            else None
+        )
+        if self.config.early_stopping and val_loader is None:
+            print("Warning: early_stopping=True requires val_dataset; disabling early stopping")
+        early_stopping_enabled = self.config.early_stopping and val_loader is not None
+        best_metric = float("inf")
+        epochs_without_improvement = 0
 
         if self.config.steps is not None:
             return self._fit_standard_steps(train_loader)
@@ -538,6 +600,44 @@ class SAETrainer:
             print(f"Epoch {epoch}/{self.config.n_epochs}")
             for key, value in epoch_losses.items():
                 print(f"  {key}: {value:.6f}")
+
+            if val_loader is not None:
+                val_losses = self.validate_epoch(val_loader)
+                self.state.update(
+                    {f"val_{key}": value for key, value in val_losses.items()},
+                    increment_step=False,
+                )
+                print("Validation")
+                for key, value in val_losses.items():
+                    print(f"  val_{key}: {value:.6f}")
+
+                metric_name = self.config.early_stopping_metric
+                if metric_name.startswith("val_"):
+                    metric_name = metric_name.removeprefix("val_")
+                if metric_name not in val_losses:
+                    raise ValueError(
+                        f"Unknown early_stopping_metric={self.config.early_stopping_metric!r}; "
+                        f"available metrics: {', '.join(sorted(val_losses))}"
+                    )
+
+                current_metric = val_losses[metric_name]
+                if current_metric < best_metric - self.config.early_stopping_min_delta:
+                    best_metric = current_metric
+                    epochs_without_improvement = 0
+                    self.save_checkpoint("best")
+                else:
+                    epochs_without_improvement += 1
+
+                if (
+                    early_stopping_enabled
+                    and epochs_without_improvement >= self.config.early_stopping_patience
+                ):
+                    print(
+                        "Early stopping triggered "
+                        f"after {epochs_without_improvement} epochs without improvement "
+                        f"on val_{metric_name}"
+                    )
+                    break
 
             # Save checkpoint
             if epoch % self.config.save_frequency == 0:
@@ -884,6 +984,9 @@ for training experiments and future loader integration.
 - **Learning Rate**: {self.config.learning_rate}
 - **Sparsity Warmup Steps**: {self.config.sparsity_warmup_steps}
 - **AuxK Alpha**: {self.config.aux_loss_weight}
+- **Early Stopping**: {self.config.early_stopping}
+- **Early Stopping Patience**: {self.config.early_stopping_patience}
+- **Early Stopping Metric**: {self.config.early_stopping_metric}
 - **Best Loss**: {self.state.best_loss:.6f}
 
 ## License
@@ -918,6 +1021,7 @@ This is a clean-room implementation trained on permissively licensed data.
 def train_sae(
     embeddings_path: str | Path | None = None,
     dataset: "EmbeddingDataset | ShardedEmbeddingDataset | None" = None,
+    val_dataset: "EmbeddingDataset | ShardedEmbeddingDataset | None" = None,
     output_dir: str | None = None,
     config: TrainingConfig | None = None,
     normalize_embeddings: bool = True,
@@ -933,6 +1037,8 @@ def train_sae(
         Ignored if dataset is provided.
     dataset : EmbeddingDataset or None
         Pre-configured dataset. If None, loads from embeddings_path.
+    val_dataset : EmbeddingDataset or None
+        Optional validation dataset for epoch-based validation and early stopping.
     output_dir : str or None
         Output directory for checkpoints. If None, uses config.output_dir.
     config : TrainingConfig or None
@@ -1022,7 +1128,7 @@ def train_sae(
     trainer = SAETrainer(model, config)
 
     # Train
-    trainer.fit(dataset)
+    trainer.fit(dataset, val_dataset=val_dataset)
 
     return trainer
 

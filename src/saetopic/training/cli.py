@@ -31,6 +31,12 @@ def main() -> None:
         help="Path to embeddings file (.npy or .pt) or sharded embedding directory",
     )
     train_parser.add_argument(
+        "--validation-embeddings",
+        type=str,
+        default=None,
+        help="Optional validation embeddings path for epoch validation and early stopping",
+    )
+    train_parser.add_argument(
         "--no-mmap",
         action="store_true",
         help="Load .npy embeddings fully into RAM instead of memory-mapping them",
@@ -165,6 +171,30 @@ def main() -> None:
         type=int,
         default=10,
         help="Save checkpoint every N epochs",
+    )
+    train_parser.add_argument(
+        "--early-stopping",
+        action="store_true",
+        help="Stop epoch-based training when validation metric stops improving",
+    )
+    train_parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=5,
+        help="Epochs without validation improvement before stopping",
+    )
+    train_parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=1e-4,
+        help="Minimum validation improvement required to reset patience",
+    )
+    train_parser.add_argument(
+        "--early-stopping-metric",
+        type=str,
+        default="reconstruction",
+        choices=["total", "reconstruction", "sparsity", "auxiliary", "val_total", "val_reconstruction", "val_sparsity", "val_auxiliary"],
+        help="Validation metric to monitor for early stopping",
     )
 
     # Loss weights
@@ -444,6 +474,16 @@ def train_sae_from_args(args: argparse.Namespace) -> None:
         normalize=not args.no_normalize_embeddings,
         mmap_mode=mmap_mode,
     )
+    validation_embeddings = getattr(args, "validation_embeddings", None)
+    val_dataset = (
+        EmbeddingDataset.from_file(
+            validation_embeddings,
+            normalize=not args.no_normalize_embeddings,
+            mmap_mode=mmap_mode,
+        )
+        if validation_embeddings is not None
+        else None
+    )
 
     # Auto-detect input_dim if not provided
     input_dim = args.input_dim or dataset.embedding_dim
@@ -467,6 +507,10 @@ def train_sae_from_args(args: argparse.Namespace) -> None:
         device=args.device,
         seed=args.seed,
         save_frequency=args.save_frequency,
+        early_stopping=getattr(args, "early_stopping", False),
+        early_stopping_patience=getattr(args, "early_stopping_patience", 5),
+        early_stopping_min_delta=getattr(args, "early_stopping_min_delta", 1e-4),
+        early_stopping_metric=getattr(args, "early_stopping_metric", "reconstruction"),
         recon_loss_weight=args.recon_loss_weight,
         sparsity_loss_weight=args.sparsity_loss_weight,
         sparsity_warmup_steps=getattr(args, "sparsity_warmup_steps", 2000),
@@ -491,6 +535,7 @@ def train_sae_from_args(args: argparse.Namespace) -> None:
     # Train
     train_sae(
         dataset=dataset,
+        val_dataset=val_dataset,
         config=config,
     )
 

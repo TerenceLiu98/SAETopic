@@ -424,6 +424,7 @@ class TopKSAE(nn.Module):
         recon_loss_weight: float = 1.0,
         sparsity_loss_weight: float = 1.0,
         aux_loss_weight: float = 0.001,
+        update_stats: bool = True,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """
         Compute SAE-TM TopK/BatchTopK loss.
@@ -458,7 +459,8 @@ class TopKSAE(nn.Module):
         recon_loss = residual.pow(2).sum(dim=-1).mean()
         aux_loss = self._auxk_loss(residual.detach(), h, aux_loss_weight)
         total_loss = recon_loss_weight * recon_loss + aux_loss_weight * aux_loss
-        self._update_firing_stats((f > 0).nonzero(as_tuple=False)[:, 1], x.shape[0])
+        if update_stats:
+            self._update_firing_stats((f > 0).nonzero(as_tuple=False)[:, 1], x.shape[0])
 
         losses = {
             "total": total_loss.detach(),
@@ -479,6 +481,7 @@ class TopKSAE(nn.Module):
         recon_loss_weight: float = 1.0,
         sparsity_loss_weight: float = 1.0,
         aux_loss_weight: float = 0.001,
+        update_stats: bool = True,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """
         Compute SAE loss from sparse top-k activations.
@@ -492,7 +495,8 @@ class TopKSAE(nn.Module):
         recon_loss = residual.pow(2).sum(dim=-1).mean()
         aux_loss = self._auxk_loss(residual.detach(), h, aux_loss_weight)
         total_loss = recon_loss_weight * recon_loss + aux_loss_weight * aux_loss
-        self._update_firing_stats(topk_indices, x.shape[0])
+        if update_stats:
+            self._update_firing_stats(topk_indices, x.shape[0])
 
         losses = {
             "total": total_loss.detach(),
@@ -598,6 +602,7 @@ class BatchTopKSAE(TopKSAE):
         recon_loss_weight: float = 1.0,
         sparsity_loss_weight: float = 1.0,
         aux_loss_weight: float = 0.001,
+        update_stats: bool = True,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """
         Compute SAE loss with multiple components.
@@ -634,6 +639,7 @@ class BatchTopKSAE(TopKSAE):
             recon_loss_weight=recon_loss_weight,
             sparsity_loss_weight=sparsity_loss_weight,
             aux_loss_weight=aux_loss_weight,
+            update_stats=update_stats,
         )
 
     def update_feature_stats(self, f: Tensor) -> None:
@@ -783,9 +789,10 @@ class StandardSAE(nn.Module):
         recon_loss_weight: float = 1.0,
         sparsity_loss_weight: float = 1.0,
         aux_loss_weight: float = 0.0,
+        update_stats: bool = True,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """Compute SAE-TM StandardTrainer loss."""
-        del h, aux_loss_weight
+        del h, aux_loss_weight, update_stats
 
         residual = x - x_recon
         recon_loss = residual.pow(2).sum(dim=-1).mean()
@@ -810,6 +817,7 @@ class StandardSAE(nn.Module):
         recon_loss_weight: float = 1.0,
         sparsity_loss_weight: float = 1.0,
         aux_loss_weight: float = 0.0,
+        update_stats: bool = True,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """Standard SAE sparse API compatibility."""
         del topk_indices
@@ -821,6 +829,7 @@ class StandardSAE(nn.Module):
             recon_loss_weight=recon_loss_weight,
             sparsity_loss_weight=sparsity_loss_weight,
             aux_loss_weight=aux_loss_weight,
+            update_stats=update_stats,
         )
 
 
@@ -921,6 +930,7 @@ class JumpReLUSAE(nn.Module):
         recon_loss_weight: float = 1.0,
         sparsity_loss_weight: float = 1.0,
         aux_loss_weight: float = 0.0,
+        update_stats: bool = True,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """Compute SAE-TM JumpReluTrainer reconstruction plus target-L0 loss."""
         del h, aux_loss_weight
@@ -930,7 +940,8 @@ class JumpReLUSAE(nn.Module):
         l0 = StepFunction.apply(f, self.threshold, self.bandwidth).sum(dim=-1).mean()
         sparsity_loss = ((l0 / self.target_l0) - 1).pow(2)
         total_loss = recon_loss_weight * recon_loss + sparsity_loss_weight * sparsity_loss
-        self._update_firing_stats(f, x.shape[0])
+        if update_stats:
+            self._update_firing_stats(f, x.shape[0])
 
         losses = {
             "total": total_loss.detach(),
@@ -950,6 +961,7 @@ class JumpReLUSAE(nn.Module):
         recon_loss_weight: float = 1.0,
         sparsity_loss_weight: float = 1.0,
         aux_loss_weight: float = 0.0,
+        update_stats: bool = True,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """JumpReLU sparse API compatibility."""
         del topk_indices
@@ -961,6 +973,7 @@ class JumpReLUSAE(nn.Module):
             recon_loss_weight=recon_loss_weight,
             sparsity_loss_weight=sparsity_loss_weight,
             aux_loss_weight=aux_loss_weight,
+            update_stats=update_stats,
         )
 
 

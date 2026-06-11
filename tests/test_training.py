@@ -7,6 +7,7 @@ import json
 import numpy as np
 import pytest
 import torch
+from torch.utils.data import DataLoader
 
 from saetopic.sae.modules import BatchTopKSAE, JumpReLUSAE, StandardSAE, TopKSAE, create_sae
 from saetopic.training.data import EmbeddingDataset
@@ -481,6 +482,62 @@ def test_jumprelu_training_keeps_decoder_rows_unit_norm(tmp_path):
     assert torch.allclose(row_norms, torch.ones_like(row_norms), atol=1e-5)
 
 
+def test_validate_epoch_does_not_update_topk_firing_stats(tmp_path):
+    """Test validation loss computation does not mutate TopK dead-feature counters."""
+    model = TopKSAE(input_dim=8, n_features=16, top_k=2)
+    config = TrainingConfig(
+        input_dim=8,
+        n_features=16,
+        top_k=2,
+        batch_size=4,
+        output_dir=str(tmp_path / "validate_no_stats"),
+    )
+    trainer = SAETrainer(model, config)
+    val_loader = DataLoader(EmbeddingDataset(torch.randn(8, 8)), batch_size=4)
+
+    before = trainer.model.num_tokens_since_fired.clone()
+    losses = trainer.validate_epoch(val_loader)
+
+    assert "reconstruction" in losses
+    assert torch.equal(trainer.model.num_tokens_since_fired, before)
+
+
+def test_train_sae_early_stopping_stops_after_patience(tmp_path, monkeypatch):
+    """Test epoch-mode training stops early when validation metric does not improve."""
+    embeddings = torch.randn(24, 8)
+    dataset = EmbeddingDataset(embeddings)
+    val_dataset = EmbeddingDataset(torch.randn(8, 8))
+
+    def constant_validation(self, val_loader):
+        return {
+            "total": 1.0,
+            "reconstruction": 1.0,
+            "sparsity": 0.0,
+            "auxiliary": 0.0,
+        }
+
+    monkeypatch.setattr(SAETrainer, "validate_epoch", constant_validation)
+
+    trainer = train_sae(
+        dataset=dataset,
+        val_dataset=val_dataset,
+        input_dim=8,
+        n_features=16,
+        top_k=2,
+        n_epochs=5,
+        batch_size=8,
+        early_stopping=True,
+        early_stopping_patience=1,
+        early_stopping_min_delta=0.0,
+        output_dir=str(tmp_path / "early_stop"),
+        save_frequency=100,
+    )
+
+    assert trainer.state.epoch == 2
+    assert (tmp_path / "early_stop" / "best").exists()
+    assert "val_reconstruction" in trainer.state.losses
+
+
 def test_train_sae_respects_config_output_dir(tmp_path):
     """Test config.output_dir is used when output_dir is not explicitly passed."""
     embeddings = torch.randn(32, 16)
@@ -629,8 +686,8 @@ def test_cli_train_passes_mmap_and_normalize_flags(monkeypatch):
         )
         return DummyDataset()
 
-    def fake_train_sae(*, dataset, config):
-        captured_train.update({"dataset": dataset, "config": config})
+    def fake_train_sae(*, dataset, config, val_dataset=None):
+        captured_train.update({"dataset": dataset, "config": config, "val_dataset": val_dataset})
         return object()
 
     def fake_upload_checkpoint(checkpoint_dir, repo_id, create_repo=False, private=False):
@@ -688,6 +745,7 @@ def test_cli_train_passes_mmap_and_normalize_flags(monkeypatch):
         "mmap_mode": None,
     }
     assert captured_train["dataset"].embedding_dim == 8
+    assert captured_train["val_dataset"] is None
     assert captured_train["config"].input_dim == 8
     assert captured_train["config"].top_k == 16
     assert captured_upload == {
@@ -696,6 +754,95 @@ def test_cli_train_passes_mmap_and_normalize_flags(monkeypatch):
         "create_repo": True,
         "private": True,
     }
+
+
+def test_cli_train_passes_validation_and_early_stopping_args(monkeypatch):
+    """Test CLI train forwards validation dataset and early stopping config."""
+    import argparse
+
+    import saetopic.training as training_package
+    import saetopic.training.cli as training_cli
+    import saetopic.training.data as data_module
+
+    class DummyDataset:
+        embedding_dim = 8
+
+        def __init__(self, name):
+            self.name = name
+
+    captured_from_file = []
+    captured_train = {}
+
+    def fake_from_file(path, normalize=True, mmap_mode=None):
+        captured_from_file.append(
+            {
+                "path": path,
+                "normalize": normalize,
+                "mmap_mode": mmap_mode,
+            }
+        )
+        return DummyDataset(path)
+
+    def fake_train_sae(*, dataset, val_dataset=None, config):
+        captured_train.update({"dataset": dataset, "val_dataset": val_dataset, "config": config})
+        return object()
+
+    monkeypatch.setattr(data_module.EmbeddingDataset, "from_file", fake_from_file)
+    monkeypatch.setattr(training_package, "train_sae", fake_train_sae)
+
+    args = argparse.Namespace(
+        embeddings="train.npy",
+        validation_embeddings="val.npy",
+        no_mmap=False,
+        no_normalize_embeddings=True,
+        input_dim=None,
+        n_features=None,
+        expansion_factor=32,
+        top_k=16,
+        architecture="batch_topk",
+        decoder_bias=True,
+        encoder_bias=False,
+        normalization=None,
+        learning_rate=1e-3,
+        batch_size=32,
+        n_epochs=10,
+        steps=None,
+        warmup_ratio=0.1,
+        warmup_steps=None,
+        device="cpu",
+        seed=42,
+        save_frequency=100,
+        early_stopping=True,
+        early_stopping_patience=3,
+        early_stopping_min_delta=0.01,
+        early_stopping_metric="val_reconstruction",
+        recon_loss_weight=1.0,
+        sparsity_loss_weight=1.0,
+        sparsity_warmup_steps=2000,
+        aux_loss_weight=1 / 32,
+        bandwidth=0.001,
+        target_l0=20.0,
+        output="checkpoints/test",
+        checkpoint_name="test",
+        dataset_name="dataset",
+        dataset_license="license",
+        upload_to_hf=None,
+        create_repo=False,
+        private=False,
+    )
+
+    training_cli.train_sae_from_args(args)
+
+    assert captured_from_file == [
+        {"path": "train.npy", "normalize": False, "mmap_mode": "r"},
+        {"path": "val.npy", "normalize": False, "mmap_mode": "r"},
+    ]
+    assert captured_train["dataset"].name == "train.npy"
+    assert captured_train["val_dataset"].name == "val.npy"
+    assert captured_train["config"].early_stopping is True
+    assert captured_train["config"].early_stopping_patience == 3
+    assert captured_train["config"].early_stopping_min_delta == 0.01
+    assert captured_train["config"].early_stopping_metric == "val_reconstruction"
 
 
 def test_cli_embed_passes_streaming_and_sentence_transformer_args(monkeypatch):
