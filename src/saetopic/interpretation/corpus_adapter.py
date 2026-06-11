@@ -66,8 +66,8 @@ class CorpusAdapter:
         CorpusAdapter
             Fitted adapter instance
         """
-        # TODO: Implement corpus adaptation (Week 3)
-        raise NotImplementedError("CorpusAdapter.fit will be implemented in Week 3")
+        # TODO: Implement corpus adaptation
+        raise NotImplementedError("CorpusAdapter.fit is not implemented yet")
 
     def transform(
         self,
@@ -86,8 +86,8 @@ class CorpusAdapter:
         np.ndarray
             Word distributions (n_docs x vocab_size)
         """
-        # TODO: Implement transform (Week 3)
-        raise NotImplementedError("CorpusAdapter.transform will be implemented in Week 3")
+        # TODO: Implement transform
+        raise NotImplementedError("CorpusAdapter.transform is not implemented yet")
 
     def fit_transform(
         self,

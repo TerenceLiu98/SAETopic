@@ -38,5 +38,5 @@ def get_top_words_for_feature(
     list of (str, float)
         Top words with association scores
     """
-    # TODO: Implement word extraction (Week 3)
-    raise NotImplementedError("get_top_words_for_feature will be implemented in Week 3")
+    # TODO: Implement word extraction
+    raise NotImplementedError("get_top_words_for_feature is not implemented yet")

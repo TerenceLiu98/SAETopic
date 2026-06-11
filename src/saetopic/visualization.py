@@ -29,8 +29,8 @@ def visualize_topics(
     plotly.graph_objects.Figure
         Interactive 2D visualization
     """
-    # TODO: Implement topic visualization (Week 4)
-    raise NotImplementedError("visualize_topics will be implemented in Week 4")
+    # TODO: Implement topic visualization
+    raise NotImplementedError("visualize_topics is not implemented yet")
 
 
 def visualize_documents(
@@ -55,8 +55,8 @@ def visualize_documents(
     plotly.graph_objects.Figure
         Interactive 2D visualization
     """
-    # TODO: Implement document visualization (Week 4)
-    raise NotImplementedError("visualize_documents will be implemented in Week 4")
+    # TODO: Implement document visualization
+    raise NotImplementedError("visualize_documents is not implemented yet")
 
 
 def visualize_hierarchy(
@@ -78,5 +78,5 @@ def visualize_hierarchy(
     plotly.graph_objects.Figure
         Interactive hierarchical visualization
     """
-    # TODO: Implement hierarchy visualization (Week 4)
-    raise NotImplementedError("visualize_hierarchy will be implemented in Week 4")
+    # TODO: Implement hierarchy visualization
+    raise NotImplementedError("visualize_hierarchy is not implemented yet")

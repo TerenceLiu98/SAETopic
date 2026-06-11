@@ -2,7 +2,6 @@
 # Edit at https://www.toptal.com/developers/gitignore?templates=python,visualstudiocode
 .claude/
 CLAUDE.md
-docs/
 
 ### Python ###
 # Byte-compiled / optimized / DLL files

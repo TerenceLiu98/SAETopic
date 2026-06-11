@@ -8,16 +8,24 @@ for training SAE models on embedding datasets.
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, cast
 
+import numpy as np
 import torch
 import torch.nn as nn
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 from torch.utils.data import DataLoader
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
-import numpy as np
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -259,7 +267,7 @@ class SAETrainer:
 
         # Optimizer will be created in fit() once we know the dataset size
         # This allows accurate total_steps calculation for the scheduler
-        self.optimizer = None
+        self.optimizer: SAEOptimizer | None = None
 
         # Training state
         self.state = TrainingState()
@@ -309,24 +317,26 @@ class SAETrainer:
                 loss="0.0000",
             )
 
-            for batch in progress:
+            for batch in train_loader:
                 batch = batch.to(self.device)
 
-                # Forward pass
-                x_recon, h, f, _ = self.model(batch)
+                # Forward pass without materializing dense sparse features.
+                x_recon, h, topk_values, topk_indices = self.model.forward_sparse(batch)
 
                 # Compute loss
-                loss, losses = self.model.compute_loss(
+                loss, losses = self.model.compute_loss_sparse(
                     batch,
                     x_recon,
                     h,
-                    f,
+                    topk_values,
+                    topk_indices,
                     recon_loss_weight=self.config.recon_loss_weight,
                     sparsity_loss_weight=self.config.sparsity_loss_weight,
                     aux_loss_weight=self.config.aux_loss_weight,
                 )
 
                 # Optimizer step
+                assert self.optimizer is not None
                 self.optimizer.step(loss)
 
                 # Update statistics
@@ -336,8 +346,12 @@ class SAETrainer:
 
                 # Update progress bar
                 avg_loss = epoch_losses["total"] / n_batches
-                progress.update(task, advance=1, description=f"[cyan]Epoch {epoch}")
-                progress.columns[-2].formatter = lambda _: f"• loss: {avg_loss:.6f}"
+                progress.update(
+                    task,
+                    advance=1,
+                    description=f"[cyan]Epoch {epoch}",
+                    loss=f"{avg_loss:.6f}",
+                )
 
         # Average losses
         return {k: v / n_batches for k, v in epoch_losses.items()}
@@ -355,11 +369,27 @@ class SAETrainer:
         if hasattr(dataset, "__len__"):
             # Standard dataset - calculate exact steps
             n_samples = len(dataset)
-            steps_per_epoch = max(1, n_samples // self.config.batch_size)
+            steps_per_epoch = max(1, math.ceil(n_samples / self.config.batch_size))
             total_steps = steps_per_epoch * self.config.n_epochs
         elif hasattr(dataset, "max_samples") and dataset.max_samples:
             # Streaming dataset with known max_samples
-            steps_per_epoch = max(1, dataset.max_samples // self.config.batch_size)
+            embedding_batch_size = getattr(dataset, "embedding_batch_size", None)
+            if embedding_batch_size:
+                full_embedding_batches = dataset.max_samples // embedding_batch_size
+                remaining_samples = dataset.max_samples % embedding_batch_size
+                steps_per_embedding_batch = math.ceil(
+                    embedding_batch_size / self.config.batch_size
+                )
+                steps_per_epoch = full_embedding_batches * steps_per_embedding_batch
+                if remaining_samples:
+                    steps_per_epoch += math.ceil(
+                        remaining_samples / self.config.batch_size
+                    )
+                steps_per_epoch = max(1, steps_per_epoch)
+            else:
+                steps_per_epoch = max(
+                    1, math.ceil(dataset.max_samples / self.config.batch_size)
+                )
             total_steps = steps_per_epoch * self.config.n_epochs
         else:
             # Streaming dataset without known size - use default
@@ -403,9 +433,9 @@ class SAETrainer:
         is_streaming = hasattr(dataset, "__iter__") and not hasattr(dataset, "__len__")
 
         if is_streaming:
-            return self._fit_streaming(dataset, val_dataset)
+            return self._fit_streaming(cast("StreamingEmbeddingDataset", dataset), val_dataset)
         else:
-            return self._fit_standard(dataset, val_dataset)
+            return self._fit_standard(cast("EmbeddingDataset", dataset), val_dataset)
 
     def _fit_standard(
         self,
@@ -418,7 +448,7 @@ class SAETrainer:
             batch_size=self.config.batch_size,
             shuffle=True,
             num_workers=0,
-            pin_memory=True,
+            pin_memory=self.device.type == "cuda",
         )
 
         for epoch in range(1, self.config.n_epochs + 1):
@@ -440,11 +470,14 @@ class SAETrainer:
 
             # Update feature stats for BatchTopKSAE
             if hasattr(self.model, "update_feature_stats"):
+                from saetopic.sae.modules import BatchTopKSAE
+
                 with torch.no_grad():
                     for batch in train_loader:
                         batch = batch.to(self.device)
-                        _, _, f, _ = self.model(batch)
-                        self.model.update_feature_stats(f)
+                        _, _, topk_values, topk_indices = self.model.forward_sparse(batch)
+                        if isinstance(self.model, BatchTopKSAE):
+                            self.model.update_feature_stats_sparse(topk_values, topk_indices)
 
         # Save final checkpoint
         self.save_checkpoint("final")
@@ -516,21 +549,23 @@ class SAETrainer:
                         batch = batch_embeddings[i : i + self.config.batch_size]
                         batch = batch.to(self.device)
 
-                        # Forward pass
-                        x_recon, h, f, _ = self.model(batch)
+                        # Forward pass without materializing dense sparse features.
+                        x_recon, h, topk_values, topk_indices = self.model.forward_sparse(batch)
 
                         # Compute loss
-                        loss, losses = self.model.compute_loss(
+                        loss, losses = self.model.compute_loss_sparse(
                             batch,
                             x_recon,
                             h,
-                            f,
+                            topk_values,
+                            topk_indices,
                             recon_loss_weight=self.config.recon_loss_weight,
                             sparsity_loss_weight=self.config.sparsity_loss_weight,
                             aux_loss_weight=self.config.aux_loss_weight,
                         )
 
                         # Optimizer step
+                        assert self.optimizer is not None
                         self.optimizer.step(loss)
 
                         # Update statistics
@@ -544,7 +579,13 @@ class SAETrainer:
 
                         # Update feature stats for BatchTopKSAE
                         if hasattr(self.model, "update_feature_stats"):
-                            self.model.update_feature_stats(f)
+                            from saetopic.sae.modules import BatchTopKSAE
+
+                            if isinstance(self.model, BatchTopKSAE):
+                                self.model.update_feature_stats_sparse(
+                                    topk_values,
+                                    topk_indices,
+                                )
 
             # Average losses
             avg_losses = {k: v / n_batches for k, v in epoch_losses.items()}
@@ -592,33 +633,42 @@ class SAETrainer:
 
             state_dict = self.model.state_dict()
             save_file(
-                {k: v.cpu().numpy() for k, v in state_dict.items()},
+                {k: v.detach().cpu() for k, v in state_dict.items()},
                 checkpoint_dir / "model.safetensors",
             )
         except ImportError:
             torch.save(self.model.state_dict(), checkpoint_dir / "model.pt")
 
         # Save optimizer state
+        assert self.optimizer is not None
         torch.save(self.optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
 
         # Save training state
         torch.save(self.state.__dict__, checkpoint_dir / "training_state.pt")
 
+        # Keep each checkpoint self-contained for direct upload/reuse.
+        self._save_metadata_files(checkpoint_dir)
+
         print(f"Saved checkpoint to {checkpoint_dir}")
 
     def save_metadata(self) -> None:
         """Save training metadata (config, model card, etc.)."""
+        self._save_metadata_files(self.output_dir)
+
+    def _save_metadata_files(self, output_dir: Path) -> None:
+        """Save metadata files into a checkpoint or output directory."""
         # Save config
-        config_path = self.output_dir / "config.json"
+        config_path = output_dir / "config.json"
         with open(config_path, "w") as f:
             json.dump(self.config.to_dict(), f, indent=2)
 
-        # Save model card template
-        model_card_path = self.output_dir / "model_card.md"
+        # Save model card template. README.md is recognized by Hugging Face Hub.
+        model_card_path = output_dir / "model_card.md"
         self._create_model_card(model_card_path)
+        (output_dir / "README.md").write_text(model_card_path.read_text())
 
         # Save checksums
-        self._save_checksums()
+        self._save_checksums(output_dir)
 
     def _create_model_card(self, path: Path) -> None:
         """Create model card markdown file."""
@@ -628,7 +678,7 @@ class SAETrainer:
 
 ## Model Description
 
-Sparse Autoencoder trained for topic modeling. This model learns {n_features} sparse features (topic atoms) from {self.input_dim}-dimensional embeddings.
+Sparse Autoencoder trained for topic modeling. This model learns {n_features} sparse features (topic atoms) from {self.config.input_dim}-dimensional embeddings.
 
 ## Training Data
 
@@ -643,14 +693,21 @@ Sparse Autoencoder trained for topic modeling. This model learns {n_features} sp
 - **Expansion Factor**: {self.config.expansion_factor}
 - **Top-K**: {self.config.top_k}
 
-## Usage
+## Checkpoint Contents
 
-```python
-from saetopic import SAETopicModel
+This checkpoint contains SAE training artifacts:
 
-model = SAETopicModel.from_pretrained("{self.config.checkpoint_name}")
-topics, probs = model.fit_transform(docs, n_topics=50)
-```
+- `model.safetensors` or `model.pt`: SAE model weights
+- `optimizer.pt`: optimizer state for resuming experiments
+- `training_state.pt`: epoch/loss history
+- `config.json`: training and architecture configuration
+- `checksums.txt`: SHA256 checksums for checkpoint tensors
+
+## Usage Status
+
+This is a trained SAE checkpoint. The end-to-end `SAETopicModel.from_pretrained`
+and topic inference APIs are still in development, so this artifact is intended
+for training experiments and future loader integration.
 
 ## Training
 
@@ -666,34 +723,34 @@ Apache-2.0
 ## Attribution
 
 This is a clean-room implementation trained on permissively licensed data.
-Inspired by ["Sparse Autoencoders are Topic Models"](https://github.com/ExplainableML/SAE-TM).
 """
         path.write_text(card)
 
-    def _save_checksums(self) -> None:
+    def _save_checksums(self, output_dir: Path) -> None:
         """Save SHA256 checksums for model files."""
         import hashlib
 
         checksums = []
-        for file in self.output_dir.glob("*.safetensors"):
+        for file in sorted(output_dir.rglob("*.safetensors")):
             sha256 = hashlib.sha256()
             sha256.update(file.read_bytes())
-            checksums.append(f"{sha256.hexdigest()}  {file.name}")
+            checksums.append(f"{sha256.hexdigest()}  {file.relative_to(output_dir)}")
 
-        for file in self.output_dir.glob("*.pt"):
+        for file in sorted(output_dir.rglob("*.pt")):
             sha256 = hashlib.sha256()
             sha256.update(file.read_bytes())
-            checksums.append(f"{sha256.hexdigest()}  {file.name}")
+            checksums.append(f"{sha256.hexdigest()}  {file.relative_to(output_dir)}")
 
-        checksum_path = self.output_dir / "checksums.txt"
+        checksum_path = output_dir / "checksums.txt"
         checksum_path.write_text("\n".join(checksums))
 
 
 def train_sae(
     embeddings_path: str | Path | None = None,
     dataset: "EmbeddingDataset | None" = None,
-    output_dir: str = "checkpoints/sae",
+    output_dir: str | None = None,
     config: TrainingConfig | None = None,
+    normalize_embeddings: bool = True,
     **kwargs,
 ) -> SAETrainer:
     """
@@ -705,10 +762,14 @@ def train_sae(
         Path to embeddings file (.npy or .pt). Ignored if dataset is provided.
     dataset : EmbeddingDataset or None
         Pre-configured dataset. If None, loads from embeddings_path.
-    output_dir : str
-        Output directory for checkpoints
+    output_dir : str or None
+        Output directory for checkpoints. If None, uses config.output_dir.
     config : TrainingConfig or None
         Training configuration. If None, uses defaults.
+    normalize_embeddings : bool, default=True
+        Whether to L2-normalize embeddings loaded from embeddings_path. Set to
+        False when training on embeddings produced by compute_and_save_embeddings
+        with normalization enabled.
     **kwargs
         Additional arguments to override config
 
@@ -729,7 +790,11 @@ def train_sae(
     """
     # Create or update config
     if config is None:
-        config = TrainingConfig(output_dir=output_dir)
+        config = TrainingConfig(
+            output_dir=output_dir or TrainingConfig.output_dir,
+        )
+    elif output_dir is not None:
+        config.output_dir = output_dir
 
     # Update config with any provided kwargs
     for key, value in kwargs.items():
@@ -743,7 +808,11 @@ def train_sae(
 
         from saetopic.training.data import EmbeddingDataset
 
-        dataset = EmbeddingDataset.from_file(embeddings_path)
+        dataset = EmbeddingDataset.from_file(
+            embeddings_path,
+            normalize=normalize_embeddings,
+            mmap_mode="r",
+        )
 
     # Auto-detect and validate input_dim from dataset
     if hasattr(dataset, "embedding_dim"):
@@ -768,7 +837,7 @@ def train_sae(
     )
 
     # Create trainer
-    trainer = SAETrainer(model, config, output_dir)
+    trainer = SAETrainer(model, config)
 
     # Train
     trainer.fit(dataset)
@@ -825,7 +894,7 @@ def compute_and_save_embeddings(
     n_total = 0
     dim = None
     batch_count = 0
-    chunk_arrays = []
+    chunk_arrays: list[np.ndarray] = []
     chunk_paths: list[tuple[Path, int]] = []
     chunk_pending = 0
     chunk_index = 0

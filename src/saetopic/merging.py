@@ -56,8 +56,8 @@ class TopicMerger:
         TopicMerger
             Fitted merger instance
         """
-        # TODO: Implement feature clustering (Week 3)
-        raise NotImplementedError("TopicMerger.fit will be implemented in Week 3")
+        # TODO: Implement feature clustering
+        raise NotImplementedError("TopicMerger.fit is not implemented yet")
 
     def transform(
         self,
@@ -76,8 +76,8 @@ class TopicMerger:
         np.ndarray
             Document-topic probabilities (n_docs x n_topics)
         """
-        # TODO: Implement activation aggregation (Week 3)
-        raise NotImplementedError("TopicMerger.transform will be implemented in Week 3")
+        # TODO: Implement activation aggregation
+        raise NotImplementedError("TopicMerger.transform is not implemented yet")
 
     def fit_transform(
         self,

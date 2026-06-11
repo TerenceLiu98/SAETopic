@@ -1,8 +1,8 @@
 """
-SAETopic: BERTopic-style topic modeling with sparse autoencoder topic atoms.
+SAETopic: sparse autoencoder topic-atom training.
 
-This is an unofficial clean-room implementation inspired by:
-"Sparse Autoencoders are Topic Models" (SAE-TM).
+The current package focuses on memory-aware SAE training. The topic inference
+API is planned and exposed as stubs while it is under development.
 """
 
 __version__ = "0.1.0"

@@ -2,7 +2,7 @@
 Tests for configuration module.
 """
 
-from saetopic.config import HFHubConfig, SAETrainingConfig, SAETopicConfig
+from saetopic.config import HFHubConfig, SAETopicConfig, SAETrainingConfig
 
 
 def test_default_saetopic_config():

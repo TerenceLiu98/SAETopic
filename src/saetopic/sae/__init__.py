@@ -5,4 +5,4 @@ This package provides SAE architecture definitions, checkpoint loading,
 and activation extraction.
 """
 
-# TODO: Implement SAE architecture and loading (Week 2)
+# TODO: Implement SAE architecture and loading

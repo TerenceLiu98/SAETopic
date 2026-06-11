@@ -5,24 +5,28 @@ This example shows how to train an SAE on pre-computed embeddings.
 For a complete pipeline including embedding computation, see the
 full training example.
 """
+# ruff: noqa: E402
 
 import numpy as np
-from saetopic.training import train_sae
-from saetopic.training.train_sae import TrainingConfig
-from saetopic.training.data import EmbeddingDataset
+import torch
 
 # Example 1: Complete pipeline - HuggingFace dataset → embeddings → training
 # -------------------------------------------------
 # Recommended workflow for large-scale training
-
 from datasets import load_dataset
 from sentence_transformers import SentenceTransformer
-from saetopic.training import train_sae, compute_and_save_embeddings
+
+from saetopic.training import compute_and_save_embeddings, train_sae
+from saetopic.training.data import EmbeddingDataset
 from saetopic.training.train_sae import TrainingConfig
-import torch
 
 # Setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+encode_device = (
+    [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1
+    else None
+)
 output_dir = "/home/jovyan/helloworld-datavol-1/SAETopic/embeddings"
 embeddings_path = f"{output_dir}/finewiki_embeddings.npy"
 
@@ -38,7 +42,10 @@ embedder = SentenceTransformer(
     model_kwargs={"dtype": torch.bfloat16} if device.type == "cuda" else {},
     truncate_dim=512            # for matryoshka, please check: https://www.sbert.net/docs/package_reference/sentence_transformer/model.html
 )
-embedder.max_seq_length = 4096
+
+# FineWiki articles can be long. Keep each embedded chunk bounded so
+# encode_batch_size controls memory predictably.
+embedder.max_seq_length = 512
 
 # Step 2: Load and stream HuggingFace dataset
 # --------------------------------------------
@@ -48,9 +55,13 @@ streaming_dataset = create_streaming_dataset(
     dataset_name="HuggingFaceFW/finewiki",
     split="train",
     embedder=embedder,
-    buffer_size=10000,          # Shuffle buffer size
-    embedding_batch_size=16,    # Texts to accumulate before yielding
-    encode_batch_size=16,       # Internal batch for embedder.encode() (lower if OOM)
+    buffer_size=1000,           # Shuffle buffer size
+    embedding_batch_size=64,    # Text chunks to accumulate before yielding
+    encode_batch_size=8,        # Internal batch for embedder.encode() (lower if OOM)
+    encode_device=encode_device,  # e.g. ["cuda:0", "cuda:1"] for multi-GPU
+    encode_chunk_size=128,      # Work distribution size for multi-process encode
+    text_chunk_size=512,        # Split long FineWiki articles before embedding
+    text_chunk_overlap=32,
     max_samples=100000,         # Adjust based on your needs
 )
 
@@ -88,6 +99,7 @@ config = TrainingConfig(
 trainer = train_sae(
     embeddings_path=embeddings_path,
     config=config,
+    normalize_embeddings=False,  # create_streaming_dataset normalizes before saving
 )
 
 # The trained model is now available at:
@@ -133,17 +145,17 @@ upload_checkpoint(
     create_repo=True,
 )
 
-# Now others can use your checkpoint:
-# from saetopic import SAETopicModel
-# model = SAETopicModel.from_pretrained("saetopic/jina-v5-sae-small")
+# The uploaded folder is a self-contained SAE training checkpoint.
+# SAETopicModel.from_pretrained() and end-to-end inference are planned, but not
+# implemented yet; use the checkpoint as a training artifact for now.
 
 
 # Example 4: Compute embeddings from text first
 # -------------------------------------------------
 # Complete pipeline from text to trained SAE
 
+import torch
 from sentence_transformers import SentenceTransformer
-import torch 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -153,7 +165,7 @@ embedder = SentenceTransformer(
     trust_remote_code=True,
     device=device,
     model_kwargs={"dtype": torch.bfloat16}, # Use bf16 if your GPU supports it
-    # config_kwargs={"_attn_implementation": "flash_attention_2"}, # use 'fa2' if you GPU supports it 
+    # config_kwargs={"_attn_implementation": "flash_attention_2"}, # use 'fa2' if you GPU supports it
 )
 
 # Load your text corpus
@@ -195,11 +207,11 @@ trainer = train_sae(
 # The embeddings are computed on-the-fly during training using HF Datasets streaming mode.
 
 import torch
-from datasets import load_dataset
 from sentence_transformers import SentenceTransformer
-from saetopic.training import create_streaming_dataset, train_sae, compute_and_save_embeddings
-from saetopic.training.train_sae import TrainingConfig
+
+from saetopic.training import compute_and_save_embeddings, create_streaming_dataset, train_sae
 from saetopic.training.data import StreamingEmbeddingDataset
+from saetopic.training.train_sae import TrainingConfig
 
 # Setup device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -223,13 +235,15 @@ streaming_dataset = create_streaming_dataset(
     split="train",
     embedder=embedder,
     text_column="text",
-    buffer_size=10000,  # Shuffle buffer size
-    embedding_batch_size=256,  # Texts to accumulate before yielding
-    encode_batch_size=32,  # Internal batch for embedder.encode() (lower if OOM)
+    buffer_size=1000,  # Shuffle buffer size
+    embedding_batch_size=64,  # Text chunks to accumulate before yielding
+    encode_batch_size=8,  # Internal batch for embedder.encode() (lower if OOM)
+    text_chunk_size=512,
+    text_chunk_overlap=32,
     max_samples=50000,  # 50k samples for testing
 )
 
-print(f"Streaming dataset created (embedding_dim will be detected on first batch)")
+print("Streaming dataset created (embedding_dim will be detected on first batch)")
 
 config = TrainingConfig(
     input_dim=768,  # nano model is 768-dim (will be auto-detected)
@@ -264,9 +278,11 @@ streaming_dataset = StreamingEmbeddingDataset(
     hf_dataset=hf_ds,
     embedder=embedder,
     text_column="text",
-    buffer_size=10000,
-    embedding_batch_size=256,
-    encode_batch_size=32,  # Internal batch for embedder.encode() (lower if OOM)
+    buffer_size=1000,
+    embedding_batch_size=64,
+    encode_batch_size=8,  # Internal batch for embedder.encode() (lower if OOM)
+    text_chunk_size=512,
+    text_chunk_overlap=32,
     normalize=True,
     max_samples=50000,
     task="clustering",  # Required for Jina v5
@@ -282,9 +298,11 @@ streaming_dataset = create_streaming_dataset(
     dataset_name="HuggingFaceFW/finewiki",
     split="train",
     embedder=embedder,
-    buffer_size=10000,
-    embedding_batch_size=256,
-    encode_batch_size=32,  # Internal batch for embedder.encode() (lower if OOM)
+    buffer_size=1000,
+    embedding_batch_size=64,
+    encode_batch_size=8,  # Internal batch for embedder.encode() (lower if OOM)
+    text_chunk_size=512,
+    text_chunk_overlap=32,
     max_samples=50000,
 )
 
@@ -307,7 +325,11 @@ config = TrainingConfig(
     output_dir="checkpoints/jina-v5-sae-nano",
 )
 
-trainer = train_sae(embeddings_path="data/finewiki_embeddings.npy", config=config)
+trainer = train_sae(
+    embeddings_path="data/finewiki_embeddings.npy",
+    config=config,
+    normalize_embeddings=False,  # streaming dataset normalized before saving
+)
 
 
 # Tips for streaming training:
@@ -317,31 +339,35 @@ trainer = train_sae(embeddings_path="data/finewiki_embeddings.npy", config=confi
 1. Buffer Size:
    - Larger buffer = better shuffling but more memory
    - HF shuffle buffer + dataset buffer = total shuffling capacity
-   - Recommended: buffer_size >= 10000
+   - Start with buffer_size=1000 for FineWiki; increase only if memory allows
 
 2. Batch Sizes:
    - embedding_batch_size: for encoding (can be larger, limited by GPU/CPU)
+   - encode_batch_size: internal SentenceTransformer batch size; lower if OOM
    - training batch_size: for SAE training (in config)
    - They can be different!
 
 3. Memory:
-   - Streaming uses less disk space (no pre-computed embeddings)
-   - But embedder model stays in memory
+   - Direct streaming training uses less disk space but keeps embedder in memory
+   - Pre-computing embeddings releases the embedder before SAE training
    - Use smaller embedding model (nano/small) if GPU memory is limited
+   - Use text_chunk_size/max_seq_length to bound long FineWiki articles
 
 4. Performance:
    - Encoding is done by SentenceTransformers on the device you specify
    - Training is done on GPU if available
-   - For large datasets, consider encoding on GPU too for speed
+   - For large datasets, use encode_device=["cuda:0", "cuda:1"] or CLI --auto-multi-gpu
 
 5. Reproducibility:
-   - Set seed for both HF shuffle and dataset
+   - Set seed for both HF shuffle and create_streaming_dataset(seed=...)
    - Each epoch will have different order due to buffering
    - For exact reproducibility, pre-compute and save embeddings
 
 6. Save embeddings for faster iteration:
    - Use compute_and_save_embeddings() to pre-compute once
-   - Then train from .npy file for fast hyperparameter tuning
+   - Then train from memory-mapped .npy for fast hyperparameter tuning
+   - If embeddings were saved from create_streaming_dataset(normalize=True),
+     pass normalize_embeddings=False to train_sae()
 """
 
 
@@ -354,7 +380,7 @@ from sentence_transformers import SentenceTransformer
 embedder = SentenceTransformer(
     "jinaai/jina-embeddings-v5-text-small",
     device="cuda",
-    model_kwargs={"torch_dtype": torch.float16},  # Use half precision
+    model_kwargs={"dtype": torch.float16},  # Use half precision
 )
 
 # In StreamingEmbeddingDataset, the encode call will use GPU

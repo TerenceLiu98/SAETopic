@@ -10,10 +10,10 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from huggingface_hub import HfApi
+    pass
 
 
 def download_checkpoint(
@@ -57,7 +57,6 @@ def download_checkpoint(
         repo_id=repo_id,
         filename=filename,
         local_dir=local_cache,
-        local_dir_use_symlinks=False,
         **kwargs,
     )
 
@@ -88,7 +87,7 @@ def download_config(
     """
     config_path = download_checkpoint(repo_id, local_cache, filename)
     with open(config_path) as f:
-        return json.load(f)
+        return cast(dict[str, Any], json.load(f))
 
 
 def verify_checksum(
@@ -320,19 +319,18 @@ def list_repo_files(
         List of file paths in the repository
     """
     try:
-        from huggingface_hub import HfApi, list_repo_tree
+        from huggingface_hub import list_repo_tree
     except ImportError:
         raise ImportError(
             "huggingface_hub is required. Install with: pip install huggingface_hub"
         )
 
-    api = HfApi()
     tree = list_repo_tree(repo_id, repo_type="model", token=None)
 
     files = []
     for item in tree:
-        if item.type == "file":
-            files.append(item.path)
+        if getattr(item, "type", None) == "file":
+            files.append(getattr(item, "path"))
 
     return files
 

@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    import numpy as np
+    pass
 
 
 def compute_diversity(
@@ -28,8 +28,8 @@ def compute_diversity(
     float
         Diversity score (higher is more diverse)
     """
-    # TODO: Implement diversity computation (Week 5)
-    raise NotImplementedError("compute_diversity will be implemented in Week 5")
+    # TODO: Implement diversity computation
+    raise NotImplementedError("compute_diversity is not implemented yet")
 
 
 def compute_coherence(
@@ -56,8 +56,8 @@ def compute_coherence(
     dict
         Mapping from topic_id to coherence score
     """
-    # TODO: Implement coherence computation (Week 5)
-    raise NotImplementedError("compute_coherence will be implemented in Week 5")
+    # TODO: Implement coherence computation
+    raise NotImplementedError("compute_coherence is not implemented yet")
 
 
 def compute_stability(
@@ -82,5 +82,5 @@ def compute_stability(
     float
         Stability score (higher is more stable)
     """
-    # TODO: Implement stability computation (Week 5)
-    raise NotImplementedError("compute_stability will be implemented in Week 5")
+    # TODO: Implement stability computation
+    raise NotImplementedError("compute_stability is not implemented yet")

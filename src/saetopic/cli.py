@@ -5,15 +5,23 @@ Command-line interface for SAETopic.
 from __future__ import annotations
 
 import argparse
+import sys
+
+
+def _raise_not_implemented(command: str) -> None:
+    """Exit with a clear message for planned inference CLI commands."""
+    raise SystemExit(
+        f"saetopic {command!s} is not implemented yet. "
+        "Current supported workflows are available via `saetopic-train` "
+        "or `python -m saetopic.training.cli`."
+    )
 
 
 def main() -> None:
     """
     Main CLI entry point.
     """
-    parser = argparse.ArgumentParser(
-        description="SAETopic: BERTopic-style topic modeling with SAE topic atoms"
-    )
+    parser = argparse.ArgumentParser(description="SAETopic topic inference commands")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     # fit command
@@ -42,17 +50,17 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # TODO: Implement CLI commands (Week 5)
     if args.command == "fit":
-        print(f"Fit command: {args.input} -> {args.output}")
+        _raise_not_implemented("fit")
     elif args.command == "topics":
-        print(f"Topics command: {args.model}")
+        _raise_not_implemented("topics")
     elif args.command == "retopic":
-        print(f"Retopic command: {args.model} -> {args.n_topics} topics")
+        _raise_not_implemented("retopic")
     elif args.command == "visualize":
-        print(f"Visualize command: {args.model}")
+        _raise_not_implemented("visualize")
     else:
         parser.print_help()
+        sys.exit(2)
 
 
 if __name__ == "__main__":

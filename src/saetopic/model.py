@@ -1,8 +1,8 @@
 """
-Main SAETopicModel class with BERTopic-like API.
+Main SAETopicModel class with the planned topic inference API.
 
-This module provides the primary interface for topic modeling using
-sparse autoencoder topic atoms.
+The public methods are present as API stubs while pretrained loading and
+end-to-end topic inference are still under development.
 """
 
 from __future__ import annotations
@@ -16,10 +16,10 @@ if TYPE_CHECKING:
 
 class SAETopicModel:
     """
-    SAETopic: BERTopic-style topic modeling with sparse autoencoder topic atoms.
+    SAETopic: planned topic inference with SAE topic atoms.
 
-    The core differentiator is the ability to change topic granularity via
-    `retopic()` without retraining the SAE or recomputing corpus adaptation.
+    The current class captures the intended public API. Methods such as
+    `from_pretrained`, `fit_transform`, and `retopic` are not implemented yet.
 
     Parameters
     ----------
@@ -100,7 +100,7 @@ class SAETopicModel:
             Initialized model with pretrained SAE checkpoint
         """
         # TODO: Implement checkpoint loading from HF Hub
-        raise NotImplementedError("from_pretrained will be implemented in Week 3")
+        raise NotImplementedError("from_pretrained is not implemented yet")
 
     def fit(
         self,
@@ -128,8 +128,8 @@ class SAETopicModel:
         SAETopicModel
             Fitted model instance
         """
-        # TODO: Implement full fit pipeline (Week 3)
-        raise NotImplementedError("fit will be implemented in Week 3")
+        # TODO: Implement full fit pipeline
+        raise NotImplementedError("fit is not implemented yet")
 
     def fit_transform(
         self,
@@ -159,8 +159,8 @@ class SAETopicModel:
         probs : np.ndarray or None
             Topic probabilities for each document
         """
-        # TODO: Implement full fit_transform pipeline (Week 3)
-        raise NotImplementedError("fit_transform will be implemented in Week 3")
+        # TODO: Implement full fit_transform pipeline
+        raise NotImplementedError("fit_transform is not implemented yet")
 
     def transform(
         self,
@@ -184,8 +184,8 @@ class SAETopicModel:
         probs : np.ndarray or None
             Topic probabilities for each document
         """
-        # TODO: Implement transform (Week 4)
-        raise NotImplementedError("transform will be implemented in Week 4")
+        # TODO: Implement transform
+        raise NotImplementedError("transform is not implemented yet")
 
     def retopic(
         self,
@@ -210,8 +210,8 @@ class SAETopicModel:
         SAETopicModel
             Self with updated topics
         """
-        # TODO: Implement retopic (Week 3)
-        raise NotImplementedError("retopic will be implemented in Week 3")
+        # TODO: Implement retopic
+        raise NotImplementedError("retopic is not implemented yet")
 
     def reduce_topics(
         self,
@@ -219,7 +219,7 @@ class SAETopicModel:
         nr_topics: int = 30,
     ) -> "SAETopicModel":
         """
-        BERTopic-compatible alias for retopic().
+        Alias for retopic().
 
         Parameters
         ----------
@@ -244,8 +244,8 @@ class SAETopicModel:
         pd.DataFrame
             DataFrame with topic_id, count, name, and top words
         """
-        # TODO: Implement get_topic_info (Week 3)
-        raise NotImplementedError("get_topic_info will be implemented in Week 3")
+        # TODO: Implement get_topic_info
+        raise NotImplementedError("get_topic_info is not implemented yet")
 
     def get_topic(
         self,
@@ -267,8 +267,8 @@ class SAETopicModel:
         list of (str, float)
             Top words with their scores
         """
-        # TODO: Implement get_topic (Week 3)
-        raise NotImplementedError("get_topic will be implemented in Week 3")
+        # TODO: Implement get_topic
+        raise NotImplementedError("get_topic is not implemented yet")
 
     def get_topics(self) -> dict[int, list[tuple[str, float]]]:
         """
@@ -279,8 +279,8 @@ class SAETopicModel:
         dict
             Mapping from topic_id to list of (word, score) tuples
         """
-        # TODO: Implement get_topics (Week 3)
-        raise NotImplementedError("get_topics will be implemented in Week 3")
+        # TODO: Implement get_topics
+        raise NotImplementedError("get_topics is not implemented yet")
 
     def get_document_info(
         self,
@@ -299,8 +299,8 @@ class SAETopicModel:
         pd.DataFrame
             DataFrame with document_id, topic, probability, and representative words
         """
-        # TODO: Implement get_document_info (Week 4)
-        raise NotImplementedError("get_document_info will be implemented in Week 4")
+        # TODO: Implement get_document_info
+        raise NotImplementedError("get_document_info is not implemented yet")
 
     def get_representative_docs(
         self,
@@ -322,8 +322,8 @@ class SAETopicModel:
         list of str
             Representative document texts
         """
-        # TODO: Implement get_representative_docs (Week 4)
-        raise NotImplementedError("get_representative_docs will be implemented in Week 4")
+        # TODO: Implement get_representative_docs
+        raise NotImplementedError("get_representative_docs is not implemented yet")
 
     def find_topics(
         self,
@@ -345,8 +345,8 @@ class SAETopicModel:
         list of (int, float)
             Topic IDs with similarity scores
         """
-        # TODO: Implement find_topics (Week 4)
-        raise NotImplementedError("find_topics will be implemented in Week 4")
+        # TODO: Implement find_topics
+        raise NotImplementedError("find_topics is not implemented yet")
 
     def generate_topic_labels(
         self,
@@ -368,8 +368,8 @@ class SAETopicModel:
         dict
             Mapping from topic_id to label string
         """
-        # TODO: Implement generate_topic_labels (Week 5)
-        raise NotImplementedError("generate_topic_labels will be implemented in Week 5")
+        # TODO: Implement generate_topic_labels
+        raise NotImplementedError("generate_topic_labels is not implemented yet")
 
     def set_topic_labels(self, labels: dict[int, str]) -> None:
         """
@@ -380,8 +380,8 @@ class SAETopicModel:
         labels : dict
             Mapping from topic_id to label string
         """
-        # TODO: Implement set_topic_labels (Week 5)
-        raise NotImplementedError("set_topic_labels will be implemented in Week 5")
+        # TODO: Implement set_topic_labels
+        raise NotImplementedError("set_topic_labels is not implemented yet")
 
     def visualize_topics(self):
         """
@@ -392,8 +392,8 @@ class SAETopicModel:
         plotly.graph_objects.Figure
             Interactive 2D visualization
         """
-        # TODO: Implement visualize_topics (Week 4)
-        raise NotImplementedError("visualize_topics will be implemented in Week 4")
+        # TODO: Implement visualize_topics
+        raise NotImplementedError("visualize_topics is not implemented yet")
 
     def visualize_documents(
         self,
@@ -412,8 +412,8 @@ class SAETopicModel:
         plotly.graph_objects.Figure
             Interactive 2D visualization
         """
-        # TODO: Implement visualize_documents (Week 4)
-        raise NotImplementedError("visualize_documents will be implemented in Week 4")
+        # TODO: Implement visualize_documents
+        raise NotImplementedError("visualize_documents is not implemented yet")
 
     def visualize_hierarchy(self):
         """
@@ -424,8 +424,8 @@ class SAETopicModel:
         plotly.graph_objects.Figure
             Interactive hierarchical visualization
         """
-        # TODO: Implement visualize_hierarchy (Week 4)
-        raise NotImplementedError("visualize_hierarchy will be implemented in Week 4")
+        # TODO: Implement visualize_hierarchy
+        raise NotImplementedError("visualize_hierarchy is not implemented yet")
 
     def visualize_atoms(
         self,
@@ -446,8 +446,8 @@ class SAETopicModel:
         plotly.graph_objects.Figure
             Interactive atom-level visualization
         """
-        # TODO: Implement visualize_atoms (Week 4)
-        raise NotImplementedError("visualize_atoms will be implemented in Week 4")
+        # TODO: Implement visualize_atoms
+        raise NotImplementedError("visualize_atoms is not implemented yet")
 
     def evaluate(
         self,
@@ -466,8 +466,8 @@ class SAETopicModel:
         dict
             Mapping from metric name to score
         """
-        # TODO: Implement evaluate (Week 5)
-        raise NotImplementedError("evaluate will be implemented in Week 5")
+        # TODO: Implement evaluate
+        raise NotImplementedError("evaluate is not implemented yet")
 
     def save(
         self,
@@ -484,8 +484,8 @@ class SAETopicModel:
         serialization : str, default="safetensors"
             Serialization format ("safetensors", "pickle")
         """
-        # TODO: Implement save (Week 4)
-        raise NotImplementedError("save will be implemented in Week 4")
+        # TODO: Implement save
+        raise NotImplementedError("save is not implemented yet")
 
     @classmethod
     def load(cls, path: str) -> "SAETopicModel":
@@ -502,5 +502,5 @@ class SAETopicModel:
         SAETopicModel
             Loaded model instance
         """
-        # TODO: Implement load (Week 4)
-        raise NotImplementedError("load will be implemented in Week 4")
+        # TODO: Implement load
+        raise NotImplementedError("load is not implemented yet")

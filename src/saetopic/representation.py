@@ -40,8 +40,8 @@ class TopicRepresentation:
         list of (str, float)
             Top words with scores
         """
-        # TODO: Implement word extraction (Week 3)
-        raise NotImplementedError("get_topic_words will be implemented in Week 3")
+        # TODO: Implement word extraction
+        raise NotImplementedError("get_topic_words is not implemented yet")
 
     def generate_topic_labels(
         self,
@@ -63,8 +63,8 @@ class TopicRepresentation:
         dict
             Mapping from topic_id to label
         """
-        # TODO: Implement label generation (Week 5)
-        raise NotImplementedError("generate_topic_labels will be implemented in Week 5")
+        # TODO: Implement label generation
+        raise NotImplementedError("generate_topic_labels is not implemented yet")
 
     def get_topic_info(self) -> pd.DataFrame:
         """
@@ -75,5 +75,5 @@ class TopicRepresentation:
         pd.DataFrame
             Topic information with counts, names, top words
         """
-        # TODO: Implement topic info (Week 3)
-        raise NotImplementedError("get_topic_info will be implemented in Week 3")
+        # TODO: Implement topic info
+        raise NotImplementedError("get_topic_info is not implemented yet")

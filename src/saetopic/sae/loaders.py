@@ -63,8 +63,8 @@ class SAECheckpoint:
         SAECheckpoint
             Loaded checkpoint with metadata and weights
         """
-        # TODO: Implement HF Hub download (Week 3)
-        raise NotImplementedError("SAECheckpoint.from_pretrained will be implemented in Week 3")
+        # TODO: Implement HF Hub download
+        raise NotImplementedError("SAECheckpoint.from_pretrained is not implemented yet")
 
 
 def load_sae_weights(repo_id: str, local_cache: str | None = None):
@@ -82,5 +82,5 @@ def load_sae_weights(repo_id: str, local_cache: str | None = None):
     -------
     Loaded model weights
     """
-    # TODO: Implement weight loading (Week 3)
-    raise NotImplementedError("load_sae_weights will be implemented in Week 3")
+    # TODO: Implement weight loading
+    raise NotImplementedError("load_sae_weights is not implemented yet")

@@ -1,18 +1,22 @@
 # SAETopic
 
-> **Sparse Autoencoder Topic Modeling with a BERTopic-like API**
+> **Sparse Autoencoder topic-atom training and planned topic inference**
 
-SAETopic is a Python package for topic modeling using sparse autoencoder (SAE) topic atoms. It provides a BERTopic-style interface while enabling rapid topic granularity exploration without retraining the core model.
+SAETopic is a Python package for training sparse autoencoder (SAE) topic atoms.
+The current implementation focuses on memory-aware SAE training; the
+inference interface and rapid topic granularity exploration are planned.
 
-**Unofficial clean-room implementation** inspired by [SAE-TM](https://github.com/ExplainableML/SAE-TM).
+**Unofficial clean-room implementation** for SAE-based topic-atom training.
 
 ## Core Features
 
-- **Pretrained Topic Atoms** — Use downloadable SAE weights, no training required
-- **Retopic Without Retraining** — Change topic granularity (`retopic(n_topics=...)`) without retraining SAE or corpus adaptation
-- **BERTopic-style API** — Familiar `fit_transform`, `get_topic_info`, `visualize_topics` interface
-- **Interpretable Topics** — Corpus-specific word interpretation for each topic atom
-- **Fast Exploration** — Try 20, 50, 100, 200 topics on the same fitted model
+- **SAE Training Pipeline** — Stream HF text datasets, pre-compute embeddings, and train sparse topic atoms
+- **Memory-Aware Large-Corpus Training** — Long-text chunking, multi-GPU embedding, chunked `.npy` writes, mmap training, and sparse top-k SAE training
+- **Pretrained Topic Atoms** — Planned downloadable SAE weights for no-training usage
+- **Retopic Without Retraining** — Planned topic granularity changes (`retopic(n_topics=...)`) without retraining SAE or corpus adaptation
+- **Topic Inference API** — Planned `fit_transform`, `get_topic_info`, `visualize_topics` interface
+- **Interpretable Topics** — Planned corpus-specific word interpretation for each topic atom
+- **Fast Exploration** — Planned exploration of 20, 50, 100, 200 topics on the same fitted model
 
 ## Installation
 
@@ -30,6 +34,34 @@ pip install "saetopic[all]"   # All extras
 ```
 
 ## Quickstart
+
+Current training workflow:
+
+```bash
+pip install "saetopic[train]"
+
+saetopic-train embed \
+  --dataset-name HuggingFaceFW/finewiki \
+  --output data/finewiki_embeddings.npy \
+  --max-samples 100000 \
+  --text-chunk-size 512 \
+  --text-chunk-overlap 32 \
+  --max-seq-length 512 \
+  --encode-batch-size 8 \
+  --embedding-batch-size 64 \
+  --seed 42 \
+  --truncate-dim 512
+
+saetopic-train train \
+  --embeddings data/finewiki_embeddings.npy \
+  --no-normalize-embeddings \
+  --input-dim 512 \
+  --expansion-factor 32 \
+  --top-k 32 \
+  --output checkpoints/jina-v5-sae-small
+```
+
+Planned pretrained-model workflow:
 
 ```python
 from saetopic import SAETopicModel
@@ -52,16 +84,6 @@ model.retopic(n_topics=30)
 # Search topics by query
 model.find_topics("climate policy", top_n=5)
 ```
-
-## Why SAETopic?
-
-| Feature | BERTopic | SAE-TM | SAETopic |
-|---------|----------|-------|----------|
-| BERTopic-style API | ✅ | ❌ | ✅ |
-| Pretrained weights | Partial | ❌ | ✅ |
-| Retopic without retraining | Partial | ✅ | ✅ |
-| Interpretable topic atoms | ❌ | ✅ | ✅ |
-| Quickstart in 5 minutes | ✅ | ❌ | ✅ |
 
 ## Key Concepts
 
@@ -113,13 +135,77 @@ loaded = SAETopicModel.load("my_model")
 **Default**: `jinaai/jina-embeddings-v5-text-small` with `task="clustering"`
 
 - Dimension: 1024
+- Recommended training examples use Matryoshka `--truncate-dim 512`, so pair
+  those saved embeddings with `--input-dim 512`
 - Optimized for clustering and downstream tasks
 - Strong semantic representation with permissive licensing
 
 ## Pretraining Datasets
 
 - **Text**: [HuggingFaceFW/finewiki](https://huggingface.co/datasets/HuggingFaceFW/finewiki) (CC-BY-SA 4.0 / Apache 2.0)
-- **Vision** (v0.3+): [ILSVRC/imagenet-1k](https://huggingface.co/datasets/ILSVRC/imagenet-1k)
+- **Vision** (planned): [ILSVRC/imagenet-1k](https://huggingface.co/datasets/ILSVRC/imagenet-1k)
+
+## Training Topic Atoms
+
+For large text corpora such as FineWiki, pre-compute embeddings once and train
+SAEs from the saved `.npy` file. This avoids keeping the embedding model in GPU
+memory during SAE training and makes hyperparameter sweeps much faster.
+
+```bash
+# Step 1: stream FineWiki, split long articles, and save normalized embeddings.
+saetopic-train embed \
+  --dataset-name HuggingFaceFW/finewiki \
+  --output data/finewiki_embeddings.npy \
+  --max-samples 100000 \
+  --auto-multi-gpu \
+  --text-chunk-size 512 \
+  --text-chunk-overlap 32 \
+  --max-seq-length 512 \
+  --encode-batch-size 8 \
+  --embedding-batch-size 64 \
+  --encode-chunk-size 128 \
+  --seed 42 \
+  --truncate-dim 512
+
+# Step 2: train from the saved embeddings.
+# .npy files are memory-mapped by default; skip re-normalization because the
+# embed step already normalized the embeddings before saving.
+saetopic-train train \
+  --embeddings data/finewiki_embeddings.npy \
+  --no-normalize-embeddings \
+  --input-dim 512 \
+  --expansion-factor 32 \
+  --top-k 32 \
+  --batch-size 256 \
+  --n-epochs 100 \
+  --output checkpoints/jina-v5-sae-small \
+  --dataset-name HuggingFaceFW/finewiki \
+  --dataset-license "CC-BY-SA 4.0 / Apache 2.0"
+
+# Optional: upload the self-contained final checkpoint.
+saetopic-train upload \
+  --checkpoint-dir checkpoints/jina-v5-sae-small/final \
+  --repo-id your-org/jina-v5-sae-small \
+  --create-repo \
+  --private
+```
+
+Notes:
+
+- FineWiki articles are long; `--text-chunk-size` prevents silent truncation and
+  keeps per-batch GPU memory predictable.
+- `--auto-multi-gpu` passes all visible CUDA devices to SentenceTransformers'
+  multi-process encoder. If a single document chunk is too long, reduce
+  `--text-chunk-size` or `--max-seq-length`; extra GPUs improve throughput but
+  do not fix single-sample OOM.
+- The embed command L2-normalizes embeddings by default. Keep
+  `train --no-normalize-embeddings` for those files; if you use
+  `embed --no-normalize-embeddings`, let `train` normalize them unless your
+  embedder already returns the exact representation you want to train on.
+- SAE training uses a sparse top-k path internally, so it does not materialize
+  the dense `(batch_size, n_features)` activation tensor during training.
+- The top-level `saetopic` inference CLI is planned. Current command-line
+  training workflows use `saetopic-train` or `python -m saetopic.training.cli`.
 
 ## Development
 
@@ -145,9 +231,13 @@ python -m build
 
 This project is in early development (v0.1). The API is subject to change.
 
-**Current Milestone**: Week 1 — Repo skeleton, API stubs
+**Current Milestone**: SAE training infrastructure. The training path supports
+FineWiki-style large text corpora with streaming embedding, chunked embedding
+storage, mmap loading, and memory-efficient sparse top-k SAE training.
 
-See [CLAUDE.md](CLAUDE.md) for development guidance and [docs/PRD.md](docs/PRD.md) for complete planning.
+Pretrained Hub loading and the full topic inference API are still in progress.
+
+See [docs/PRD.md](docs/PRD.md) for current requirements and planning.
 
 ## Citation
 
@@ -155,18 +245,12 @@ If you use SAETopic, please cite:
 
 ```bibtex
 @software{saetopic2026,
-  title = {SAETopic: BERTopic-style Topic Modeling with Sparse Autoencoders},
+  title = {SAETopic: Topic-Atom Training with Sparse Autoencoders},
   author = {SAETopic Contributors},
   year = {2026},
   url = {https://github.com/yourusername/saetopic}
 }
 ```
-
-## Inspired By
-
-- **SAE-TM**: [Sparse Autoencoders are Topic Models](https://github.com/ExplainableML/SAE-TM)
-- **BERTopic**: [https://github.com/maartengr/bertopic](https://github.com/maartengr/bertopic)
-- **Concept**: [https://github.com/MaartenGr/Concept](https://github.com/MaartenGr/Concept)
 
 ## License
 
@@ -174,4 +258,4 @@ Apache-2.0
 
 ## Legal Notice
 
-SAETopic is an independent, unofficial clean-room implementation. It is not affiliated with or endorsed by the authors of SAE-TM. All SAE code and checkpoints are trained independently using permissively licensed datasets.
+SAETopic is an independent, unofficial clean-room implementation. All SAE code and checkpoints are trained independently using permissively licensed datasets.

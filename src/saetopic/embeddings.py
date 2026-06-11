@@ -57,5 +57,5 @@ class EmbeddingBackend:
         np.ndarray
             Document embeddings (n_docs x embedding_dim)
         """
-        # TODO: Implement embedding computation (Week 3)
-        raise NotImplementedError("EmbeddingBackend.embed will be implemented in Week 3")
+        # TODO: Implement embedding computation
+        raise NotImplementedError("EmbeddingBackend.embed is not implemented yet")

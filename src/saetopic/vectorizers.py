@@ -60,8 +60,8 @@ class CorpusVectorizer:
         CorpusVectorizer
             Fitted vectorizer instance
         """
-        # TODO: Implement vocabulary building (Week 3)
-        raise NotImplementedError("CorpusVectorizer.fit will be implemented in Week 3")
+        # TODO: Implement vocabulary building
+        raise NotImplementedError("CorpusVectorizer.fit is not implemented yet")
 
     def transform(
         self,
@@ -80,8 +80,8 @@ class CorpusVectorizer:
         sparse.csr_matrix
             Bag-of-words matrix (n_docs x vocab_size)
         """
-        # TODO: Implement BoW transformation (Week 3)
-        raise NotImplementedError("CorpusVectorizer.transform will be implemented in Week 3")
+        # TODO: Implement BoW transformation
+        raise NotImplementedError("CorpusVectorizer.transform is not implemented yet")
 
     def fit_transform(
         self,

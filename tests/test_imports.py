@@ -18,7 +18,7 @@ def test_import_model():
 
 def test_import_config():
     """Test that config can be imported."""
-    from saetopic.config import SAETopicConfig, SAETrainingConfig, HFHubConfig
+    from saetopic.config import HFHubConfig, SAETopicConfig, SAETrainingConfig
 
     assert SAETopicConfig is not None
     assert SAETrainingConfig is not None
@@ -27,7 +27,7 @@ def test_import_config():
 
 def test_import_sae_modules():
     """Test that SAE modules can be imported."""
-    from saetopic.sae import modules, loaders, activations
+    from saetopic.sae import activations, loaders, modules
 
     assert modules is not None
     assert loaders is not None
@@ -45,15 +45,15 @@ def test_import_interpretation():
 def test_import_other_modules():
     """Test that other modules can be imported."""
     from saetopic import (
-        embeddings,
-        vectorizers,
-        merging,
-        representation,
-        visualization,
-        evaluation,
-        serialization,
         cli,
         config,
+        embeddings,
+        evaluation,
+        merging,
+        representation,
+        serialization,
+        vectorizers,
+        visualization,
     )
 
     assert embeddings is not None
@@ -65,3 +65,29 @@ def test_import_other_modules():
     assert serialization is not None
     assert cli is not None
     assert config is not None
+
+
+def test_main_cli_planned_commands_fail_clearly(monkeypatch):
+    """Test planned inference CLI commands do not silently succeed."""
+    from saetopic.cli import main
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "saetopic",
+            "fit",
+            "--input",
+            "docs.csv",
+            "--output",
+            "model",
+        ],
+    )
+
+    try:
+        main()
+    except SystemExit as exc:
+        assert exc.code != 0
+        assert "not implemented yet" in str(exc)
+        assert "saetopic-train" in str(exc)
+    else:
+        raise AssertionError("saetopic fit should fail until implemented")

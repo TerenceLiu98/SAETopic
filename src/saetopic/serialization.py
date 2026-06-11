@@ -4,7 +4,6 @@ Model serialization utilities.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -28,8 +27,8 @@ def save_model(
     serialization : str, default="safetensors"
         Serialization format ("safetensors", "pickle")
     """
-    # TODO: Implement model saving (Week 4)
-    raise NotImplementedError("save_model will be implemented in Week 4")
+    # TODO: Implement model saving
+    raise NotImplementedError("save_model is not implemented yet")
 
 
 def load_model(
@@ -48,5 +47,5 @@ def load_model(
     SAETopicModel
         Loaded model instance
     """
-    # TODO: Implement model loading (Week 4)
-    raise NotImplementedError("load_model will be implemented in Week 4")
+    # TODO: Implement model loading
+    raise NotImplementedError("load_model is not implemented yet")

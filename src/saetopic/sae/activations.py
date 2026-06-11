@@ -38,5 +38,5 @@ def extract_activations(
     np.ndarray
         Sparse activations (n_docs x n_features)
     """
-    # TODO: Implement activation extraction (Week 3)
-    raise NotImplementedError("extract_activations will be implemented in Week 3")
+    # TODO: Implement activation extraction
+    raise NotImplementedError("extract_activations is not implemented yet")
