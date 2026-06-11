@@ -36,7 +36,9 @@ embedder = SentenceTransformer(
     trust_remote_code=True,
     device=device,
     model_kwargs={"dtype": torch.bfloat16} if device.type == "cuda" else {},
+    truncate_dim=512            # for matryoshka, please check: https://www.sbert.net/docs/package_reference/sentence_transformer/model.html
 )
+embedder.max_seq_length = 4096
 
 # Step 2: Load and stream HuggingFace dataset
 # --------------------------------------------
@@ -47,8 +49,8 @@ streaming_dataset = create_streaming_dataset(
     split="train",
     embedder=embedder,
     buffer_size=10000,          # Shuffle buffer size
-    embedding_batch_size=8,    # Texts to accumulate before yielding
-    encode_batch_size=8,        # Internal batch for embedder.encode() (lower if OOM)
+    embedding_batch_size=16,    # Texts to accumulate before yielding
+    encode_batch_size=16,       # Internal batch for embedder.encode() (lower if OOM)
     max_samples=100000,         # Adjust based on your needs
 )
 
