@@ -366,6 +366,116 @@ def test_compute_and_save_embeddings_writes_sharded_directory(tmp_path):
     assert dataset[-1][0].item() == 3
 
 
+def test_compute_and_save_embeddings_writes_partial_manifest_on_failure(tmp_path):
+    """Test sharded saving leaves resumable metadata after a failed run."""
+    import json
+
+    from saetopic.training.train_sae import compute_and_save_embeddings
+
+    class FailingDataset:
+        max_samples = 7
+
+        def __iter__(self):
+            yield torch.ones(4, 4)
+            raise RuntimeError("simulated failure")
+
+    output_dir = tmp_path / "embeddings"
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        compute_and_save_embeddings(FailingDataset(), output_dir, chunk_size=4)
+
+    partial_manifest = json.loads((output_dir / "manifest.partial.json").read_text())
+    assert partial_manifest["shape"] == [4, 4]
+    assert partial_manifest["completed"] is False
+    assert len(partial_manifest["shards"]) == 1
+    assert (output_dir / "shard_000000.npy").exists()
+    assert not (output_dir / "manifest.json").exists()
+
+
+def test_compute_and_save_embeddings_resumes_sharded_directory(tmp_path):
+    """Test sharded saving resumes from manifest.partial.json by skipping saved rows."""
+    import json
+
+    import numpy as np
+
+    from saetopic.training.train_sae import compute_and_save_embeddings
+
+    class FailingDataset:
+        max_samples = 7
+
+        def __iter__(self):
+            yield torch.ones(4, 4)
+            raise RuntimeError("simulated failure")
+
+    class ResumableDataset:
+        max_samples = 7
+
+        def __iter__(self):
+            yield torch.ones(4, 4)
+            yield torch.ones(3, 4) * 2
+
+    output_dir = tmp_path / "embeddings"
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        compute_and_save_embeddings(FailingDataset(), output_dir, chunk_size=4)
+
+    n_embeddings, embedding_dim = compute_and_save_embeddings(
+        ResumableDataset(),
+        output_dir,
+        chunk_size=4,
+    )
+
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    shard_0 = np.load(output_dir / "shard_000000.npy")
+    shard_1 = np.load(output_dir / "shard_000001.npy")
+
+    assert n_embeddings == 7
+    assert embedding_dim == 4
+    assert manifest["shape"] == [7, 4]
+    assert manifest["completed"] is True
+    assert len(manifest["shards"]) == 2
+    assert not (output_dir / "manifest.partial.json").exists()
+    assert shard_0.shape == (4, 4)
+    assert shard_1.shape == (3, 4)
+    assert shard_0[0, 0] == 1
+    assert shard_1[0, 0] == 2
+
+
+def test_compute_and_save_embeddings_recovers_existing_shards_without_manifest(tmp_path):
+    """Test sharded saving can resume old runs that only have shard files."""
+    import json
+
+    import numpy as np
+
+    from saetopic.training.train_sae import compute_and_save_embeddings
+
+    class ResumableDataset:
+        max_samples = 7
+
+        def __iter__(self):
+            yield torch.ones(4, 4)
+            yield torch.ones(3, 4) * 2
+
+    output_dir = tmp_path / "embeddings"
+    output_dir.mkdir()
+    np.save(output_dir / "shard_000000.npy", np.ones((4, 4), dtype=np.float32))
+
+    n_embeddings, embedding_dim = compute_and_save_embeddings(
+        ResumableDataset(),
+        output_dir,
+        chunk_size=4,
+    )
+
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    shard_1 = np.load(output_dir / "shard_000001.npy")
+
+    assert n_embeddings == 7
+    assert embedding_dim == 4
+    assert manifest["shape"] == [7, 4]
+    assert manifest["completed"] is True
+    assert len(manifest["shards"]) == 2
+    assert shard_1.shape == (3, 4)
+    assert shard_1[0, 0] == 2
+
+
 def test_compute_and_save_embeddings_compacts_partial_npy(tmp_path):
     """Test that direct memmap saving compacts when fewer embeddings are produced."""
     import numpy as np

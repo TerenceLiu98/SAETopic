@@ -57,6 +57,8 @@ Required behavior:
   `--auto-multi-gpu`.
 - Large-corpus embedding output should support sharded `.npy` directories with
   a manifest, avoiding a final single-file merge step.
+- Sharded output should update `manifest.partial.json` after each shard and
+  resume from existing partial metadata or contiguous `shard_*.npy` files.
 - Empty streams must fail explicitly instead of writing an invalid output file.
 - Embedding normalization must be explicit: the embed CLI normalizes by default,
   while `--no-normalize-embeddings` saves raw embedder outputs.

@@ -193,6 +193,9 @@ Notes:
 
 - FineWiki articles are long; `--text-chunk-size` prevents silent truncation and
   keeps per-batch GPU memory predictable.
+- Sharded embedding output writes `manifest.partial.json` after each shard.
+  If a run is interrupted, rerun the same command to resume from existing
+  shards; successful completion writes `manifest.json`.
 - `--auto-multi-gpu` passes all visible CUDA devices to SentenceTransformers'
   multi-process encoder. If a single document chunk is too long, reduce
   `--text-chunk-size` or `--max-seq-length`; extra GPUs improve throughput but

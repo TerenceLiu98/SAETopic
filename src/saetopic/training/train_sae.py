@@ -860,6 +860,7 @@ def compute_and_save_embeddings(
     dataset: StreamingEmbeddingDataset,
     output_path: str | Path,
     chunk_size: int = 10000,
+    resume: bool = True,
 ) -> tuple[int, int]:
     """
     Compute embeddings from streaming dataset and save them to disk.
@@ -876,6 +877,9 @@ def compute_and_save_embeddings(
         Paths without a file suffix use a sharded embedding directory.
     chunk_size : int, default=10000
         Number of embeddings to accumulate before saving to disk
+    resume : bool, default=True
+        Whether sharded embedding output should resume from
+        `manifest.partial.json` when available. Only applies to sharded output.
 
     Returns
     -------
@@ -907,6 +911,7 @@ def compute_and_save_embeddings(
             dataset=dataset,
             output_dir=output_path,
             chunk_size=chunk_size,
+            resume=resume,
         )
 
     n_total = 0
@@ -1139,15 +1144,25 @@ def _compute_and_save_sharded_embeddings(
     dataset: StreamingEmbeddingDataset,
     output_dir: Path,
     chunk_size: int,
+    resume: bool,
 ) -> tuple[int, int]:
     """Compute embeddings from a stream and save them as `.npy` shards."""
-    if output_dir.exists():
+    manifest_path = output_dir / "manifest.json"
+    partial_manifest_path = output_dir / "manifest.partial.json"
+
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        shape = manifest["shape"]
+        print(f"Found completed sharded embeddings at {output_dir}")
+        return int(shape[0]), int(shape[1])
+
+    if output_dir.exists() and not resume:
         raise ValueError(
             f"Sharded embedding output directory already exists: {output_dir}. "
-            "Choose a new path or remove the incomplete/old directory first."
+            "Choose a new path, remove the directory, or enable resume."
         )
 
-    output_dir.mkdir(parents=True)
+    output_dir.mkdir(parents=True, exist_ok=resume)
 
     n_total = 0
     dim = None
@@ -1157,12 +1172,112 @@ def _compute_and_save_sharded_embeddings(
     shard_arrays: list[np.ndarray] = []
     shards: list[dict[str, Any]] = []
     total_samples = getattr(dataset, "max_samples", None)
+    skip_remaining = 0
+
+    def write_manifest(path: Path, *, completed: bool) -> None:
+        if dim is None:
+            return
+
+        manifest = {
+            "format": "saetopic.sharded_embeddings.v1",
+            "dtype": "float32",
+            "shape": [int(n_total), int(dim)],
+            "shard_size": int(chunk_size),
+            "completed": completed,
+            "shards": shards,
+        }
+        temp_path = path.with_suffix(f"{path.suffix}.tmp")
+        temp_path.write_text(json.dumps(manifest, indent=2))
+        temp_path.replace(path)
+
+    if partial_manifest_path.exists():
+        if not resume:
+            raise ValueError(
+                f"Found incomplete sharded embeddings at {partial_manifest_path} "
+                "but resume is disabled"
+            )
+
+        partial_manifest = json.loads(partial_manifest_path.read_text())
+        if partial_manifest.get("format") != "saetopic.sharded_embeddings.v1":
+            raise ValueError(
+                f"Unknown sharded embedding format in {partial_manifest_path}"
+            )
+        if int(partial_manifest.get("shard_size", chunk_size)) != chunk_size:
+            raise ValueError(
+                "Cannot resume with a different chunk_size: "
+                f"existing={partial_manifest.get('shard_size')}, requested={chunk_size}"
+            )
+
+        shards = list(partial_manifest["shards"])
+        shape = partial_manifest["shape"]
+        n_total = int(shape[0])
+        dim = int(shape[1])
+        shard_index = len(shards)
+        skip_remaining = n_total
+
+        for shard in shards:
+            shard_path = output_dir / shard["file"]
+            if not shard_path.exists():
+                raise ValueError(f"Manifest references missing shard: {shard_path}")
+
+        print(
+            f"Resuming sharded embeddings at {output_dir}: "
+            f"{n_total:,} rows across {len(shards):,} shards"
+        )
+    elif output_dir.exists():
+        existing_shards = sorted(output_dir.glob("shard_*.npy"))
+        if existing_shards:
+            if not resume:
+                raise ValueError(
+                    f"Found existing embedding shards in {output_dir} but resume is disabled"
+                )
+
+            for expected_index, shard_path in enumerate(existing_shards):
+                expected_name = f"shard_{expected_index:06d}.npy"
+                if shard_path.name != expected_name:
+                    raise ValueError(
+                        "Cannot resume from non-contiguous shard files: "
+                        f"expected {expected_name}, found {shard_path.name}"
+                    )
+
+                shard = np.load(shard_path, mmap_mode="r")
+                if shard.ndim != 2:
+                    raise ValueError(f"Shard must be 2D: {shard_path}")
+                if dim is None:
+                    dim = int(shard.shape[1])
+                elif dim != int(shard.shape[1]):
+                    raise ValueError(
+                        f"Shard dimension mismatch in {shard_path}: "
+                        f"expected {dim}, got {shard.shape[1]}"
+                    )
+
+                n_rows = int(shard.shape[0])
+                n_total += n_rows
+                shards.append(
+                    {
+                        "file": shard_path.name,
+                        "shape": [n_rows, int(shard.shape[1])],
+                    }
+                )
+
+            shard_index = len(shards)
+            skip_remaining = n_total
+            write_manifest(partial_manifest_path, completed=False)
+            print(
+                f"Recovered resumable sharded embeddings at {output_dir}: "
+                f"{n_total:,} rows across {len(shards):,} shards"
+            )
+        elif any(output_dir.iterdir()):
+            raise ValueError(
+                f"Sharded embedding output directory is not empty and has no manifest: "
+                f"{output_dir}"
+            )
 
     print(f"Computing embeddings and saving shards to {output_dir}")
     print("Note: This may take a while for large datasets...")
 
     def flush_shard() -> None:
-        nonlocal shard_arrays, shard_index, shard_pending
+        nonlocal n_total, shard_arrays, shard_index, shard_pending
 
         if not shard_arrays:
             return
@@ -1176,10 +1291,12 @@ def _compute_and_save_sharded_embeddings(
                 "shape": [int(shard.shape[0]), int(shard.shape[1])],
             }
         )
+        n_total += int(shard.shape[0])
 
         shard_arrays = []
         shard_pending = 0
         shard_index += 1
+        write_manifest(partial_manifest_path, completed=False)
 
     with Progress(
         SpinnerColumn(),
@@ -1196,15 +1313,39 @@ def _compute_and_save_sharded_embeddings(
             remaining="unknown" if total_samples is None else f"{total_samples:,}",
             shards="0",
         )
+        if n_total:
+            remaining = (
+                "unknown"
+                if total_samples is None
+                else f"{max(total_samples - n_total, 0):,}"
+            )
+            progress.update(
+                task,
+                completed=n_total,
+                remaining=remaining,
+                shards=f"{len(shards):,}",
+            )
 
         for batch in dataset:
             if dim is None:
                 dim = batch.shape[1]
+            elif dim != batch.shape[1]:
+                raise ValueError(
+                    f"Embedding dimension changed from {dim} to {batch.shape[1]}"
+                )
 
             if batch.device.type != "cpu":
                 batch = batch.cpu()
 
             batch_np = batch.numpy().astype(np.float32, copy=False)
+            if skip_remaining:
+                if skip_remaining >= batch_np.shape[0]:
+                    skip_remaining -= batch_np.shape[0]
+                    continue
+
+                batch_np = batch_np[skip_remaining:]
+                skip_remaining = 0
+
             batch_start = 0
             while batch_start < batch_np.shape[0]:
                 remaining_space = chunk_size - shard_pending
@@ -1217,22 +1358,23 @@ def _compute_and_save_sharded_embeddings(
                 if shard_pending >= chunk_size:
                     flush_shard()
 
-            n_total += batch.shape[0]
             batch_count += 1
 
             if total_samples is None:
                 remaining = "unknown"
             else:
-                remaining = f"{max(total_samples - n_total, 0):,}"
+                pending_rows = sum(array.shape[0] for array in shard_arrays)
+                remaining = f"{max(total_samples - n_total - pending_rows, 0):,}"
 
             progress.update(
                 task,
-                completed=n_total,
+                completed=n_total + shard_pending,
                 remaining=remaining,
                 shards=f"{len(shards):,}",
             )
 
             if batch_count % 10 == 0:
+                flush_shard()
                 progress.refresh()
 
             if batch_count % 100 == 0:
@@ -1246,15 +1388,9 @@ def _compute_and_save_sharded_embeddings(
     if dim is None:
         raise ValueError("No embeddings were produced from the dataset")
 
-    manifest = {
-        "format": "saetopic.sharded_embeddings.v1",
-        "dtype": "float32",
-        "shape": [int(n_total), int(dim)],
-        "shard_size": int(chunk_size),
-        "shards": shards,
-    }
-    manifest_path = output_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2))
+    write_manifest(manifest_path, completed=True)
+    if partial_manifest_path.exists():
+        partial_manifest_path.unlink()
 
     print(
         f"[green]✓[/green] Saved {n_total} embeddings ({(n_total, dim)}) "
