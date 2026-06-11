@@ -8,5 +8,7 @@ API is planned and exposed as stubs while it is under development.
 __version__ = "0.1.0"
 
 from saetopic.model import SAETopicModel
+from saetopic.interpretation import CorpusAdapter
+from saetopic.merging import TopicMerger
 
-__all__ = ["SAETopicModel"]
+__all__ = ["SAETopicModel", "CorpusAdapter", "TopicMerger"]
