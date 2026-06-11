@@ -12,7 +12,7 @@ license = "Apache-2.0"
 authors = [
     {name = "SAETopic contributors"},
 ]
-keywords = ["topic-modeling", "sparse-autoencoder"，"language", "vision"]
+keywords = ["topic-modeling", "sparse-autoencoder", "language", "vision"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

@@ -331,6 +331,35 @@ def test_compute_and_save_embeddings_writes_chunked_npy(tmp_path):
     assert embeddings[-1, 0] == 3
 
 
+def test_compute_and_save_embeddings_compacts_partial_npy(tmp_path):
+    """Test that direct memmap saving compacts when fewer embeddings are produced."""
+    import numpy as np
+
+    from saetopic.training.train_sae import compute_and_save_embeddings
+
+    class MockDataset:
+        max_samples = 10
+
+        def __iter__(self):
+            yield torch.ones(3, 4)
+            yield torch.ones(4, 4) * 2
+
+    output_path = tmp_path / "embeddings.npy"
+    n_embeddings, embedding_dim = compute_and_save_embeddings(
+        MockDataset(),
+        output_path,
+        chunk_size=4,
+    )
+
+    embeddings = np.load(output_path)
+    assert n_embeddings == 7
+    assert embedding_dim == 4
+    assert embeddings.shape == (7, 4)
+    assert not (tmp_path / "embeddings.partial.npy").exists()
+    assert embeddings[0, 0] == 1
+    assert embeddings[-1, 0] == 2
+
+
 def test_compute_and_save_embeddings_rejects_empty_dataset(tmp_path):
     """Test that empty streams fail explicitly instead of writing bad files."""
 

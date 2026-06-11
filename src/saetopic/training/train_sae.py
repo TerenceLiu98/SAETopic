@@ -903,6 +903,110 @@ def compute_and_save_embeddings(
     print("Note: This may take a while for large datasets...")
 
     total_samples = getattr(dataset, "max_samples", None)
+    known_total = total_samples if isinstance(total_samples, int) and total_samples > 0 else None
+
+    if known_total is not None:
+        partial_path = output_path.with_name(
+            f"{output_path.stem}.partial{output_path.suffix}"
+        )
+        if partial_path.exists():
+            partial_path.unlink()
+
+        print(f"Writing embeddings incrementally to {partial_path}")
+        final_embeddings = None
+
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TextColumn("• {task.fields[remaining]} remaining"),
+                TimeRemainingColumn(),
+            ) as progress:
+                task = progress.add_task(
+                    "[cyan]Computing embeddings...",
+                    total=known_total,
+                    remaining=f"{known_total:,}",
+                )
+
+                for batch in dataset:
+                    if dim is None:
+                        dim = batch.shape[1]
+                        final_embeddings = np.lib.format.open_memmap(
+                            partial_path,
+                            mode="w+",
+                            dtype=np.float32,
+                            shape=(known_total, dim),
+                        )
+
+                    if batch.device.type != "cpu":
+                        batch = batch.cpu()
+
+                    assert final_embeddings is not None
+                    batch_np = batch.numpy().astype(np.float32, copy=False)
+                    batch_end = n_total + batch_np.shape[0]
+                    if batch_end > known_total:
+                        raise ValueError(
+                            "Streaming dataset produced more embeddings than "
+                            f"max_samples ({known_total})"
+                        )
+
+                    final_embeddings[n_total:batch_end] = batch_np
+                    n_total = batch_end
+                    batch_count += 1
+
+                    remaining = f"{max(known_total - n_total, 0):,}"
+                    progress.update(
+                        task,
+                        completed=n_total,
+                        remaining=remaining,
+                    )
+
+                    if batch_count % 10 == 0:
+                        progress.refresh()
+                        final_embeddings.flush()
+
+                    if batch_count % 100 == 0:
+                        import torch
+
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+            if dim is None or final_embeddings is None:
+                raise ValueError("No embeddings were produced from the dataset")
+
+            final_embeddings.flush()
+            del final_embeddings
+
+            if n_total == known_total:
+                partial_path.replace(output_path)
+            else:
+                print("Compacting final embeddings file...")
+                partial_embeddings = np.load(partial_path, mmap_mode="r")
+                compact_embeddings = np.lib.format.open_memmap(
+                    output_path,
+                    mode="w+",
+                    dtype=np.float32,
+                    shape=(n_total, dim),
+                )
+                for start in range(0, n_total, chunk_size):
+                    end = min(start + chunk_size, n_total)
+                    compact_embeddings[start:end] = partial_embeddings[start:end]
+                compact_embeddings.flush()
+                del compact_embeddings
+                del partial_embeddings
+                partial_path.unlink()
+
+            print(
+                f"[green]✓[/green] Saved {n_total} embeddings ({(n_total, dim)}) "
+                f"to {output_path}"
+            )
+            return n_total, dim
+        except Exception:
+            if final_embeddings is not None:
+                del final_embeddings
+            raise
 
     with tempfile.TemporaryDirectory(
         prefix=f".{output_path.stem}_chunks_",
