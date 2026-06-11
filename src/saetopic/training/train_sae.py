@@ -1275,6 +1275,12 @@ def _compute_and_save_sharded_embeddings(
 
     print(f"Computing embeddings and saving shards to {output_dir}")
     print("Note: This may take a while for large datasets...")
+    if skip_remaining and hasattr(dataset, "skip_samples"):
+        setattr(dataset, "skip_samples", skip_remaining)
+        print(
+            f"Skipping {skip_remaining:,} previously saved text chunks before encoding..."
+        )
+        skip_remaining = 0
 
     def flush_shard() -> None:
         nonlocal n_total, shard_arrays, shard_index, shard_pending

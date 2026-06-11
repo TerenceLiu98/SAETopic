@@ -91,6 +91,41 @@ def test_streaming_dataset_empty_text():
     assert len(batches) >= 1
 
 
+def test_streaming_dataset_skip_samples_before_encode():
+    """Test resume skipping happens before texts are sent to the embedder."""
+    from saetopic.training.data import StreamingEmbeddingDataset
+
+    class MockEmbedder:
+        def __init__(self):
+            self.encoded_texts = []
+
+        def encode(self, texts, **kwargs):
+            import numpy as np
+
+            self.encoded_texts.extend(texts)
+            return np.ones((len(texts), 8), dtype=np.float32)
+
+    class MockDataset:
+        def __iter__(self):
+            for i in range(10):
+                yield {"text": f"Document {i}"}
+
+    embedder = MockEmbedder()
+    dataset = StreamingEmbeddingDataset(
+        MockDataset(),
+        embedder,
+        buffer_size=10,
+        embedding_batch_size=10,
+        max_samples=7,
+        skip_samples=4,
+    )
+
+    batches = list(dataset)
+
+    assert sum(batch.shape[0] for batch in batches) == 3
+    assert set(embedder.encoded_texts) == {"Document 4", "Document 5", "Document 6"}
+
+
 def test_streaming_dataset_passes_encode_device_and_task():
     """Test that encode options are forwarded to SentenceTransformer."""
     from saetopic.training.data import StreamingEmbeddingDataset

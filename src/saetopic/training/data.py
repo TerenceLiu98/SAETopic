@@ -308,6 +308,9 @@ class StreamingEmbeddingDataset:
         Random seed for shuffling
     max_samples : int or None, default=None
         Maximum number of samples to stream (None for unlimited)
+    skip_samples : int, default=0
+        Number of text chunks to skip before encoding. This is used for
+        resuming sharded embedding jobs without re-encoding saved chunks.
     task : str, default="clustering"
         Task type for Jina embeddings (e.g., "clustering", "retrieval")
         Passed to embedder.encode() as task parameter
@@ -353,6 +356,7 @@ class StreamingEmbeddingDataset:
         normalize: bool = True,
         seed: int = 42,
         max_samples: int | None = None,
+        skip_samples: int = 0,
         task: str = "clustering",
     ):
         self.base_dataset = hf_dataset
@@ -367,9 +371,12 @@ class StreamingEmbeddingDataset:
         self.text_chunk_overlap = text_chunk_overlap
         self.normalize = normalize
         self.max_samples = max_samples
+        self.skip_samples = skip_samples
         self.seed = seed
         self.task = task
 
+        if self.skip_samples < 0:
+            raise ValueError("skip_samples must be non-negative")
         if self.text_chunk_size is not None and self.text_chunk_size <= 0:
             raise ValueError("text_chunk_size must be greater than 0")
         if self.encode_chunk_size is not None and self.encode_chunk_size <= 0:
@@ -485,11 +492,15 @@ class StreamingEmbeddingDataset:
 
         random.seed(self.seed)
         texts_buffer = []
+        n_samples_skipped = 0
         n_samples_yielded = 0
 
         for item in self.base_dataset:
             # Check max_samples limit
-            if self.max_samples is not None and n_samples_yielded >= self.max_samples:
+            if (
+                self.max_samples is not None
+                and n_samples_skipped + n_samples_yielded >= self.max_samples
+            ):
                 break
 
             # Extract text
@@ -503,8 +514,12 @@ class StreamingEmbeddingDataset:
                 continue
 
             for text_chunk in self._split_text(text):
+                if n_samples_skipped < self.skip_samples:
+                    n_samples_skipped += 1
+                    continue
                 if self.max_samples is not None and (
-                    n_samples_yielded + len(texts_buffer) >= self.max_samples
+                    n_samples_skipped + n_samples_yielded + len(texts_buffer)
+                    >= self.max_samples
                 ):
                     break
                 texts_buffer.append(text_chunk)
@@ -550,6 +565,7 @@ def create_streaming_dataset(
     seed: int = 42,
     streaming: bool = True,
     max_samples: int | None = None,
+    skip_samples: int = 0,
     task: str = "clustering",
     **hf_kwargs,
 ) -> StreamingEmbeddingDataset:
@@ -595,6 +611,8 @@ def create_streaming_dataset(
         Use streaming mode (set to False for small datasets)
     max_samples : int or None, default=None
         Maximum samples to stream
+    skip_samples : int, default=0
+        Number of text chunks to skip before encoding
     task : str, default="clustering"
         Task type for Jina embeddings (e.g., "clustering", "retrieval")
     **hf_kwargs
@@ -661,5 +679,6 @@ def create_streaming_dataset(
         normalize=normalize,
         seed=seed,
         max_samples=max_samples,
+        skip_samples=skip_samples,
         task=task,
     )
