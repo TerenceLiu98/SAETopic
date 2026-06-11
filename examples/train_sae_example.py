@@ -27,14 +27,14 @@ encode_device = (
     if torch.cuda.is_available() and torch.cuda.device_count() > 1
     else None
 )
-output_dir = "/home/jovyan/helloworld-datavol-1/SAETopic/embeddings"
-embeddings_path = f"{output_dir}/finewiki_embeddings"
+output_dir = "/home/jovyan/helloworld-datavol-1/SAETopic"
+embeddings_path = f"{output_dir}/embeddings/finewiki_embeddings"
 
 # Step 1: Load embedding model
 # -----------------------------
-# jina-embeddings-v5-text-nano: 768-dim, fastest for testing
-# jina-embeddings-v5-text-small: 1024-dim, good balance
-# jina-embeddings-v5-text-base: 1024-dim, best quality
+# ibm-granite/granite-embedding{97m, 311m}-multilingual-r2: 384-dim
+# jina-embeddings-v5-text-nano: {32, 64, 128, 256, 512, 768}-dim
+# jina-embeddings-v5-text-small: {32, 64, 128, 256, 512, 768, 1024}-dim
 embedder = SentenceTransformer(
     "jinaai/jina-embeddings-v5-text-small",
     trust_remote_code=True,
@@ -55,14 +55,14 @@ streaming_dataset = create_streaming_dataset(
     dataset_name="HuggingFaceFW/finewiki",
     split="train",
     embedder=embedder,
-    buffer_size=1000,           # Shuffle buffer size
+    buffer_size=10000,          # Shuffle buffer size
     embedding_batch_size=128,   # Text chunks to accumulate before yielding
     encode_batch_size=128,      # Internal batch for embedder.encode() (lower if OOM)
     encode_device=encode_device,# e.g. ["cuda:0", "cuda:1"] for multi-GPU
     encode_chunk_size=128,      # Work distribution size for multi-process encode
     text_chunk_size=512,        # Split long FineWiki articles before embedding
     text_chunk_overlap=32,
-    max_samples=100000,         # Adjust based on your needs
+    max_samples=1000000,        # Adjust based on your needs
 )
 
 # Step 3: Compute and save embeddings (one-time setup)
@@ -88,17 +88,18 @@ config = TrainingConfig(
     architecture="batch_topk",
     learning_rate=1e-3,
     batch_size=256,
-    steps=800000,
+    n_epochs=10, 
+    save_frequency=1,
     warmup_ratio=0.1,
     aux_loss_weight=1 / 32,
     device="auto",
     seed=42,
-    output_dir="checkpoints/jina-v5-sae-small",
+    output_dir=f"{output_dir}/checkpoints/jina-v5-sae-small",
     checkpoint_name="jina-v5-sae-small",
     dataset_name="HuggingFaceFW/finewiki",
     dataset_license="CC-BY-SA 4.0 / Apache 2.0",
 )
-
+torch.cuda.empty_cache()
 trainer = train_sae(
     embeddings_path=embeddings_path,
     config=config,
@@ -127,7 +128,7 @@ config = TrainingConfig(
     top_k=16,
     architecture="batch_topk",
     n_epochs=50,
-    output_dir="checkpoints/my-sae",
+    output_dir=f"{output_dir}/checkpoints/my-sae",
 )
 
 trainer = train_sae(dataset=dataset, config=config)
