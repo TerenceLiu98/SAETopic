@@ -2,6 +2,8 @@
 Tests for SAE training infrastructure.
 """
 
+import json
+
 import numpy as np
 import pytest
 import torch
@@ -342,6 +344,44 @@ def test_train_sae_from_embeddings_path_uses_mmap(tmp_path):
         embeddings_path=embeddings_path,
         input_dim=16,
         n_features=32,
+        top_k=4,
+        n_epochs=1,
+        batch_size=8,
+        output_dir=str(tmp_path / "checkpoints"),
+        save_frequency=100,
+    )
+
+    assert trainer.state.epoch == 1
+    assert trainer.state.global_step > 0
+
+
+def test_train_sae_from_sharded_embeddings_path(tmp_path):
+    """Test train_sae can train directly from a sharded embedding directory."""
+    embeddings_dir = tmp_path / "embeddings"
+    embeddings_dir.mkdir()
+    shard_0 = np.random.randn(16, 8).astype(np.float32)
+    shard_1 = np.random.randn(16, 8).astype(np.float32)
+    np.save(embeddings_dir / "shard_000000.npy", shard_0)
+    np.save(embeddings_dir / "shard_000001.npy", shard_1)
+    (embeddings_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "saetopic.sharded_embeddings.v1",
+                "dtype": "float32",
+                "shape": [32, 8],
+                "shard_size": 16,
+                "shards": [
+                    {"file": "shard_000000.npy", "shape": [16, 8]},
+                    {"file": "shard_000001.npy", "shape": [16, 8]},
+                ],
+            }
+        )
+    )
+
+    trainer = train_sae(
+        embeddings_path=embeddings_dir,
+        input_dim=8,
+        n_features=16,
         top_k=4,
         n_epochs=1,
         batch_size=8,

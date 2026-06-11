@@ -7,6 +7,7 @@ for training sparse autoencoders.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -30,7 +31,8 @@ class EmbeddingDataset(Dataset):
     lazy : bool, default=False
         If True, keep embeddings in their original array/tensor container and
         convert/normalize individual samples in __getitem__. This is useful for
-        memory-mapped .npy files.
+        memory-mapped .npy files. For sharded embedding directories, use
+        ShardedEmbeddingDataset.
     """
 
     def __init__(
@@ -75,14 +77,14 @@ class EmbeddingDataset(Dataset):
         path: str | Path,
         normalize: bool = True,
         mmap_mode: Literal["r", "r+", "w+", "c"] | None = None,
-    ) -> "EmbeddingDataset":
+    ) -> "EmbeddingDataset | ShardedEmbeddingDataset":
         """
-        Load embeddings from a .npy or .pt file.
+        Load embeddings from a .npy, .pt, or sharded embedding directory.
 
         Parameters
         ----------
         path : str or Path
-            Path to embeddings file (.npy or .pt)
+            Path to embeddings file (.npy or .pt) or sharded embedding directory
         normalize : bool, default=True
             Whether to L2-normalize embeddings
         mmap_mode : str or None, default=None
@@ -95,7 +97,13 @@ class EmbeddingDataset(Dataset):
             Dataset instance
         """
         path = Path(path)
-        if path.suffix == ".npy":
+        if path.is_dir():
+            return ShardedEmbeddingDataset.from_directory(
+                path,
+                normalize=normalize,
+                mmap_mode=mmap_mode,
+            )
+        elif path.suffix == ".npy":
             embeddings = np.load(path, mmap_mode=mmap_mode)
             lazy = mmap_mode is not None
         elif path.suffix == ".pt":
@@ -105,6 +113,95 @@ class EmbeddingDataset(Dataset):
             raise ValueError(f"Unknown file type: {path.suffix}")
 
         return cls(cast(np.ndarray | Tensor, embeddings), normalize=normalize, lazy=lazy)
+
+
+class ShardedEmbeddingDataset(Dataset):
+    """
+    PyTorch Dataset for sharded `.npy` embedding directories.
+
+    Sharded embeddings are stored as:
+
+    - `manifest.json`: total shape, dtype, and shard metadata
+    - `shard_000000.npy`, `shard_000001.npy`, ...: row-contiguous embedding shards
+
+    Only the shard needed for the requested sample is memory-mapped.
+    """
+
+    def __init__(
+        self,
+        directory: str | Path,
+        manifest: dict[str, Any],
+        normalize: bool = True,
+        mmap_mode: Literal["r", "r+", "w+", "c"] | None = "r",
+    ):
+        self.directory = Path(directory)
+        self.manifest = manifest
+        self.normalize = normalize
+        self.mmap_mode = mmap_mode
+
+        shape = manifest["shape"]
+        self.n_samples = int(shape[0])
+        self.embedding_dim = int(shape[1])
+        self.shards = manifest["shards"]
+
+        self._starts: list[int] = []
+        offset = 0
+        for shard in self.shards:
+            self._starts.append(offset)
+            offset += int(shard["shape"][0])
+
+        if offset != self.n_samples:
+            raise ValueError(
+                f"Shard rows ({offset}) do not match manifest shape ({self.n_samples})"
+            )
+
+        self._active_shard_index: int | None = None
+        self._active_shard: np.ndarray | None = None
+
+    @classmethod
+    def from_directory(
+        cls,
+        path: str | Path,
+        normalize: bool = True,
+        mmap_mode: Literal["r", "r+", "w+", "c"] | None = "r",
+    ) -> "ShardedEmbeddingDataset":
+        """Load a sharded embedding dataset from a directory."""
+        path = Path(path)
+        manifest_path = path / "manifest.json"
+        if not manifest_path.exists():
+            raise ValueError(f"Missing sharded embedding manifest: {manifest_path}")
+
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("format") != "saetopic.sharded_embeddings.v1":
+            raise ValueError(f"Unknown sharded embedding format in {manifest_path}")
+
+        return cls(path, manifest, normalize=normalize, mmap_mode=mmap_mode)
+
+    def __len__(self) -> int:
+        return self.n_samples
+
+    def _load_shard(self, shard_index: int) -> np.ndarray:
+        if self._active_shard_index != shard_index or self._active_shard is None:
+            shard_path = self.directory / self.shards[shard_index]["file"]
+            self._active_shard = np.load(shard_path, mmap_mode=self.mmap_mode)
+            self._active_shard_index = shard_index
+        return self._active_shard
+
+    def __getitem__(self, idx: int) -> Tensor:
+        if idx < 0:
+            idx += self.n_samples
+        if idx < 0 or idx >= self.n_samples:
+            raise IndexError(idx)
+
+        shard_index = int(np.searchsorted(self._starts, idx, side="right") - 1)
+        shard = self._load_shard(shard_index)
+        local_idx = idx - self._starts[shard_index]
+        embedding = torch.from_numpy(np.asarray(shard[local_idx], dtype=np.float32).copy())
+
+        if self.normalize:
+            embedding = functional.normalize(embedding, p=2, dim=-1)
+
+        return embedding
 
 
 def load_embeddings_from_hf(

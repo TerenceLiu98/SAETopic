@@ -40,7 +40,7 @@ pip install "saetopic[train]"
 
 saetopic-train embed \
   --dataset-name HuggingFaceFW/finewiki \
-  --output data/finewiki_embeddings.npy \
+  --output data/finewiki_embeddings \
   --max-samples 100000 \
   --text-chunk-size 512 \
   --text-chunk-overlap 32 \
@@ -51,7 +51,7 @@ saetopic-train embed \
   --truncate-dim 512
 
 saetopic-train train \
-  --embeddings data/finewiki_embeddings.npy \
+  --embeddings data/finewiki_embeddings \
   --no-normalize-embeddings \
   --input-dim 512 \
   --expansion-factor 32 \
@@ -146,14 +146,15 @@ loaded = SAETopicModel.load("my_model")
 ## Training Topic Atoms
 
 For large text corpora such as FineWiki, pre-compute embeddings once and train
-SAEs from the saved `.npy` file. This avoids keeping the embedding model in GPU
-memory during SAE training and makes hyperparameter sweeps much faster.
+SAEs from the saved sharded embedding directory. This avoids keeping the
+embedding model in GPU memory during SAE training, avoids a final single-file
+merge step, and makes hyperparameter sweeps much faster.
 
 ```bash
 # Step 1: stream FineWiki, split long articles, and save normalized embeddings.
 saetopic-train embed \
   --dataset-name HuggingFaceFW/finewiki \
-  --output data/finewiki_embeddings.npy \
+  --output data/finewiki_embeddings \
   --max-samples 100000 \
   --auto-multi-gpu \
   --text-chunk-size 512 \
@@ -166,10 +167,10 @@ saetopic-train embed \
   --truncate-dim 512
 
 # Step 2: train from the saved embeddings.
-# .npy files are memory-mapped by default; skip re-normalization because the
-# embed step already normalized the embeddings before saving.
+# Sharded embeddings are memory-mapped by default; skip re-normalization
+# because the embed step already normalized the embeddings before saving.
 saetopic-train train \
-  --embeddings data/finewiki_embeddings.npy \
+  --embeddings data/finewiki_embeddings \
   --no-normalize-embeddings \
   --input-dim 512 \
   --expansion-factor 32 \

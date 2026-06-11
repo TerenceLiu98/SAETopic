@@ -2,8 +2,8 @@
 Command-line interface for training SAE models.
 
 Usage:
-    python -m saetopic.training.cli embed --dataset-name HuggingFaceFW/finewiki --output data/finewiki_embeddings.npy
-    python -m saetopic.training.cli train --embeddings path/to/embeddings.npy --output checkpoints/sae
+    python -m saetopic.training.cli embed --dataset-name HuggingFaceFW/finewiki --output data/finewiki_embeddings
+    python -m saetopic.training.cli train --embeddings path/to/embeddings --output checkpoints/sae
     python -m saetopic.training.cli upload --checkpoint-dir checkpoints/sae/final --repo-id your-org/sae
 """
 
@@ -28,7 +28,7 @@ def main() -> None:
         "--embeddings",
         type=str,
         required=True,
-        help="Path to embeddings file (.npy or .pt)",
+        help="Path to embeddings file (.npy or .pt) or sharded embedding directory",
     )
     train_parser.add_argument(
         "--no-mmap",
@@ -240,7 +240,7 @@ def main() -> None:
         "--output",
         type=str,
         required=True,
-        help="Output .npy path",
+        help="Output path. Use a directory/no extension for sharded embeddings, or .npy for a single file",
     )
     embed_parser.add_argument(
         "--max-samples",

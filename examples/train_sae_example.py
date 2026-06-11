@@ -28,7 +28,7 @@ encode_device = (
     else None
 )
 output_dir = "/home/jovyan/helloworld-datavol-1/SAETopic/embeddings"
-embeddings_path = f"{output_dir}/finewiki_embeddings.npy"
+embeddings_path = f"{output_dir}/finewiki_embeddings"
 
 # Step 1: Load embedding model
 # -----------------------------
@@ -67,8 +67,9 @@ streaming_dataset = create_streaming_dataset(
 
 # Step 3: Compute and save embeddings (one-time setup)
 # -----------------------------------------------------
-# This saves embeddings to disk so you can train multiple times
-# without recomputing embeddings each run.
+# This saves sharded embeddings to disk so you can train multiple times
+# without recomputing embeddings each run. The output is a directory with
+# manifest.json and shard_*.npy files.
 n_embeddings, embedding_dim = compute_and_save_embeddings(
     dataset=streaming_dataset,
     output_path=embeddings_path,
@@ -309,7 +310,7 @@ streaming_dataset = create_streaming_dataset(
 # Step 1: Compute and save embeddings (do this once!)
 n_embeddings, embedding_dim = compute_and_save_embeddings(
     dataset=streaming_dataset,
-    output_path="data/finewiki_embeddings.npy",
+    output_path="data/finewiki_embeddings",
     chunk_size=10000,
 )
 print(f"Saved {n_embeddings} embeddings of dimension {embedding_dim}")
@@ -326,7 +327,7 @@ config = TrainingConfig(
 )
 
 trainer = train_sae(
-    embeddings_path="data/finewiki_embeddings.npy",
+    embeddings_path="data/finewiki_embeddings",
     config=config,
     normalize_embeddings=False,  # streaming dataset normalized before saving
 )

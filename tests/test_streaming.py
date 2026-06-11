@@ -331,6 +331,41 @@ def test_compute_and_save_embeddings_writes_chunked_npy(tmp_path):
     assert embeddings[-1, 0] == 3
 
 
+def test_compute_and_save_embeddings_writes_sharded_directory(tmp_path):
+    """Test that embedding saving can write a sharded directory."""
+    import json
+
+    from saetopic.training.data import EmbeddingDataset
+    from saetopic.training.train_sae import compute_and_save_embeddings
+
+    class MockDataset:
+        max_samples = 7
+
+        def __iter__(self):
+            yield torch.ones(3, 4)
+            yield torch.ones(3, 4) * 2
+            yield torch.ones(1, 4) * 3
+
+    output_dir = tmp_path / "embeddings"
+    n_embeddings, embedding_dim = compute_and_save_embeddings(
+        MockDataset(),
+        output_dir,
+        chunk_size=4,
+    )
+
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    dataset = EmbeddingDataset.from_file(output_dir, normalize=False, mmap_mode="r")
+
+    assert n_embeddings == 7
+    assert embedding_dim == 4
+    assert manifest["shape"] == [7, 4]
+    assert len(manifest["shards"]) == 2
+    assert len(dataset) == 7
+    assert dataset.embedding_dim == 4
+    assert dataset[0][0].item() == 1
+    assert dataset[-1][0].item() == 3
+
+
 def test_compute_and_save_embeddings_compacts_partial_npy(tmp_path):
     """Test that direct memmap saving compacts when fewer embeddings are produced."""
     import numpy as np

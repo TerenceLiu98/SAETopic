@@ -6,6 +6,7 @@ This package provides utilities for training SAE models on embedding datasets.
 
 from saetopic.training.data import (
     EmbeddingDataset,
+    ShardedEmbeddingDataset,
     StreamingEmbeddingDataset,
     create_streaming_dataset,
     load_embeddings_from_hf,
@@ -23,6 +24,7 @@ __all__ = [
     "SAEOptimizer",
     "train_sae",
     "EmbeddingDataset",
+    "ShardedEmbeddingDataset",
     "StreamingEmbeddingDataset",
     "create_streaming_dataset",
     "load_embeddings_from_hf",

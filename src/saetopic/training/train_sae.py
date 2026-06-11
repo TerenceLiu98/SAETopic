@@ -31,7 +31,11 @@ if TYPE_CHECKING:
     from torch import Tensor
 
     from saetopic.sae.modules import TopKSAE
-    from saetopic.training.data import EmbeddingDataset, StreamingEmbeddingDataset
+    from saetopic.training.data import (
+        EmbeddingDataset,
+        ShardedEmbeddingDataset,
+        StreamingEmbeddingDataset,
+    )
 
 
 @dataclass
@@ -356,7 +360,10 @@ class SAETrainer:
         # Average losses
         return {k: v / n_batches for k, v in epoch_losses.items()}
 
-    def _create_optimizer(self, dataset: "EmbeddingDataset | StreamingEmbeddingDataset") -> None:
+    def _create_optimizer(
+        self,
+        dataset: "EmbeddingDataset | ShardedEmbeddingDataset | StreamingEmbeddingDataset",
+    ) -> None:
         """
         Create optimizer with scheduler based on dataset size.
 
@@ -406,8 +413,8 @@ class SAETrainer:
 
     def fit(
         self,
-        dataset: "EmbeddingDataset | StreamingEmbeddingDataset",
-        val_dataset: "EmbeddingDataset | None" = None,
+        dataset: "EmbeddingDataset | ShardedEmbeddingDataset | StreamingEmbeddingDataset",
+        val_dataset: "EmbeddingDataset | ShardedEmbeddingDataset | None" = None,
     ) -> TrainingState:
         """
         Train the SAE model.
@@ -435,12 +442,15 @@ class SAETrainer:
         if is_streaming:
             return self._fit_streaming(cast("StreamingEmbeddingDataset", dataset), val_dataset)
         else:
-            return self._fit_standard(cast("EmbeddingDataset", dataset), val_dataset)
+            return self._fit_standard(
+                cast("EmbeddingDataset | ShardedEmbeddingDataset", dataset),
+                val_dataset,
+            )
 
     def _fit_standard(
         self,
-        dataset: "EmbeddingDataset",
-        val_dataset: "EmbeddingDataset | None" = None,
+        dataset: "EmbeddingDataset | ShardedEmbeddingDataset",
+        val_dataset: "EmbeddingDataset | ShardedEmbeddingDataset | None" = None,
     ) -> TrainingState:
         """Train with standard PyTorch Dataset (uses DataLoader)."""
         train_loader = DataLoader(
@@ -490,7 +500,7 @@ class SAETrainer:
     def _fit_streaming(
         self,
         streaming_dataset: "StreamingEmbeddingDataset",
-        val_dataset: "EmbeddingDataset | None" = None,
+        val_dataset: "EmbeddingDataset | ShardedEmbeddingDataset | None" = None,
     ) -> TrainingState:
         """
         Train with streaming dataset (iterator mode).
@@ -747,7 +757,7 @@ This is a clean-room implementation trained on permissively licensed data.
 
 def train_sae(
     embeddings_path: str | Path | None = None,
-    dataset: "EmbeddingDataset | None" = None,
+    dataset: "EmbeddingDataset | ShardedEmbeddingDataset | None" = None,
     output_dir: str | None = None,
     config: TrainingConfig | None = None,
     normalize_embeddings: bool = True,
@@ -759,7 +769,8 @@ def train_sae(
     Parameters
     ----------
     embeddings_path : str or Path or None
-        Path to embeddings file (.npy or .pt). Ignored if dataset is provided.
+        Path to embeddings file (.npy or .pt) or sharded embedding directory.
+        Ignored if dataset is provided.
     dataset : EmbeddingDataset or None
         Pre-configured dataset. If None, loads from embeddings_path.
     output_dir : str or None
@@ -851,7 +862,7 @@ def compute_and_save_embeddings(
     chunk_size: int = 10000,
 ) -> tuple[int, int]:
     """
-    Compute embeddings from streaming dataset and save to .npy file.
+    Compute embeddings from streaming dataset and save them to disk.
 
     This is useful for pre-computing embeddings once and reusing them
     for multiple training runs with different hyperparameters.
@@ -861,7 +872,8 @@ def compute_and_save_embeddings(
     dataset : StreamingEmbeddingDataset
         Streaming dataset that computes embeddings on-the-fly
     output_path : str or Path
-        Path to save embeddings (.npy or .pt)
+        Path to save embeddings. Paths ending in `.npy` use a single file.
+        Paths without a file suffix use a sharded embedding directory.
     chunk_size : int, default=10000
         Number of embeddings to accumulate before saving to disk
 
@@ -883,13 +895,19 @@ def compute_and_save_embeddings(
     ...     embedder=embedder,
     ...     max_samples=100000,
     ... )
-    >>> n, dim = compute_and_save_embeddings(dataset, "finewiki_embeddings.npy")
+    >>> n, dim = compute_and_save_embeddings(dataset, "finewiki_embeddings")
     >>> print(f"Saved {n} embeddings of dimension {dim}")
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if chunk_size <= 0:
         raise ValueError("chunk_size must be greater than 0")
+    if output_path.suffix not in {".npy", ".pt"}:
+        return _compute_and_save_sharded_embeddings(
+            dataset=dataset,
+            output_dir=output_path,
+            chunk_size=chunk_size,
+        )
 
     n_total = 0
     dim = None
@@ -1113,6 +1131,135 @@ def compute_and_save_embeddings(
         del final_embeddings
 
     print(f"[green]✓[/green] Saved {n_total} embeddings ({(n_total, dim)}) to {output_path}")
+
+    return n_total, dim
+
+
+def _compute_and_save_sharded_embeddings(
+    dataset: StreamingEmbeddingDataset,
+    output_dir: Path,
+    chunk_size: int,
+) -> tuple[int, int]:
+    """Compute embeddings from a stream and save them as `.npy` shards."""
+    if output_dir.exists():
+        raise ValueError(
+            f"Sharded embedding output directory already exists: {output_dir}. "
+            "Choose a new path or remove the incomplete/old directory first."
+        )
+
+    output_dir.mkdir(parents=True)
+
+    n_total = 0
+    dim = None
+    batch_count = 0
+    shard_index = 0
+    shard_pending = 0
+    shard_arrays: list[np.ndarray] = []
+    shards: list[dict[str, Any]] = []
+    total_samples = getattr(dataset, "max_samples", None)
+
+    print(f"Computing embeddings and saving shards to {output_dir}")
+    print("Note: This may take a while for large datasets...")
+
+    def flush_shard() -> None:
+        nonlocal shard_arrays, shard_index, shard_pending
+
+        if not shard_arrays:
+            return
+
+        shard = np.concatenate(shard_arrays, axis=0).astype(np.float32, copy=False)
+        shard_path = output_dir / f"shard_{shard_index:06d}.npy"
+        np.save(shard_path, shard)
+        shards.append(
+            {
+                "file": shard_path.name,
+                "shape": [int(shard.shape[0]), int(shard.shape[1])],
+            }
+        )
+
+        shard_arrays = []
+        shard_pending = 0
+        shard_index += 1
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TextColumn("• {task.fields[remaining]} remaining"),
+        TextColumn("• {task.fields[shards]} shards"),
+        TimeRemainingColumn(),
+    ) as progress:
+        task = progress.add_task(
+            "[cyan]Computing embeddings...",
+            total=total_samples,
+            remaining="unknown" if total_samples is None else f"{total_samples:,}",
+            shards="0",
+        )
+
+        for batch in dataset:
+            if dim is None:
+                dim = batch.shape[1]
+
+            if batch.device.type != "cpu":
+                batch = batch.cpu()
+
+            batch_np = batch.numpy().astype(np.float32, copy=False)
+            batch_start = 0
+            while batch_start < batch_np.shape[0]:
+                remaining_space = chunk_size - shard_pending
+                batch_end = min(batch_start + remaining_space, batch_np.shape[0])
+
+                shard_arrays.append(batch_np[batch_start:batch_end].copy())
+                shard_pending += batch_end - batch_start
+                batch_start = batch_end
+
+                if shard_pending >= chunk_size:
+                    flush_shard()
+
+            n_total += batch.shape[0]
+            batch_count += 1
+
+            if total_samples is None:
+                remaining = "unknown"
+            else:
+                remaining = f"{max(total_samples - n_total, 0):,}"
+
+            progress.update(
+                task,
+                completed=n_total,
+                remaining=remaining,
+                shards=f"{len(shards):,}",
+            )
+
+            if batch_count % 10 == 0:
+                progress.refresh()
+
+            if batch_count % 100 == 0:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+    flush_shard()
+
+    if dim is None:
+        raise ValueError("No embeddings were produced from the dataset")
+
+    manifest = {
+        "format": "saetopic.sharded_embeddings.v1",
+        "dtype": "float32",
+        "shape": [int(n_total), int(dim)],
+        "shard_size": int(chunk_size),
+        "shards": shards,
+    }
+    manifest_path = output_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+
+    print(
+        f"[green]✓[/green] Saved {n_total} embeddings ({(n_total, dim)}) "
+        f"as {len(shards)} shards to {output_dir}"
+    )
 
     return n_total, dim
 

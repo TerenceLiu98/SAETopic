@@ -55,8 +55,8 @@ Required behavior:
   batch size.
 - Multi-GPU encoding must be opt-in through an explicit device list or
   `--auto-multi-gpu`.
-- The final embedding file must be a valid `.npy` array even when produced from
-  many temporary chunks.
+- Large-corpus embedding output should support sharded `.npy` directories with
+  a manifest, avoiding a final single-file merge step.
 - Empty streams must fail explicitly instead of writing an invalid output file.
 - Embedding normalization must be explicit: the embed CLI normalizes by default,
   while `--no-normalize-embeddings` saves raw embedder outputs.
@@ -94,7 +94,7 @@ Primary commands:
 ```bash
 saetopic-train embed \
   --dataset-name HuggingFaceFW/finewiki \
-  --output data/finewiki_embeddings.npy \
+  --output data/finewiki_embeddings \
   --text-chunk-size 512 \
   --max-seq-length 512 \
   --encode-batch-size 8 \
@@ -102,7 +102,7 @@ saetopic-train embed \
   --truncate-dim 512
 
 saetopic-train train \
-  --embeddings data/finewiki_embeddings.npy \
+  --embeddings data/finewiki_embeddings \
   --no-normalize-embeddings \
   --input-dim 512 \
   --expansion-factor 32 \
