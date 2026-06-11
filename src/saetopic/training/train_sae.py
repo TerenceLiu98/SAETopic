@@ -383,7 +383,9 @@ class SAETrainer:
         """
         self.model.train()
 
-        epoch_losses = {key: 0.0 for key in ["total", "reconstruction", "sparsity", "auxiliary"]}
+        epoch_losses = {
+            key: 0.0 for key in ["total", "reconstruction", "sparsity", "auxiliary", "r2"]
+        }
         n_batches = 0
 
         # Use rich.progress for better terminal output
@@ -425,7 +427,9 @@ class SAETrainer:
         """Evaluate one validation epoch without updating SAE training statistics."""
         self.model.eval()
 
-        val_losses = {key: 0.0 for key in ["total", "reconstruction", "sparsity", "auxiliary"]}
+        val_losses = {
+            key: 0.0 for key in ["total", "reconstruction", "sparsity", "auxiliary", "r2"]
+        }
         n_batches = 0
 
         sparsity_loss_weight = self.config.sparsity_loss_weight
@@ -582,7 +586,7 @@ class SAETrainer:
         if self.config.early_stopping and val_loader is None:
             print("Warning: early_stopping=True requires val_dataset; disabling early stopping")
         early_stopping_enabled = self.config.early_stopping and val_loader is not None
-        best_metric = float("inf")
+        best_metric = float("-inf") if self._metric_higher_is_better() else float("inf")
         epochs_without_improvement = 0
 
         if self.config.steps is not None:
@@ -621,7 +625,7 @@ class SAETrainer:
                     )
 
                 current_metric = val_losses[metric_name]
-                if current_metric < best_metric - self.config.early_stopping_min_delta:
+                if self._is_improved_metric(current_metric, best_metric):
                     best_metric = current_metric
                     epochs_without_improvement = 0
                     self.save_checkpoint("best")
@@ -662,12 +666,26 @@ class SAETrainer:
 
         return self.state
 
+    def _metric_higher_is_better(self) -> bool:
+        """Return whether the configured early stopping metric should increase."""
+        metric_name = self.config.early_stopping_metric.removeprefix("val_")
+        return metric_name == "r2"
+
+    def _is_improved_metric(self, current_metric: float, best_metric: float) -> bool:
+        """Check early stopping improvement with metric direction."""
+        min_delta = self.config.early_stopping_min_delta
+        if self._metric_higher_is_better():
+            return current_metric > best_metric + min_delta
+        return current_metric < best_metric - min_delta
+
     def _fit_standard_steps(self, train_loader: DataLoader) -> TrainingState:
         """Train with a finite DataLoader cycled to a fixed number of SAE-TM steps."""
         assert self.config.steps is not None
         self.model.train()
 
-        running_losses = {key: 0.0 for key in ["total", "reconstruction", "sparsity", "auxiliary"]}
+        running_losses = {
+            key: 0.0 for key in ["total", "reconstruction", "sparsity", "auxiliary", "r2"]
+        }
         n_batches = 0
 
         with Progress(
@@ -752,6 +770,7 @@ class SAETrainer:
                 "reconstruction": 0.0,
                 "sparsity": 0.0,
                 "auxiliary": 0.0,
+                "r2": 0.0,
             }
             n_batches = 0
 
@@ -823,6 +842,7 @@ class SAETrainer:
             "reconstruction": 0.0,
             "sparsity": 0.0,
             "auxiliary": 0.0,
+            "r2": 0.0,
         }
         n_batches = 0
 
@@ -939,6 +959,8 @@ class SAETrainer:
     def _create_model_card(self, path: Path) -> None:
         """Create model card markdown file."""
         n_features = self.config.n_features or self.config.input_dim * self.config.expansion_factor
+        latest_r2 = self.state.losses.get("r2", [None])[-1]
+        latest_val_r2 = self.state.losses.get("val_r2", [None])[-1]
 
         card = f"""# {self.config.checkpoint_name}
 
@@ -988,6 +1010,8 @@ for training experiments and future loader integration.
 - **Early Stopping Patience**: {self.config.early_stopping_patience}
 - **Early Stopping Metric**: {self.config.early_stopping_metric}
 - **Best Loss**: {self.state.best_loss:.6f}
+- **Latest R2**: {latest_r2 if latest_r2 is not None else "n/a"}
+- **Latest Validation R2**: {latest_val_r2 if latest_val_r2 is not None else "n/a"}
 
 ## License
 

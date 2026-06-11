@@ -193,7 +193,18 @@ def main() -> None:
         "--early-stopping-metric",
         type=str,
         default="reconstruction",
-        choices=["total", "reconstruction", "sparsity", "auxiliary", "val_total", "val_reconstruction", "val_sparsity", "val_auxiliary"],
+        choices=[
+            "total",
+            "reconstruction",
+            "sparsity",
+            "auxiliary",
+            "r2",
+            "val_total",
+            "val_reconstruction",
+            "val_sparsity",
+            "val_auxiliary",
+            "val_r2",
+        ],
         help="Validation metric to monitor for early stopping",
     )
 

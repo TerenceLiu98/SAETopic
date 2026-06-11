@@ -71,6 +71,14 @@ def geometric_median(points: Tensor, max_iter: int = 100, tol: float = 1e-5) -> 
     return guess
 
 
+def reconstruction_r2(x: Tensor, x_recon: Tensor) -> Tensor:
+    """Compute batch-level reconstruction R^2."""
+    residual_sum_squares = (x.float() - x_recon.float()).pow(2).sum()
+    centered = x.float() - x.float().mean(dim=0, keepdim=True)
+    total_sum_squares = centered.pow(2).sum()
+    return cast(Tensor, (1 - residual_sum_squares / total_sum_squares.clamp_min(1e-12)).nan_to_num(0.0))
+
+
 class RectangleFunction(autograd.Function):
     """Straight-through rectangle used by SAE-TM JumpReLU threshold gradients."""
 
@@ -467,6 +475,7 @@ class TopKSAE(nn.Module):
             "reconstruction": recon_loss.detach(),
             "sparsity": torch.tensor(0.0, device=x.device),
             "auxiliary": aux_loss.detach(),
+            "r2": reconstruction_r2(x, x_recon).detach(),
         }
 
         return total_loss, losses
@@ -503,6 +512,7 @@ class TopKSAE(nn.Module):
             "reconstruction": recon_loss.detach(),
             "sparsity": torch.tensor(0.0, device=x.device),
             "auxiliary": aux_loss.detach(),
+            "r2": reconstruction_r2(x, x_recon).detach(),
         }
 
         return total_loss, losses
@@ -804,6 +814,7 @@ class StandardSAE(nn.Module):
             "reconstruction": recon_loss.detach(),
             "sparsity": sparsity_loss.detach(),
             "auxiliary": torch.tensor(0.0, device=x.device),
+            "r2": reconstruction_r2(x, x_recon).detach(),
         }
         return total_loss, losses
 
@@ -948,6 +959,7 @@ class JumpReLUSAE(nn.Module):
             "reconstruction": recon_loss.detach(),
             "sparsity": sparsity_loss.detach(),
             "auxiliary": torch.tensor(0.0, device=x.device),
+            "r2": reconstruction_r2(x, x_recon).detach(),
         }
         return total_loss, losses
 

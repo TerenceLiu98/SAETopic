@@ -134,10 +134,25 @@ def test_sae_compute_loss():
     assert "reconstruction" in losses
     assert "sparsity" in losses
     assert "auxiliary" in losses
+    assert "r2" in losses
 
     # All losses should be non-negative
-    for value in losses.values():
+    for key, value in losses.items():
+        if key == "r2":
+            continue
         assert value.item() >= 0
+
+
+def test_reconstruction_r2_is_one_for_perfect_reconstruction():
+    """Test SAE reconstruction R^2 metric for exact reconstruction."""
+    model = TopKSAE(input_dim=4, n_features=8, top_k=2)
+    x = torch.randn(6, 4)
+    h = torch.zeros(6, 8)
+    f = torch.zeros(6, 8)
+
+    _, losses = model.compute_loss(x, x, h, f, update_stats=False)
+
+    assert torch.allclose(losses["r2"], torch.tensor(1.0))
 
 
 def test_standard_sae_compute_loss_uses_l1_sparsity():
@@ -157,6 +172,7 @@ def test_standard_sae_compute_loss_uses_l1_sparsity():
     expected = losses["reconstruction"] + 0.5 * losses["sparsity"]
     assert torch.allclose(loss.detach(), expected)
     assert losses["auxiliary"].item() == 0.0
+    assert "r2" in losses
 
 
 def test_jumprelu_sae_compute_loss_uses_target_l0_penalty():
@@ -176,6 +192,7 @@ def test_jumprelu_sae_compute_loss_uses_target_l0_penalty():
     expected = losses["reconstruction"] + 0.5 * losses["sparsity"]
     assert torch.allclose(loss.detach(), expected)
     assert losses["auxiliary"].item() == 0.0
+    assert "r2" in losses
 
 
 def test_sparse_loss_matches_dense_loss():
@@ -514,6 +531,7 @@ def test_train_sae_early_stopping_stops_after_patience(tmp_path, monkeypatch):
             "reconstruction": 1.0,
             "sparsity": 0.0,
             "auxiliary": 0.0,
+            "r2": 0.0,
         }
 
     monkeypatch.setattr(SAETrainer, "validate_epoch", constant_validation)
@@ -536,6 +554,45 @@ def test_train_sae_early_stopping_stops_after_patience(tmp_path, monkeypatch):
     assert trainer.state.epoch == 2
     assert (tmp_path / "early_stop" / "best").exists()
     assert "val_reconstruction" in trainer.state.losses
+    assert "val_r2" in trainer.state.losses
+
+
+def test_early_stopping_r2_metric_uses_higher_is_better(tmp_path, monkeypatch):
+    """Test val_r2 early stopping treats larger values as improvement."""
+    dataset = EmbeddingDataset(torch.randn(24, 8))
+    val_dataset = EmbeddingDataset(torch.randn(8, 8))
+    values = iter([0.1, 0.2, 0.2])
+
+    def validation_with_r2(self, val_loader):
+        r2 = next(values)
+        return {
+            "total": 1.0,
+            "reconstruction": 1.0,
+            "sparsity": 0.0,
+            "auxiliary": 0.0,
+            "r2": r2,
+        }
+
+    monkeypatch.setattr(SAETrainer, "validate_epoch", validation_with_r2)
+
+    trainer = train_sae(
+        dataset=dataset,
+        val_dataset=val_dataset,
+        input_dim=8,
+        n_features=16,
+        top_k=2,
+        n_epochs=5,
+        batch_size=8,
+        early_stopping=True,
+        early_stopping_patience=1,
+        early_stopping_min_delta=0.0,
+        early_stopping_metric="val_r2",
+        output_dir=str(tmp_path / "early_stop_r2"),
+        save_frequency=100,
+    )
+
+    assert trainer.state.epoch == 3
+    assert trainer.state.losses["val_r2"] == [0.1, 0.2, 0.2]
 
 
 def test_train_sae_respects_config_output_dir(tmp_path):

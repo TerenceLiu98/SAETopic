@@ -15,6 +15,7 @@ import torch
 # Recommended workflow for large-scale training
 from datasets import load_dataset
 from sentence_transformers import SentenceTransformer
+from torch.utils.data import random_split
 
 from saetopic.training import compute_and_save_embeddings, train_sae
 from saetopic.training.data import EmbeddingDataset
@@ -81,6 +82,19 @@ print(f"Saved {n_embeddings} embeddings of dimension {embedding_dim}")
 # --------------------------------------
 # Now you can experiment with different hyperparameters
 # without recomputing embeddings!
+full_dataset = EmbeddingDataset.from_file(
+    embeddings_path,
+    normalize=False,  # create_streaming_dataset normalizes before saving
+    mmap_mode="r",
+)
+val_size = max(1, int(0.05 * len(full_dataset)))
+train_size = len(full_dataset) - val_size
+train_dataset, val_dataset = random_split(
+    full_dataset,
+    [train_size, val_size],
+    generator=torch.Generator().manual_seed(42),
+)
+
 config = TrainingConfig(
     input_dim=embedding_dim,  # Auto-detected from saved embeddings
     expansion_factor=32,
@@ -88,10 +102,14 @@ config = TrainingConfig(
     architecture="batch_topk",
     learning_rate=1e-3,
     batch_size=256,
-    n_epochs=10, 
+    n_epochs=100,
     save_frequency=1,
     warmup_ratio=0.1,
     aux_loss_weight=1 / 32,
+    early_stopping=True,
+    early_stopping_patience=5,
+    early_stopping_min_delta=1e-4,
+    early_stopping_metric="val_reconstruction",
     device="auto",
     seed=42,
     output_dir=f"{output_dir}/checkpoints/jina-v5-sae-small",
@@ -101,9 +119,9 @@ config = TrainingConfig(
 )
 torch.cuda.empty_cache()
 trainer = train_sae(
-    embeddings_path=embeddings_path,
+    dataset=train_dataset,
+    val_dataset=val_dataset,
     config=config,
-    normalize_embeddings=False,  # create_streaming_dataset normalizes before saving
 )
 
 # The trained model is now available at:
