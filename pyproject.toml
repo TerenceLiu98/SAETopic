@@ -12,7 +12,7 @@ license = "Apache-2.0"
 authors = [
     {name = "SAETopic contributors"},
 ]
-keywords = ["topic-modeling", "nlp", "sparse-autoencoder"]
+keywords = ["topic-modeling", "sparse-autoencoder"，"language", "vision"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -47,10 +47,10 @@ saetopic = "saetopic.cli:main"
 saetopic-train = "saetopic.training.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/yourusername/saetopic"
-Documentation = "https://github.com/yourusername/saetopic#readme"
-Repository = "https://github.com/yourusername/saetopic"
-"Bug Tracker" = "https://github.com/yourusername/saetopic/issues"
+Homepage = "https://github.com/TerenceLiu98/saetopic"
+Documentation = "https://github.com/TerenceLiu98/saetopic#readme"
+Repository = "https://github.com/TerenceLiu98/saetopic"
+"Bug Tracker" = "https://github.com/TerenceLiu98/saetopic/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/saetopic"]

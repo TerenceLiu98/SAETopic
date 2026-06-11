@@ -2,11 +2,9 @@
 
 > **Sparse Autoencoder topic-atom training and planned topic inference**
 
-SAETopic is a Python package for training sparse autoencoder (SAE) topic atoms.
+SAETopic is a Python package for training sparse autoencoder (SAE) topic atoms, an **unofficial** implementation of [Sparse Autoencoders are Topic Models](https://arxiv.org/abs/2511.16309) with its official [GitHub repo](https://github.com/ExplainableML/SAE-TM/tree/main). 
 The current implementation focuses on memory-aware SAE training; the
 inference interface and rapid topic granularity exploration are planned.
-
-**Unofficial clean-room implementation** for SAE-based topic-atom training.
 
 ## Core Features
 
@@ -142,8 +140,8 @@ loaded = SAETopicModel.load("my_model")
 
 ## Pretraining Datasets
 
-- **Text**: [HuggingFaceFW/finewiki](https://huggingface.co/datasets/HuggingFaceFW/finewiki) (CC-BY-SA 4.0 / Apache 2.0)
-- **Vision** (planned): [ILSVRC/imagenet-1k](https://huggingface.co/datasets/ILSVRC/imagenet-1k)
+- **Text**: [HuggingFaceFW/finewiki](https://huggingface.co/datasets/HuggingFaceFW/finewiki) (with CC-BY-SA 4.0)
+- **Vision** (planned): [ILSVRC/imagenet-1k](https://huggingface.co/datasets/ILSVRC/imagenet-1k) (with [LICENSE](https://huggingface.co/datasets/ILSVRC/imagenet-1k#licensing-information))
 
 ## Training Topic Atoms
 
