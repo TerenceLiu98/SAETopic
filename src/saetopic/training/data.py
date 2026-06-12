@@ -677,6 +677,7 @@ def create_streaming_dataset(
         *load_args,
         split=split,
         streaming=streaming,
+        num_proc=16,
         **hf_kwargs,
     )
 
