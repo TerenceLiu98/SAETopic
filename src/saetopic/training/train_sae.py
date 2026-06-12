@@ -1681,7 +1681,6 @@ def _compute_and_save_sharded_embeddings(
             )
 
             if batch_count % 10 == 0:
-                flush_shard()
                 progress.refresh()
 
             if batch_count % 100 == 0:

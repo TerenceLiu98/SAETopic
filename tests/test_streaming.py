@@ -401,6 +401,40 @@ def test_compute_and_save_embeddings_writes_sharded_directory(tmp_path):
     assert dataset[-1][0].item() == 3
 
 
+def test_compute_and_save_embeddings_flushes_shards_by_chunk_size(tmp_path):
+    """Test sharded saving only flushes full chunks until the final partial shard."""
+    import json
+
+    import numpy as np
+
+    from saetopic.training.train_sae import compute_and_save_embeddings
+
+    class MockDataset:
+        max_samples = 20
+
+        def __iter__(self):
+            for i in range(5):
+                yield torch.ones(4, 3) * i
+
+    output_dir = tmp_path / "embeddings"
+    n_embeddings, embedding_dim = compute_and_save_embeddings(
+        MockDataset(),
+        output_dir,
+        chunk_size=10,
+    )
+
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    shard_0 = np.load(output_dir / "shard_000000.npy")
+    shard_1 = np.load(output_dir / "shard_000001.npy")
+
+    assert n_embeddings == 20
+    assert embedding_dim == 3
+    assert manifest["shape"] == [20, 3]
+    assert [shard["shape"][0] for shard in manifest["shards"]] == [10, 10]
+    assert shard_0.shape == (10, 3)
+    assert shard_1.shape == (10, 3)
+
+
 def test_compute_and_save_embeddings_writes_partial_manifest_on_failure(tmp_path):
     """Test sharded saving leaves resumable metadata after a failed run."""
     import json
