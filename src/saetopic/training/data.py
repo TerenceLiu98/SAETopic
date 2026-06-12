@@ -376,6 +376,7 @@ class StreamingEmbeddingDataset:
         self.task = task
         self.source_rows_seen = 0
         self.source_total = self._infer_source_total()
+        self._encode_pool: dict[str, Any] | None = None
 
         if self.skip_samples < 0:
             raise ValueError("skip_samples must be non-negative")
@@ -404,6 +405,34 @@ class StreamingEmbeddingDataset:
             return None
 
         return int(source_total)
+
+    def _encode_device_list(self) -> list[str] | None:
+        """Return encode devices as strings when multi-device encoding is requested."""
+        if not isinstance(self.encode_device, list) or len(self.encode_device) <= 1:
+            return None
+        return [str(device) for device in self.encode_device]
+
+    def _start_encode_pool(self) -> None:
+        """Start a persistent SentenceTransformers pool for multi-device encoding."""
+        devices = self._encode_device_list()
+        if devices is None or self._encode_pool is not None:
+            return
+        if not hasattr(self.embedder, "start_multi_process_pool"):
+            return
+
+        print(
+            "Starting SentenceTransformers encode pool on devices: "
+            + ", ".join(devices)
+        )
+        self._encode_pool = self.embedder.start_multi_process_pool(devices)
+
+    def _stop_encode_pool(self) -> None:
+        """Stop the persistent SentenceTransformers pool if one was started."""
+        if self._encode_pool is None:
+            return
+        if hasattr(self.embedder, "stop_multi_process_pool"):
+            self.embedder.stop_multi_process_pool(self._encode_pool)
+        self._encode_pool = None
 
     def _get_embedding_dim(self) -> int:
         """Get embedding dimension by encoding a sample."""
@@ -475,7 +504,9 @@ class StreamingEmbeddingDataset:
             "task": self.task,
             "show_progress_bar": False,
         }
-        if self.encode_device is not None:
+        if self._encode_pool is not None:
+            encode_kwargs["pool"] = self._encode_pool
+        elif self.encode_device is not None:
             encode_kwargs["device"] = self.encode_device
         if self.encode_chunk_size is not None:
             encode_kwargs["chunk_size"] = self.encode_chunk_size
@@ -508,59 +539,63 @@ class StreamingEmbeddingDataset:
         n_samples_skipped = 0
         n_samples_yielded = 0
         self.source_rows_seen = 0
+        self._start_encode_pool()
 
-        for item in self.base_dataset:
-            self.source_rows_seen += 1
-            # Check max_samples limit
-            if (
-                self.max_samples is not None
-                and n_samples_skipped + n_samples_yielded >= self.max_samples
-            ):
-                break
-
-            # Extract text
-            if isinstance(item, dict):
-                text = item.get(self.text_column, "")
-            else:
-                text = item
-
-            # Skip empty texts
-            if not text or (isinstance(text, str) and len(text.strip()) == 0):
-                continue
-
-            for text_chunk in self._split_text(text):
-                if n_samples_skipped < self.skip_samples:
-                    n_samples_skipped += 1
-                    continue
-                if self.max_samples is not None and (
-                    n_samples_skipped + n_samples_yielded + len(texts_buffer)
-                    >= self.max_samples
+        try:
+            for item in self.base_dataset:
+                self.source_rows_seen += 1
+                # Check max_samples limit
+                if (
+                    self.max_samples is not None
+                    and n_samples_skipped + n_samples_yielded >= self.max_samples
                 ):
                     break
-                texts_buffer.append(text_chunk)
 
-            # When buffer is full, encode and yield
-            if len(texts_buffer) >= self.buffer_size:
-                # Shuffle buffer
-                random.shuffle(texts_buffer)
+                # Extract text
+                if isinstance(item, dict):
+                    text = item.get(self.text_column, "")
+                else:
+                    text = item
 
-                # Encode in batches
+                # Skip empty texts
+                if not text or (isinstance(text, str) and len(text.strip()) == 0):
+                    continue
+
+                for text_chunk in self._split_text(text):
+                    if n_samples_skipped < self.skip_samples:
+                        n_samples_skipped += 1
+                        continue
+                    if self.max_samples is not None and (
+                        n_samples_skipped + n_samples_yielded + len(texts_buffer)
+                        >= self.max_samples
+                    ):
+                        break
+                    texts_buffer.append(text_chunk)
+
+                # When buffer is full, encode and yield
+                if len(texts_buffer) >= self.buffer_size:
+                    # Shuffle buffer
+                    random.shuffle(texts_buffer)
+
+                    # Encode in batches
+                    for i in range(0, len(texts_buffer), self.embedding_batch_size):
+                        batch_texts = texts_buffer[i : i + self.embedding_batch_size]
+
+                        embeddings = self._embed_text_batch(batch_texts)
+                        yield embeddings
+                        n_samples_yielded += embeddings.shape[0]
+
+                    texts_buffer = []
+
+            # Yield remaining items
+            if texts_buffer:
                 for i in range(0, len(texts_buffer), self.embedding_batch_size):
                     batch_texts = texts_buffer[i : i + self.embedding_batch_size]
-
                     embeddings = self._embed_text_batch(batch_texts)
                     yield embeddings
                     n_samples_yielded += embeddings.shape[0]
-
-                texts_buffer = []
-
-        # Yield remaining items
-        if texts_buffer:
-            for i in range(0, len(texts_buffer), self.embedding_batch_size):
-                batch_texts = texts_buffer[i : i + self.embedding_batch_size]
-                embeddings = self._embed_text_batch(batch_texts)
-                yield embeddings
-                n_samples_yielded += embeddings.shape[0]
+        finally:
+            self._stop_encode_pool()
 
 
 def create_streaming_dataset(

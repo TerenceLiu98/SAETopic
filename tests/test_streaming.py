@@ -200,6 +200,54 @@ def test_streaming_dataset_passes_encode_device_and_task():
     assert embedder.calls[0]["task"] == "clustering"
 
 
+def test_streaming_dataset_reuses_encode_pool_for_multi_device_embedder():
+    """Test multi-device SentenceTransformers-style encoding uses one pool."""
+    from saetopic.training.data import StreamingEmbeddingDataset
+
+    class MockEmbedder:
+        def __init__(self):
+            self.calls = []
+            self.started_devices = None
+            self.stopped_pool = None
+
+        def start_multi_process_pool(self, devices):
+            self.started_devices = devices
+            return {"processes": ["worker0", "worker1"]}
+
+        def stop_multi_process_pool(self, pool):
+            self.stopped_pool = pool
+
+        def encode(self, texts, **kwargs):
+            import numpy as np
+
+            self.calls.append(kwargs)
+            return np.ones((len(texts), 8), dtype=np.float32)
+
+    class MockDataset:
+        def __iter__(self):
+            for i in range(4):
+                yield {"text": f"Document {i}"}
+
+    embedder = MockEmbedder()
+    dataset = StreamingEmbeddingDataset(
+        MockDataset(),
+        embedder,
+        buffer_size=4,
+        embedding_batch_size=2,
+        encode_batch_size=4,
+        encode_device=["cuda:0", "cuda:1"],
+        encode_chunk_size=16,
+    )
+
+    list(dataset)
+
+    assert embedder.started_devices == ["cuda:0", "cuda:1"]
+    assert embedder.stopped_pool == {"processes": ["worker0", "worker1"]}
+    assert len(embedder.calls) == 2
+    assert all(call["pool"] == {"processes": ["worker0", "worker1"]} for call in embedder.calls)
+    assert all("device" not in call for call in embedder.calls)
+
+
 def test_create_streaming_dataset_forwards_local_options_to_dataset(monkeypatch):
     """Test local options are handled locally, not passed to load_dataset."""
     import sys
