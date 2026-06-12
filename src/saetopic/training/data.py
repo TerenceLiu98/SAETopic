@@ -374,6 +374,8 @@ class StreamingEmbeddingDataset:
         self.skip_samples = skip_samples
         self.seed = seed
         self.task = task
+        self.source_rows_seen = 0
+        self.source_total = self._infer_source_total()
 
         if self.skip_samples < 0:
             raise ValueError("skip_samples must be non-negative")
@@ -391,6 +393,17 @@ class StreamingEmbeddingDataset:
 
         # Detect embedding dimension from first batch
         self._embedding_dim: int | None = None
+
+    def _infer_source_total(self) -> int | None:
+        """Infer raw dataset rows when the source exposes a cheap length."""
+        try:
+            source_total = len(self.base_dataset)
+        except TypeError:
+            return None
+        except NotImplementedError:
+            return None
+
+        return int(source_total)
 
     def _get_embedding_dim(self) -> int:
         """Get embedding dimension by encoding a sample."""
@@ -494,8 +507,10 @@ class StreamingEmbeddingDataset:
         texts_buffer = []
         n_samples_skipped = 0
         n_samples_yielded = 0
+        self.source_rows_seen = 0
 
         for item in self.base_dataset:
+            self.source_rows_seen += 1
             # Check max_samples limit
             if (
                 self.max_samples is not None

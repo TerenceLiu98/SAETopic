@@ -126,6 +126,40 @@ def test_streaming_dataset_skip_samples_before_encode():
     assert set(embedder.encoded_texts) == {"Document 4", "Document 5", "Document 6"}
 
 
+def test_streaming_dataset_tracks_source_rows_for_sized_sources():
+    """Test non-streaming sources expose raw-row progress separately."""
+    from saetopic.training.data import StreamingEmbeddingDataset
+
+    class MockEmbedder:
+        def encode(self, texts, **kwargs):
+            import numpy as np
+
+            return np.ones((len(texts), 8), dtype=np.float32)
+
+    class MockDataset:
+        def __len__(self):
+            return 3
+
+        def __iter__(self):
+            yield {"text": "first document"}
+            yield {"text": "second document"}
+            yield {"text": "third document"}
+
+    dataset = StreamingEmbeddingDataset(
+        MockDataset(),
+        MockEmbedder(),
+        buffer_size=10,
+        embedding_batch_size=2,
+    )
+
+    assert dataset.source_total == 3
+
+    batches = list(dataset)
+
+    assert sum(batch.shape[0] for batch in batches) == 3
+    assert dataset.source_rows_seen == 3
+
+
 def test_streaming_dataset_passes_encode_device_and_task():
     """Test that encode options are forwarded to SentenceTransformer."""
     from saetopic.training.data import StreamingEmbeddingDataset

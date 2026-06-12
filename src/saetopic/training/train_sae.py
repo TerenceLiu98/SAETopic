@@ -1157,6 +1157,24 @@ def train_sae(
     return trainer
 
 
+def _format_embedding_progress_remaining(
+    dataset: Any,
+    total_samples: int | None,
+    n_saved: int,
+    n_pending: int = 0,
+) -> str:
+    """Format remaining progress without mixing source rows and embeddings."""
+    if total_samples is not None:
+        return f"{max(total_samples - n_saved - n_pending, 0):,}"
+
+    source_total = getattr(dataset, "source_total", None)
+    source_rows_seen = getattr(dataset, "source_rows_seen", None)
+    if isinstance(source_total, int) and isinstance(source_rows_seen, int):
+        return f"{max(source_total - source_rows_seen, 0):,} source rows"
+
+    return "unknown"
+
+
 def compute_and_save_embeddings(
     dataset: StreamingEmbeddingDataset,
     output_path: str | Path,
@@ -1364,7 +1382,11 @@ def compute_and_save_embeddings(
             task = progress.add_task(
                 "[cyan]Computing embeddings...",
                 total=total_samples,
-                remaining="unknown",
+                remaining=_format_embedding_progress_remaining(
+                    dataset,
+                    total_samples,
+                    n_total,
+                ),
             )
 
             for batch in dataset:
@@ -1392,10 +1414,11 @@ def compute_and_save_embeddings(
                 batch_count += 1
 
                 # Progress update
-                if total_samples is None:
-                    remaining = "unknown"
-                else:
-                    remaining = f"{max(total_samples - n_total, 0):,}"
+                remaining = _format_embedding_progress_remaining(
+                    dataset,
+                    total_samples,
+                    n_total,
+                )
 
                 progress.update(
                     task,
@@ -1617,14 +1640,18 @@ def _compute_and_save_sharded_embeddings(
         task = progress.add_task(
             "[cyan]Computing embeddings...",
             total=total_samples,
-            remaining="unknown" if total_samples is None else f"{total_samples:,}",
+            remaining=_format_embedding_progress_remaining(
+                dataset,
+                total_samples,
+                n_total,
+            ),
             shards="0",
         )
         if n_total:
-            remaining = (
-                "unknown"
-                if total_samples is None
-                else f"{max(total_samples - n_total, 0):,}"
+            remaining = _format_embedding_progress_remaining(
+                dataset,
+                total_samples,
+                n_total,
             )
             progress.update(
                 task,
@@ -1667,11 +1694,13 @@ def _compute_and_save_sharded_embeddings(
 
             batch_count += 1
 
-            if total_samples is None:
-                remaining = "unknown"
-            else:
-                pending_rows = sum(array.shape[0] for array in shard_arrays)
-                remaining = f"{max(total_samples - n_total - pending_rows, 0):,}"
+            pending_rows = sum(array.shape[0] for array in shard_arrays)
+            remaining = _format_embedding_progress_remaining(
+                dataset,
+                total_samples,
+                n_total,
+                pending_rows,
+            )
 
             progress.update(
                 task,
