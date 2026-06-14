@@ -402,7 +402,15 @@ class SAETopicModel:
         from saetopic.merging import TopicMerger
         from saetopic.representation import TopicRepresentation, compute_ctfidf
 
-        feature_weights = np.asarray(self.feature_activations_.mean(axis=0)).ravel()
+        theta = np.asarray(self.feature_activations_, dtype=np.float32)
+        row_sums = theta.sum(axis=1, keepdims=True)
+        theta_normalized = np.divide(
+            theta,
+            np.clip(row_sums, 1e-8, None),
+            out=np.zeros_like(theta),
+            where=row_sums > 0,
+        )
+        feature_weights = theta_normalized.mean(axis=0).ravel()
 
         self.merger_ = TopicMerger(
             n_topics=n_topics,
@@ -415,7 +423,7 @@ class SAETopicModel:
 
         self.topic_word_matrix_ = self.merger_.topic_word_matrix_
         self.topic_atom_clusters_ = self.merger_.feature_clusters_
-        self.document_topic_matrix_ = self.merger_.transform(self.feature_activations_)
+        self.document_topic_matrix_ = self.merger_.transform(theta_normalized)
         self.n_topics = self.merger_.n_topics
 
         # c-TF-IDF topic-word scores (distinctiveness-weighted) for display
