@@ -88,10 +88,10 @@ class SAETopicModel:
         Max input sequence length for the embedder. Set to match the SAE's
         training chunk size so inference embeddings stay in-distribution.
     use_ctfidf : bool, default=True
-        Use c-TF-IDF (BERTopic-style) topic-word scoring for ``get_topic`` /
-        ``get_topic_info``, so topic words are ranked by distinctiveness across
-        topics rather than raw emission probability. Down-weights corpus-common
-        words (e.g. "events", "born", month names).
+        Use c-TF-IDF topic-word scoring for ``get_topic`` / ``get_topic_info``,
+        so topic words are ranked by distinctiveness across topics rather than
+        raw emission probability. Down-weights corpus-common words (e.g.
+        "events", "born", month names).
     drop_empty_topics : bool, default=True
         Drop clusters to which no document is assigned (count == 0) and
         renumber the remaining topics, so the output never shows empty topics.
@@ -582,7 +582,7 @@ class SAETopicModel:
         docs: list[str] | None = None,
         nr_topics: int = 30,
     ) -> "SAETopicModel":
-        """BERTopic-compatible alias for :meth:`retopic`."""
+        """Alias for :meth:`retopic`."""
         del docs
         return self.retopic(n_topics=nr_topics)
 

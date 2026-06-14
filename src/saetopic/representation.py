@@ -14,7 +14,6 @@ import numpy as np
 
 if TYPE_CHECKING:
     import pandas as pd
-    from scipy import sparse
 
 
 def top_words_from_distribution(
@@ -34,7 +33,7 @@ def compute_ctfidf(
     bow,
 ) -> np.ndarray:
     """
-    Compute class-based TF-IDF (BERTopic-style) topic-word scores.
+    Compute class-based TF-IDF topic-word scores.
 
     Unlike a raw aggregated emission distribution, c-TF-IDF down-weights
     words that are common across *many* topics (e.g. ``events``, ``born``,
@@ -72,7 +71,7 @@ def compute_ctfidf(
     topic_totals = counts.sum(axis=1, keepdims=True)  # (T x 1)
     tf = counts / np.clip(topic_totals, 1e-12, None)
 
-    # idf: rare-across-topics words score higher (BERTopic form)
+    # idf: rare-across-topics words score higher
     word_totals = counts.sum(axis=0)  # (V,)
     m = float(topic_totals.mean())  # average total mass per topic
     idf = np.log(1.0 + (1.0 + m / np.clip(word_totals, 1e-12, None)))  # (V,)
