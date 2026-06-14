@@ -4,10 +4,96 @@ Vectorizer for corpus vocabulary and bag-of-words construction.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from scipy import sparse
+
+
+class SAETMDocumentProcessor:
+    """Tokenization/filtering/lemmatization used by the SAE-TM BoW cache."""
+
+    def __init__(self):
+        try:
+            import nltk
+            from nltk.corpus import stopwords, wordnet
+            from nltk.stem import WordNetLemmatizer
+            from nltk.tokenize import word_tokenize
+        except ImportError as exc:
+            raise ImportError(
+                "nltk is required for stop_words='saetm'. Install with `pip install nltk`."
+            ) from exc
+
+        self.nltk = nltk
+        self.wordnet = wordnet
+        self.word_tokenize = word_tokenize
+        self.lemmatizer = WordNetLemmatizer()
+        self._ensure_nltk_data()
+        self.stop_words = set(stopwords.words("english"))
+        self.wordnet_words = set(wordnet.words())
+        self.ascii_pattern = re.compile(r"^[a-z]+$")
+        self.tag_dict = {
+            "J": wordnet.ADJ,
+            "N": wordnet.NOUN,
+            "V": wordnet.VERB,
+            "R": wordnet.ADV,
+        }
+
+    def _ensure_nltk_data(self) -> None:
+        required_resources = [
+            ("tokenizers/punkt", "punkt"),
+            ("corpora/stopwords", "stopwords"),
+            ("corpora/wordnet", "wordnet"),
+            ("taggers/averaged_perceptron_tagger", "averaged_perceptron_tagger"),
+        ]
+        for resource, package in required_resources:
+            try:
+                self.nltk.data.find(resource)
+                continue
+            except LookupError:
+                pass
+
+            if not self.nltk.download(package, quiet=True):
+                raise RuntimeError(
+                    f"Missing NLTK resource {resource!r}. Download it once with "
+                    f"`python -m nltk.downloader {package}` or use stop_words='english'."
+                )
+
+        optional_packages = [
+            ("tokenizers/punkt_tab", "punkt_tab"),
+            ("corpora/omw-1.4", "omw-1.4"),
+            ("taggers/averaged_perceptron_tagger_eng", "averaged_perceptron_tagger_eng"),
+        ]
+        for resource, package in optional_packages:
+            try:
+                self.nltk.data.find(resource)
+            except LookupError:
+                self.nltk.download(package, quiet=True)
+
+    def _get_pos(self, tag: str) -> str:
+        tag_char = tag[0].upper()
+        return self.tag_dict.get(tag_char, self.wordnet.NOUN)
+
+    def process(self, text: str) -> list[str]:
+        tokens = self.word_tokenize(text.lower())
+        filtered_tokens = [
+            token
+            for token in tokens
+            if (
+                len(token) > 2
+                and self.ascii_pattern.match(token)
+                and token not in self.stop_words
+                and token in self.wordnet_words
+            )
+        ]
+        if not filtered_tokens:
+            return []
+
+        lemmas = []
+        for token, tag in self.nltk.pos_tag(filtered_tokens):
+            lemmas.append(self.lemmatizer.lemmatize(token, self._get_pos(tag)))
+        return lemmas
 
 
 class CorpusVectorizer:
@@ -29,9 +115,9 @@ class CorpusVectorizer:
     idf_weighting : bool, default=True
         Whether to compute IDF weights (consumed by CorpusAdapter)
     stop_words : str or None, default="english"
-        Stop-word list forwarded to CountVectorizer. Use "news20k" for
-        20 Newsgroups-style email/forum boilerplate, "wikipedia" for
-        Wikipedia-style article boilerplate, "english", None, or a custom list.
+        Stop-word/preprocessing mode. Use "saetm" to match the SAE-TM BoW
+        preprocessing (NLTK stopwords + WordNet filtering + lemmatization),
+        "english", None, or a custom list.
     ngram_range : tuple, default=(1, 1)
         N-gram range forwarded to CountVectorizer
     token_pattern : str or None, default=r"(?u)\\b[a-zA-Z][a-zA-Z]+\\b"
@@ -42,52 +128,6 @@ class CorpusVectorizer:
 
     # Drop pure-number tokens (dates/years) so they don't dominate topic words.
     DEFAULT_TOKEN_PATTERN = r"(?u)\b[a-zA-Z][a-zA-Z]+\b"
-
-    # Extra Wikipedia boilerplate that floods topic words (date-list articles,
-    # biography stubs). Unioned with English stopwords when stop_words="wikipedia".
-    WIKIPEDIA_EXTRA_STOP_WORDS = frozenset(
-        {
-            # months / date scaffolding
-            "january", "february", "march", "april", "may", "june", "july",
-            "august", "september", "october", "november", "december",
-            # biography / date-list boilerplate
-            "born", "died", "births", "deaths", "events", "incumbents",
-            "incumbent", "year", "years", "date", "unknown", "married",
-            "son", "sons", "daughter", "daughters", "wife", "husband",
-            "father", "mother", "aged", "century", "early", "late",
-            "following", "later", "time", "new", "old", "known", "near",
-            "place", "day", "today", "total",
-            # result/abbreviation scaffolding surfaced by c-TF-IDF
-            "did", "advance", "ha", "displaystyle",
-            # high-frequency Wikipedia given names that carry no topic signal
-            "john", "william", "james", "thomas", "charles", "george",
-            "robert", "henry", "richard", "joseph", "edward", "samuel",
-            "david", "peter", "paul", "james", "mary", "anne", "elizabeth",
-            "margaret", "james", "frederick", "arthur", "albert", "walter",
-        }
-    )
-    NEWS20K_EXTRA_STOP_WORDS = frozenset(
-        {
-            # contraction fragments from the default alphabetic token pattern
-            "don", "doesn", "didn", "isn", "aren", "wasn", "weren", "won",
-            "wouldn", "couldn", "shouldn", "haven", "hasn", "hadn", "can",
-            "cant", "ll", "ve", "re", "isnt", "arent", "wasnt", "werent",
-            # email / quoting / organization boilerplate
-            "edu", "com", "org", "net", "gov", "writes", "article", "posting",
-            "host", "nntp", "subject", "lines", "organization", "reply",
-            "email", "mail", "address", "university",
-            # high-frequency conversational words that dominate topic labels
-            "just", "like", "know", "think", "people", "time", "does", "did",
-            "say", "said", "make", "way", "want", "need", "use", "using",
-            "used", "good", "new", "right", "thanks", "work", "problem",
-            "problems", "question", "questions", "thing", "things", "point",
-            "sure", "going", "got", "really", "probably", "look", "actually",
-            "better", "best", "lot", "little", "long", "read", "help",
-            # temporal/filler terms
-            "year", "years", "day", "days", "week", "weeks", "today",
-            "yesterday", "tomorrow", "old", "new",
-        }
-    )
 
     def __init__(
         self,
@@ -112,20 +152,21 @@ class CorpusVectorizer:
         self.vocab_: list[str] | None = None
 
     def _build_count_vectorizer(self):
-        from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, CountVectorizer
+        from sklearn.feature_extraction.text import CountVectorizer
 
         kwargs: dict = dict(
             min_df=self.min_df,
             max_df=self.max_df,
             ngram_range=self.ngram_range,
-            token_pattern=self.token_pattern,
             binary=False,
         )
-        if self.stop_words == "wikipedia":
-            kwargs["stop_words"] = list(ENGLISH_STOP_WORDS | self.WIKIPEDIA_EXTRA_STOP_WORDS)
-        elif self.stop_words == "news20k":
-            kwargs["stop_words"] = list(ENGLISH_STOP_WORDS | self.NEWS20K_EXTRA_STOP_WORDS)
+        if self.stop_words == "saetm":
+            processor = SAETMDocumentProcessor()
+            kwargs["tokenizer"] = processor.process
+            kwargs["token_pattern"] = None
+            kwargs["lowercase"] = False
         else:
+            kwargs["token_pattern"] = self.token_pattern
             kwargs["stop_words"] = self.stop_words
         if self.vocabulary_size:
             kwargs["max_features"] = self.vocabulary_size

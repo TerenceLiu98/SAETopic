@@ -111,8 +111,8 @@ def main() -> None:
     ap.add_argument("--min-df", type=int, default=3, help="Vectorizer min document frequency")
     ap.add_argument(
         "--stop-words",
-        default="wikipedia",
-        help='Stop-word set: "english", "wikipedia" (english + date/bio boilerplate), or none',
+        default="saetm",
+        help='Stop-word/preprocessing mode: "saetm", "english", or none',
     )
     ap.add_argument(
         "--theta-mode",

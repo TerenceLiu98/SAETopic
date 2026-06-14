@@ -270,8 +270,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--stop-words",
-        default="news20k",
-        help='Stop-word set: "news20k", "english", "wikipedia", or "none".',
+        default="saetm",
+        help='Stop-word/preprocessing mode: "saetm", "english", or "none".',
     )
     parser.add_argument("--out", default="news20k_topics.csv", help="Topic info CSV output path.")
     args = parser.parse_args()
