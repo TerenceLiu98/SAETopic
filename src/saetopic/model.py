@@ -77,8 +77,8 @@ class SAETopicModel:
     max_df : float, default=0.95
         Maximum document frequency (ratio) for vocabulary terms
     stop_words : str or None, default="english"
-        Stop-word list for the vectorizer: "english", "wikipedia" (English +
-        Wikipedia date/biography boilerplate + common names), None, or a list.
+        Stop-word list for the vectorizer: "english", "news20k", "wikipedia",
+        None, or a custom list.
     theta_mode : str, default="dense"
         How SAE feature activations (θ) are obtained:
         - "dense": ``sae.encode()`` dense ReLU (SAE-TM faithful, default).

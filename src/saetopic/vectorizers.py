@@ -7,7 +7,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    import numpy as np
     from scipy import sparse
 
 
@@ -30,7 +29,9 @@ class CorpusVectorizer:
     idf_weighting : bool, default=True
         Whether to compute IDF weights (consumed by CorpusAdapter)
     stop_words : str or None, default="english"
-        Stop-word list forwarded to CountVectorizer
+        Stop-word list forwarded to CountVectorizer. Use "news20k" for
+        20 Newsgroups-style email/forum boilerplate, "wikipedia" for
+        Wikipedia-style article boilerplate, "english", None, or a custom list.
     ngram_range : tuple, default=(1, 1)
         N-gram range forwarded to CountVectorizer
     token_pattern : str or None, default=r"(?u)\\b[a-zA-Z][a-zA-Z]+\\b"
@@ -65,6 +66,28 @@ class CorpusVectorizer:
             "margaret", "james", "frederick", "arthur", "albert", "walter",
         }
     )
+    NEWS20K_EXTRA_STOP_WORDS = frozenset(
+        {
+            # contraction fragments from the default alphabetic token pattern
+            "don", "doesn", "didn", "isn", "aren", "wasn", "weren", "won",
+            "wouldn", "couldn", "shouldn", "haven", "hasn", "hadn", "can",
+            "cant", "ll", "ve", "re", "isnt", "arent", "wasnt", "werent",
+            # email / quoting / organization boilerplate
+            "edu", "com", "org", "net", "gov", "writes", "article", "posting",
+            "host", "nntp", "subject", "lines", "organization", "reply",
+            "email", "mail", "address", "university",
+            # high-frequency conversational words that dominate topic labels
+            "just", "like", "know", "think", "people", "time", "does", "did",
+            "say", "said", "make", "way", "want", "need", "use", "using",
+            "used", "good", "new", "right", "thanks", "work", "problem",
+            "problems", "question", "questions", "thing", "things", "point",
+            "sure", "going", "got", "really", "probably", "look", "actually",
+            "better", "best", "lot", "little", "long", "read", "help",
+            # temporal/filler terms
+            "year", "years", "day", "days", "week", "weeks", "today",
+            "yesterday", "tomorrow", "old", "new",
+        }
+    )
 
     def __init__(
         self,
@@ -89,7 +112,7 @@ class CorpusVectorizer:
         self.vocab_: list[str] | None = None
 
     def _build_count_vectorizer(self):
-        from sklearn.feature_extraction.text import CountVectorizer, ENGLISH_STOP_WORDS
+        from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, CountVectorizer
 
         kwargs: dict = dict(
             min_df=self.min_df,
@@ -100,6 +123,8 @@ class CorpusVectorizer:
         )
         if self.stop_words == "wikipedia":
             kwargs["stop_words"] = list(ENGLISH_STOP_WORDS | self.WIKIPEDIA_EXTRA_STOP_WORDS)
+        elif self.stop_words == "news20k":
+            kwargs["stop_words"] = list(ENGLISH_STOP_WORDS | self.NEWS20K_EXTRA_STOP_WORDS)
         else:
             kwargs["stop_words"] = self.stop_words
         if self.vocabulary_size:

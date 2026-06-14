@@ -268,6 +268,11 @@ def main() -> None:
         action="store_true",
         help="Use distinctiveness-weighted display words instead of raw emission words.",
     )
+    parser.add_argument(
+        "--stop-words",
+        default="news20k",
+        help='Stop-word set: "news20k", "english", "wikipedia", or "none".',
+    )
     parser.add_argument("--out", default="news20k_topics.csv", help="Topic info CSV output path.")
     args = parser.parse_args()
 
@@ -298,7 +303,7 @@ def main() -> None:
         embedding_batch_size=64,
         min_df=args.min_df,
         max_df=args.max_df,
-        stop_words="english",
+        stop_words=(None if args.stop_words.lower() == "none" else args.stop_words),
         theta_mode="dense",
         max_seq_length=512,
         use_ctfidf=args.use_ctfidf,
