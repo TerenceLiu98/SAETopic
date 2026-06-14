@@ -212,12 +212,14 @@ class CorpusAdapter:
         init_pi: float = 0.3,
         learning_rate: float = 1e-2,
         device: str = "auto",
+        use_sparse_activation: bool = False,
     ):
         self.vocab_size = vocab_size
         self.n_features = n_features
         self.idf_weighting = idf_weighting
         self.init_pi = init_pi
         self.learning_rate = learning_rate
+        self.use_sparse_activation = use_sparse_activation
 
         # Resolve device
         if device == "auto":
@@ -267,6 +269,24 @@ class CorpusAdapter:
         idf = np.log(n_docs / doc_freq)
         idf = idf / idf.max()  # Normalize to [0, 1]
         return torch.from_numpy(idf).float().to(self.device)
+
+    def _compute_theta(self, sae, emb: torch.Tensor) -> torch.Tensor:
+        """SAE feature activations used as the BoW-emission mixture θ.
+
+        By default (``use_sparse_activation=False``) uses ``sae.encode()`` —
+        the dense ReLU pre-activations — which is SAE-TM's θ for word-emission
+        training. Set ``use_sparse_activation=True`` to instead use the true
+        top-k sparse activation (via ``activate``), giving sharper per-atom
+        mixtures at the cost of diverging from SAE-TM.
+
+        ``emb`` is expected to already be on the right device/dtype.
+        """
+        if self.use_sparse_activation and hasattr(sae, "activate"):
+            h = sae.encode(emb)
+            theta, _ = sae.activate(h)
+        else:
+            theta = sae.encode(emb)
+        return theta.float()
 
     def fit(
         self,
@@ -367,9 +387,9 @@ class CorpusAdapter:
 
                 # Compute SAE activations (no grad)
                 with torch.no_grad():
-                    theta = sae.encode(
-                        emb_batch.to(self.device, dtype=sae_dtype)
-                    ).float()
+                    theta = self._compute_theta(
+                        sae, emb_batch.to(self.device, dtype=sae_dtype)
+                    )
 
                 # Normalize theta (row-wise)
                 row_sums = theta.sum(dim=1, keepdim=True).clamp_min(1e-8)
@@ -533,9 +553,9 @@ class CorpusAdapter:
         sae_dtype = torch.float32 if self.device.type == "cpu" else torch.bfloat16
         with torch.no_grad():
             sae = sae.to(self.device, dtype=sae_dtype).eval()
-            activations = sae.encode(
-                embeddings.to(self.device, dtype=sae_dtype)
-            ).float()
+            activations = self._compute_theta(
+                sae, embeddings.to(self.device, dtype=sae_dtype)
+            )
 
         return self.transform(activations.cpu().numpy())
 

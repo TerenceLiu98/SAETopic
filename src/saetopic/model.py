@@ -1,50 +1,100 @@
 """
 Main SAETopicModel class with the planned topic inference API.
 
-The public methods are present as API stubs while pretrained loading and
-end-to-end topic inference are still under development.
+The pipeline chains the pretrained SAE topic atoms into end-to-end topic
+modeling::
+
+    docs
+      -> EmbeddingBackend          (embeddings_)
+      -> extract_activations(SAE)  (feature_activations_)
+      -> CorpusVectorizer          (vocab_, bow)
+      -> CorpusAdapter             (feature_word_matrix_)
+      -> TopicMerger               (topic_word_matrix_, document_topic_matrix_)
+      -> topics / probs
+
+``retopic`` re-runs only the TopicMerger step, reusing the SAE activations and
+the corpus-specific feature-word matrix.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+import numpy as np
+
 if TYPE_CHECKING:
-    import numpy as np
     import pandas as pd
 
 
 class SAETopicModel:
     """
-    SAETopic: planned topic inference with SAE topic atoms.
-
-    The current class captures the intended public API. Methods such as
-    `from_pretrained`, `fit_transform`, and `retopic` are not implemented yet.
+    SAETopic: topic modeling with SAE topic atoms.
 
     Parameters
     ----------
     embedding_model : str or callable, default="jinaai/jina-embeddings-v5-text-small"
-        Model to use for embedding documents. Can be:
-        - A Hugging Face model ID (for SentenceTransformers/Jina)
-        - A callable that takes a list of strings and returns embeddings
+        Model to use for embedding documents. A Hugging Face model id, an
+        object with ``encode``, or a callable mapping ``list[str]`` to
+        ``(n_docs, dim)`` arrays.
     embedding_task : str, default="clustering"
         Task type for Jina embeddings (e.g., "clustering", "retrieval")
     sae_model : str, default="saetopic/jina-v5-sae-small"
-        Pretrained SAE checkpoint ID from Hugging Face Hub
+        Pretrained SAE checkpoint: a Hugging Face id or a local checkpoint
+        directory. May also be an already-instantiated SAE module.
     n_topics : int, default=50
         Initial number of topics to generate
     top_k_features : int, default=32
-        Number of top-k features to activate in SAE
+        Number of top-k features (informational; read from the SAE checkpoint
+        at load time)
     min_topic_size : int or None, default=None
-        Minimum number of documents per topic
+        Minimum number of documents per topic (reserved for post-processing)
     vectorizer_model : Any, default=None
-        Custom vectorizer for bag-of-words construction
+        Custom fitted vectorizer exposing ``fit``/``transform``/``vocab_``.
+        If None, a :class:`CorpusVectorizer` is built from the parameters below.
     idf_weighting : bool, default=True
         Whether to use IDF weighting in corpus adaptation
     device : str, default="auto"
         Device for computation ("auto", "cpu", "cuda", "mps")
     random_state : int, default=42
         Random seed for reproducibility
+    corpus_adapter_epochs : int, default=50
+        Number of epochs for the CorpusAdapter (feature->word) optimization
+    corpus_adapter_batch_size : int, default=1024
+        Batch size for CorpusAdapter training
+    activation_batch_size : int, default=512
+        Batch size for SAE activation extraction
+    embedding_batch_size : int, default=64
+        Batch size for the embedding backend
+    cluster_method : str, default="kmeans"
+        Topic-merging clustering method ("kmeans", "agglomerative")
+    sparsity_threshold : float, default=0.9
+        Tau threshold for sparsifying the feature-word matrix before clustering
+    vocabulary_size : int or None, default=None
+        Maximum vocabulary size (None = unlimited)
+    min_df : int, default=2
+        Minimum document frequency for vocabulary terms
+    max_df : float, default=0.95
+        Maximum document frequency (ratio) for vocabulary terms
+    stop_words : str or None, default="english"
+        Stop-word list for the vectorizer: "english", "wikipedia" (English +
+        Wikipedia date/biography boilerplate + common names), None, or a list.
+    theta_mode : str, default="dense"
+        How SAE feature activations (θ) are obtained:
+        - "dense": ``sae.encode()`` dense ReLU (SAE-TM faithful, default).
+        - "sparse_topk": true top-k sparse activation (sharper atoms).
+        Applies to both word-emission training and the document-topic matrix.
+    max_seq_length : int or None, default=512
+        Max input sequence length for the embedder. Set to match the SAE's
+        training chunk size so inference embeddings stay in-distribution.
+    use_ctfidf : bool, default=True
+        Use c-TF-IDF (BERTopic-style) topic-word scoring for ``get_topic`` /
+        ``get_topic_info``, so topic words are ranked by distinctiveness across
+        topics rather than raw emission probability. Down-weights corpus-common
+        words (e.g. "events", "born", month names).
+    drop_empty_topics : bool, default=True
+        Drop clusters to which no document is assigned (count == 0) and
+        renumber the remaining topics, so the output never shows empty topics.
     """
 
     def __init__(
@@ -59,6 +109,20 @@ class SAETopicModel:
         idf_weighting: bool = True,
         device: str = "auto",
         random_state: int = 42,
+        corpus_adapter_epochs: int = 50,
+        corpus_adapter_batch_size: int = 1024,
+        activation_batch_size: int = 512,
+        embedding_batch_size: int = 64,
+        cluster_method: str = "kmeans",
+        sparsity_threshold: float = 0.9,
+        vocabulary_size: int | None = None,
+        min_df: int = 2,
+        max_df: float = 0.95,
+        max_seq_length: int | None = 512,
+        use_ctfidf: bool = True,
+        drop_empty_topics: bool = True,
+        stop_words: str | None = "english",
+        theta_mode: str = "dense",
     ):
         self.embedding_model = embedding_model
         self.embedding_task = embedding_task
@@ -70,8 +134,33 @@ class SAETopicModel:
         self.idf_weighting = idf_weighting
         self.device = device
         self.random_state = random_state
+        self.corpus_adapter_epochs = corpus_adapter_epochs
+        self.corpus_adapter_batch_size = corpus_adapter_batch_size
+        self.activation_batch_size = activation_batch_size
+        self.embedding_batch_size = embedding_batch_size
+        self.cluster_method = cluster_method
+        self.sparsity_threshold = sparsity_threshold
+        self.vocabulary_size = vocabulary_size
+        self.min_df = min_df
+        self.max_df = max_df
+        self.max_seq_length = max_seq_length
+        self.use_ctfidf = use_ctfidf
+        self.drop_empty_topics = drop_empty_topics
+        self.stop_words = stop_words
+        self.theta_mode = theta_mode
+
+        # Pipeline components (set during fit)
+        self.sae_: Any = None
+        self.sae_input_dim_: int | None = None
+        self.sae_n_features_: int | None = None
+        self.vectorizer_: Any = None
+        self.adapter_: Any = None
+        self.merger_: Any = None
+        self.representation_: Any = None
+        self._embedding_backend_: Any = None
 
         # Internal attributes (set during fit)
+        self.docs_: list[str] | None = None
         self.embeddings_: np.ndarray | None = None
         self.feature_activations_: np.ndarray | None = None
         self.feature_word_matrix_: np.ndarray | None = None
@@ -79,29 +168,119 @@ class SAETopicModel:
         self.topic_word_matrix_: np.ndarray | None = None
         self.document_topic_matrix_: np.ndarray | None = None
         self.topic_embeddings_: np.ndarray | None = None
+        self.word_embeddings_: np.ndarray | None = None
         self.vocab_: list[str] | None = None
         self.idf_: np.ndarray | None = None
+        self.topics_: list[int] | None = None
+        self.bow_: Any = None
+        self.ctfidf_: np.ndarray | None = None
 
+    # ------------------------------------------------------------------
+    # Construction / loading helpers
+    # ------------------------------------------------------------------
     @classmethod
     def from_pretrained(cls, model_id: str, **kwargs) -> "SAETopicModel":
         """
-        Load a pretrained SAETopic model from Hugging Face Hub.
+        Load a pretrained SAETopic model from a local path or Hugging Face Hub.
+
+        This resolves and loads the SAE checkpoint. Document embedding and
+        topic inference happen lazily when ``fit`` / ``fit_transform`` is
+        called.
 
         Parameters
         ----------
         model_id : str
-            Hugging Face model ID (e.g., "saetopic/jina-v5-sae-small")
+            Hugging Face model id (e.g., "saetopic/jina-v5-sae-small") or a
+            local checkpoint directory.
         **kwargs
-            Additional arguments to override default config
+            Additional arguments forwarded to the constructor.
 
         Returns
         -------
         SAETopicModel
-            Initialized model with pretrained SAE checkpoint
+            Initialized model with the pretrained SAE checkpoint loaded
         """
-        # TODO: Implement checkpoint loading from HF Hub
-        raise NotImplementedError("from_pretrained is not implemented yet")
+        init_keys = {
+            "embedding_model",
+            "embedding_task",
+            "n_topics",
+            "top_k_features",
+            "min_topic_size",
+            "vectorizer_model",
+            "idf_weighting",
+            "device",
+            "random_state",
+            "corpus_adapter_epochs",
+            "corpus_adapter_batch_size",
+            "activation_batch_size",
+            "embedding_batch_size",
+            "cluster_method",
+            "sparsity_threshold",
+            "vocabulary_size",
+            "min_df",
+            "max_df",
+            "max_seq_length",
+            "use_ctfidf",
+            "drop_empty_topics",
+            "stop_words",
+            "theta_mode",
+        }
+        init_kwargs = {k: v for k, v in kwargs.items() if k in init_keys}
+        instance = cls(sae_model=model_id, **init_kwargs)
+        instance._ensure_sae()
+        return instance
 
+    def _ensure_sae(self) -> None:
+        """Load the SAE (if not already loaded) and record its dimensions."""
+        if self.sae_ is not None:
+            return
+
+        if isinstance(self.sae_model, (str, Path)):
+            from saetopic.sae.loaders import SAECheckpoint
+
+            checkpoint = SAECheckpoint.from_pretrained(self.sae_model)
+            self.sae_ = checkpoint.get_model()
+            self.sae_input_dim_ = checkpoint.embedding_dim
+            self.sae_n_features_ = checkpoint.n_features
+            self.top_k_features = checkpoint.top_k
+        elif hasattr(self.sae_model, "encode"):
+            self.sae_ = self.sae_model
+            self.sae_input_dim_ = getattr(self.sae_, "input_dim", None)
+            self.sae_n_features_ = getattr(self.sae_, "n_features", None)
+            self.top_k_features = getattr(self.sae_, "top_k", self.top_k_features)
+        else:
+            raise TypeError(
+                "sae_model must be a path/repo id or an SAE module with .encode"
+            )
+
+    def _get_embedding_backend(self):
+        # Cache a single backend: remote-code models (e.g. Jina v5) can fail
+        # when SentenceTransformer is instantiated a second time in-process, so
+        # we build it once and reuse it for both documents and vocabulary.
+        if self._embedding_backend_ is not None:
+            return self._embedding_backend_
+
+        from saetopic.embeddings import EmbeddingBackend
+
+        self._embedding_backend_ = EmbeddingBackend(
+            model=self.embedding_model,
+            task=self.embedding_task,
+            device=self.device,
+            batch_size=self.embedding_batch_size,
+            truncate_dim=self.sae_input_dim_,
+            normalize=True,
+            max_seq_length=self.max_seq_length,
+        )
+        return self._embedding_backend_
+
+    def _compute_word_embeddings(self, vocab: list[str]) -> np.ndarray:
+        """Embed the vocabulary words with the document embedding model."""
+        backend = self._get_embedding_backend()
+        return backend.embed(list(vocab))
+
+    # ------------------------------------------------------------------
+    # Fitting
+    # ------------------------------------------------------------------
     def fit(
         self,
         docs: list[str],
@@ -119,7 +298,7 @@ class SAETopicModel:
         embeddings : np.ndarray or None, default=None
             Pre-computed document embeddings (optional)
         y : np.ndarray or None, default=None
-            Optional labels for supervised topic modeling
+            Reserved for supervised topic modeling (ignored)
         n_topics : int or None, default=None
             Number of topics (overrides self.n_topics if provided)
 
@@ -128,8 +307,168 @@ class SAETopicModel:
         SAETopicModel
             Fitted model instance
         """
-        # TODO: Implement full fit pipeline
-        raise NotImplementedError("fit is not implemented yet")
+        del y
+        if n_topics is not None:
+            self.n_topics = n_topics
+
+        self.docs_ = list(docs)
+        if not self.docs_:
+            raise ValueError("docs must be a non-empty list of strings")
+
+        # 1. Load SAE
+        self._ensure_sae()
+
+        # 2. Embed documents
+        if embeddings is None:
+            backend = self._get_embedding_backend()
+            self.embeddings_ = backend.embed(self.docs_)
+        else:
+            self.embeddings_ = np.asarray(embeddings, dtype=np.float32)
+
+        if self.embeddings_.shape[1] != self.sae_input_dim_:
+            raise ValueError(
+                f"Embedding dim {self.embeddings_.shape[1]} does not match SAE "
+                f"input_dim {self.sae_input_dim_}. Re-train the SAE or pass "
+                "embeddings with the matching dimension."
+            )
+
+        # 3. Extract SAE feature activations (topic atoms)
+        from saetopic.sae.activations import extract_activations
+
+        self.feature_activations_ = extract_activations(
+            self.embeddings_,
+            self.sae_,
+            batch_size=self.activation_batch_size,
+            device=self.device,
+            sparse=(self.theta_mode == "sparse_topk"),
+        )
+
+        # 4. Build corpus vocabulary and bag-of-words
+        self.vectorizer_ = self.vectorizer_model or self._build_vectorizer()
+        if getattr(self.vectorizer_, "vocab_", None) is None:
+            self.vectorizer_.fit(self.docs_)
+        self.vocab_ = list(self.vectorizer_.vocab_)
+        bow = self.vectorizer_.transform(self.docs_)
+        self.bow_ = bow
+
+        if len(self.vocab_) == 0:
+            raise ValueError(
+                "CorpusVectorizer produced an empty vocabulary. Lower min_df or "
+                "provide longer documents."
+            )
+
+        # 5. Adapt SAE features to corpus vocabulary (feature -> word matrix)
+        import torch
+
+        from saetopic.interpretation import CorpusAdapter
+
+        self.adapter_ = CorpusAdapter(
+            vocab_size=len(self.vocab_),
+            n_features=self.sae_n_features_,
+            idf_weighting=self.idf_weighting,
+            device=self.device,
+            use_sparse_activation=(self.theta_mode == "sparse_topk"),
+        )
+        self.adapter_.fit(
+            embeddings=torch.from_numpy(self.embeddings_),
+            bow=bow,
+            sae=self.sae_,
+            n_epochs=self.corpus_adapter_epochs,
+            batch_size=self.corpus_adapter_batch_size,
+        )
+        self.feature_word_matrix_ = self.adapter_.feature_word_matrix_
+        self.idf_ = self.adapter_.idf_
+
+        # 6. Word embeddings for meaningful feature clustering (computed once)
+        self.word_embeddings_ = self._compute_word_embeddings(self.vocab_)
+
+        # 7. Merge topic atoms into final topics
+        self._fit_topics(self.n_topics)
+        return self
+
+    def _build_vectorizer(self):
+        from saetopic.vectorizers import CorpusVectorizer
+
+        return CorpusVectorizer(
+            vocabulary_size=self.vocabulary_size,
+            min_df=self.min_df,
+            max_df=self.max_df,
+            idf_weighting=self.idf_weighting,
+            stop_words=self.stop_words,
+        )
+
+    def _fit_topics(self, n_topics: int) -> None:
+        """Run the topic-merging step (reusable by fit and retopic)."""
+        from saetopic.merging import TopicMerger
+        from saetopic.representation import TopicRepresentation, compute_ctfidf
+
+        feature_weights = np.asarray(self.feature_activations_.mean(axis=0)).ravel()
+
+        self.merger_ = TopicMerger(
+            n_topics=n_topics,
+            method=self.cluster_method,
+            random_state=self.random_state,
+            sparsity_threshold=self.sparsity_threshold,
+            word_embeddings=self.word_embeddings_,
+        )
+        self.merger_.fit(self.feature_word_matrix_, feature_weights, self.vocab_)
+
+        self.topic_word_matrix_ = self.merger_.topic_word_matrix_
+        self.topic_atom_clusters_ = self.merger_.feature_clusters_
+        self.document_topic_matrix_ = self.merger_.transform(self.feature_activations_)
+        self.n_topics = self.merger_.n_topics
+
+        # c-TF-IDF topic-word scores (distinctiveness-weighted) for display
+        if self.use_ctfidf and self.bow_ is not None:
+            self.ctfidf_ = compute_ctfidf(self.document_topic_matrix_, self.bow_)
+        else:
+            self.ctfidf_ = None
+
+        # Drop clusters to which no document is assigned (count == 0)
+        if self.drop_empty_topics:
+            self._drop_empty_topics()
+
+        self.topics_ = self.document_topic_matrix_.argmax(axis=1).tolist()
+
+        # Topic embeddings as document-weighted centroids (for find_topics)
+        if self.embeddings_ is not None and self.document_topic_matrix_ is not None:
+            dtm = self.document_topic_matrix_.astype(np.float32)
+            col_sums = dtm.sum(axis=0, keepdims=True)
+            col_sums[col_sums == 0] = 1.0
+            self.topic_embeddings_ = (dtm.T @ self.embeddings_) / col_sums.T
+
+        # Representation: prefer c-TF-IDF for readable topic words
+        display_matrix = self.ctfidf_ if self.ctfidf_ is not None else self.topic_word_matrix_
+        self.representation_ = TopicRepresentation(
+            display_matrix, self.vocab_, self.document_topic_matrix_
+        )
+
+    def _drop_empty_topics(self) -> None:
+        """Remove topics with zero assigned documents and renumber the rest."""
+        dtm = np.asarray(self.document_topic_matrix_)
+        if dtm.ndim != 2 or dtm.shape[1] == 0:
+            return
+        hard = dtm.argmax(axis=1)
+        counts = np.bincount(hard, minlength=dtm.shape[1])
+        keep = np.where(counts > 0)[0]
+        if len(keep) == dtm.shape[1]:
+            return  # nothing empty
+
+        # Slice topic matrices
+        self.topic_word_matrix_ = np.asarray(self.topic_word_matrix_)[keep]
+        if self.ctfidf_ is not None:
+            self.ctfidf_ = np.asarray(self.ctfidf_)[keep]
+        # Slice + renormalize document-topic columns
+        dtm = dtm[:, keep]
+        row_sums = dtm.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1.0
+        self.document_topic_matrix_ = dtm / row_sums
+        # Renumber feature cluster assignments
+        remap = np.full(counts.shape[0], -1, dtype=int)
+        remap[keep] = np.arange(len(keep))
+        clusters = np.asarray(self.topic_atom_clusters_)
+        self.topic_atom_clusters_ = remap[clusters]
+        self.n_topics = int(len(keep))
 
     def fit_transform(
         self,
@@ -148,7 +487,7 @@ class SAETopicModel:
         embeddings : np.ndarray or None, default=None
             Pre-computed document embeddings (optional)
         y : np.ndarray or None, default=None
-            Optional labels for supervised topic modeling
+            Reserved for supervised topic modeling (ignored)
         n_topics : int or None, default=None
             Number of topics (overrides self.n_topics if provided)
 
@@ -156,11 +495,11 @@ class SAETopicModel:
         -------
         topics : list of int
             Topic assignment for each document
-        probs : np.ndarray or None
-            Topic probabilities for each document
+        probs : np.ndarray
+            Topic probabilities for each document (n_docs x n_topics)
         """
-        # TODO: Implement full fit_transform pipeline
-        raise NotImplementedError("fit_transform is not implemented yet")
+        self.fit(docs, embeddings=embeddings, y=y, n_topics=n_topics)
+        return self.topics_, self.document_topic_matrix_
 
     def transform(
         self,
@@ -181,71 +520,86 @@ class SAETopicModel:
         -------
         topics : list of int
             Topic assignment for each document
-        probs : np.ndarray or None
+        probs : np.ndarray
             Topic probabilities for each document
         """
-        # TODO: Implement transform
-        raise NotImplementedError("transform is not implemented yet")
+        if self.merger_ is None or self.sae_ is None:
+            raise RuntimeError("Model must be fitted before transform")
+
+        self._ensure_sae()
+
+        if embeddings is None:
+            backend = self._get_embedding_backend()
+            embs = backend.embed(list(docs))
+        else:
+            embs = np.asarray(embeddings, dtype=np.float32)
+
+        from saetopic.sae.activations import extract_activations
+
+        activations = extract_activations(
+            embs,
+            self.sae_,
+            batch_size=self.activation_batch_size,
+            device=self.device,
+            sparse=(self.theta_mode == "sparse_topk"),
+        )
+        probs = self.merger_.transform(activations)
+        topics = probs.argmax(axis=1).tolist()
+        return topics, probs
 
     def retopic(
         self,
         n_topics: int,
-        method: str = "kmeans",
+        method: str | None = None,
     ) -> "SAETopicModel":
         """
-        Change topic granularity without retraining SAE or corpus adaptation.
+        Change topic granularity without retraining the SAE or corpus adaptation.
 
-        This is the key differentiator: only re-runs the clustering step,
-        reusing existing feature_activations_ and feature_word_matrix_.
+        Only re-runs the clustering step, reusing ``feature_activations_`` and
+        ``feature_word_matrix_`` (plus the cached word embeddings).
 
         Parameters
         ----------
         n_topics : int
             New number of topics
-        method : str, default="kmeans"
-            Clustering method ("kmeans", "agglomerative", "hdbscan")
+        method : str or None, default=None
+            Clustering method ("kmeans", "agglomerative"). None keeps current.
 
         Returns
         -------
         SAETopicModel
             Self with updated topics
         """
-        # TODO: Implement retopic
-        raise NotImplementedError("retopic is not implemented yet")
+        if self.feature_word_matrix_ is None or self.feature_activations_ is None:
+            raise RuntimeError("Model must be fitted before retopic")
+        if method is not None:
+            self.cluster_method = method
+        self._fit_topics(n_topics)
+        return self
 
     def reduce_topics(
         self,
         docs: list[str] | None = None,
         nr_topics: int = 30,
     ) -> "SAETopicModel":
-        """
-        Alias for retopic().
-
-        Parameters
-        ----------
-        docs : list of str or None, default=None
-            Documents (for compatibility, not used in SAETopic)
-        nr_topics : int, default=30
-            Target number of topics
-
-        Returns
-        -------
-        SAETopicModel
-            Self with updated topics
-        """
+        """BERTopic-compatible alias for :meth:`retopic`."""
+        del docs
         return self.retopic(n_topics=nr_topics)
 
-    def get_topic_info(self) -> pd.DataFrame:
+    # ------------------------------------------------------------------
+    # Topic / document inspection
+    # ------------------------------------------------------------------
+    def get_topic_info(self) -> "pd.DataFrame":
         """
         Get information about each topic.
 
         Returns
         -------
         pd.DataFrame
-            DataFrame with topic_id, count, name, and top words
+            DataFrame with Topic, Count, Name, and Top_Words
         """
-        # TODO: Implement get_topic_info
-        raise NotImplementedError("get_topic_info is not implemented yet")
+        self._require_fitted()
+        return self.representation_.get_topic_info()
 
     def get_topic(
         self,
@@ -267,8 +621,8 @@ class SAETopicModel:
         list of (str, float)
             Top words with their scores
         """
-        # TODO: Implement get_topic
-        raise NotImplementedError("get_topic is not implemented yet")
+        self._require_fitted()
+        return self.representation_.get_topic_words(topic_id, top_n=top_n)
 
     def get_topics(self) -> dict[int, list[tuple[str, float]]]:
         """
@@ -279,13 +633,13 @@ class SAETopicModel:
         dict
             Mapping from topic_id to list of (word, score) tuples
         """
-        # TODO: Implement get_topics
-        raise NotImplementedError("get_topics is not implemented yet")
+        self._require_fitted()
+        return {t: self.get_topic(t) for t in range(self.n_topics)}
 
     def get_document_info(
         self,
         docs: list[str] | None = None,
-    ) -> pd.DataFrame:
+    ) -> "pd.DataFrame":
         """
         Get information about each document.
 
@@ -297,10 +651,22 @@ class SAETopicModel:
         Returns
         -------
         pd.DataFrame
-            DataFrame with document_id, topic, probability, and representative words
+            DataFrame with Document, Topic, and top topic probability
         """
-        # TODO: Implement get_document_info
-        raise NotImplementedError("get_document_info is not implemented yet")
+        import pandas as pd
+
+        self._require_fitted()
+        docs = docs if docs is not None else self.docs_
+        dtm = np.asarray(self.document_topic_matrix_)
+        top_topic = dtm.argmax(axis=1)
+        top_prob = dtm.max(axis=1)
+        return pd.DataFrame(
+            {
+                "Document": docs,
+                "Topic": top_topic.tolist(),
+                "Probability": top_prob.tolist(),
+            }
+        )
 
     def get_representative_docs(
         self,
@@ -308,22 +674,27 @@ class SAETopicModel:
         n: int = 5,
     ) -> list[str]:
         """
-        Get representative documents for a topic.
+        Get representative documents for a topic (highest topic probability).
 
         Parameters
         ----------
         topic_id : int or None, default=None
-            Topic identifier (None returns for all topics)
+            Topic identifier (None returns representatives for topic 0)
         n : int, default=5
-            Number of representative documents per topic
+            Number of representative documents
 
         Returns
         -------
         list of str
             Representative document texts
         """
-        # TODO: Implement get_representative_docs
-        raise NotImplementedError("get_representative_docs is not implemented yet")
+        self._require_fitted()
+        if self.docs_ is None:
+            raise RuntimeError("No fitted documents available")
+        topic_id = 0 if topic_id is None else topic_id
+        probs = np.asarray(self.document_topic_matrix_)[:, topic_id]
+        top_idx = np.argsort(probs)[-n:][::-1]
+        return [self.docs_[i] for i in top_idx]
 
     def find_topics(
         self,
@@ -343,164 +714,63 @@ class SAETopicModel:
         Returns
         -------
         list of (int, float)
-            Topic IDs with similarity scores
+            Topic IDs with cosine similarity scores
         """
-        # TODO: Implement find_topics
-        raise NotImplementedError("find_topics is not implemented yet")
+        self._require_fitted()
+        backend = self._get_embedding_backend()
+        query_emb = backend.embed([query])[0]
+        topic_emb = np.asarray(self.topic_embeddings_)
+        # cosine similarity
+        q = query_emb / (np.linalg.norm(query_emb) + 1e-12)
+        t = topic_emb / (np.linalg.norm(topic_emb, axis=1, keepdims=True) + 1e-12)
+        sims = t @ q
+        top_idx = np.argsort(sims)[-top_n:][::-1]
+        return [(int(i), float(sims[i])) for i in top_idx]
 
     def generate_topic_labels(
         self,
         method: str = "words",
         llm: Any = None,
     ) -> dict[int, str]:
-        """
-        Generate human-readable topic labels.
-
-        Parameters
-        ----------
-        method : str, default="words"
-            Labeling method ("words", "llm")
-        llm : Any, default=None
-            LLM for label generation (if method="llm")
-
-        Returns
-        -------
-        dict
-            Mapping from topic_id to label string
-        """
-        # TODO: Implement generate_topic_labels
-        raise NotImplementedError("generate_topic_labels is not implemented yet")
+        """Generate human-readable topic labels and store them on the model."""
+        self._require_fitted()
+        labels = self.representation_.generate_topic_labels(method=method, llm=llm)
+        self.representation_.topic_labels_ = labels
+        return labels
 
     def set_topic_labels(self, labels: dict[int, str]) -> None:
-        """
-        Set custom labels for topics.
+        """Set custom labels for topics."""
+        self._require_fitted()
+        self.representation_.topic_labels_ = dict(labels)
 
-        Parameters
-        ----------
-        labels : dict
-            Mapping from topic_id to label string
-        """
-        # TODO: Implement set_topic_labels
-        raise NotImplementedError("set_topic_labels is not implemented yet")
+    def _require_fitted(self) -> None:
+        if self.representation_ is None:
+            raise RuntimeError("Model must be fitted before this operation")
 
+    # ------------------------------------------------------------------
+    # Not yet implemented (Week 4 / Week 5 scope)
+    # ------------------------------------------------------------------
     def visualize_topics(self):
-        """
-        Visualize topics in 2D space.
-
-        Returns
-        -------
-        plotly.graph_objects.Figure
-            Interactive 2D visualization
-        """
-        # TODO: Implement visualize_topics
         raise NotImplementedError("visualize_topics is not implemented yet")
 
-    def visualize_documents(
-        self,
-        docs: list[str] | None = None,
-    ):
-        """
-        Visualize documents in 2D space colored by topic.
-
-        Parameters
-        ----------
-        docs : list of str or None, default=None
-            Documents to visualize
-
-        Returns
-        -------
-        plotly.graph_objects.Figure
-            Interactive 2D visualization
-        """
-        # TODO: Implement visualize_documents
+    def visualize_documents(self, docs: list[str] | None = None):
         raise NotImplementedError("visualize_documents is not implemented yet")
 
     def visualize_hierarchy(self):
-        """
-        Visualize topic merge hierarchy.
-
-        Returns
-        -------
-        plotly.graph_objects.Figure
-            Interactive hierarchical visualization
-        """
-        # TODO: Implement visualize_hierarchy
         raise NotImplementedError("visualize_hierarchy is not implemented yet")
 
-    def visualize_atoms(
-        self,
-        topic_id: int,
-    ):
-        """
-        Visualize SAE topic atoms within a merged topic.
-
-        This is an advanced visualization showing the internal structure.
-
-        Parameters
-        ----------
-        topic_id : int
-            Topic identifier
-
-        Returns
-        -------
-        plotly.graph_objects.Figure
-            Interactive atom-level visualization
-        """
-        # TODO: Implement visualize_atoms
+    def visualize_atoms(self, topic_id: int):
         raise NotImplementedError("visualize_atoms is not implemented yet")
 
     def evaluate(
         self,
         metrics: tuple[str, ...] = ("diversity", "coherence", "stability"),
     ) -> dict[str, float]:
-        """
-        Evaluate topic model quality.
-
-        Parameters
-        ----------
-        metrics : tuple of str, default=("diversity", "coherence", "stability")
-            Metrics to compute
-
-        Returns
-        -------
-        dict
-            Mapping from metric name to score
-        """
-        # TODO: Implement evaluate
         raise NotImplementedError("evaluate is not implemented yet")
 
-    def save(
-        self,
-        path: str,
-        serialization: str = "safetensors",
-    ) -> None:
-        """
-        Save fitted model to disk.
-
-        Parameters
-        ----------
-        path : str
-            Path to save directory
-        serialization : str, default="safetensors"
-            Serialization format ("safetensors", "pickle")
-        """
-        # TODO: Implement save
+    def save(self, path: str, serialization: str = "safetensors") -> None:
         raise NotImplementedError("save is not implemented yet")
 
     @classmethod
     def load(cls, path: str) -> "SAETopicModel":
-        """
-        Load a fitted model from disk.
-
-        Parameters
-        ----------
-        path : str
-            Path to saved model directory
-
-        Returns
-        -------
-        SAETopicModel
-            Loaded model instance
-        """
-        # TODO: Implement load
         raise NotImplementedError("load is not implemented yet")

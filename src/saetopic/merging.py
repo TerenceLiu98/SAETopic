@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 def sparsify_and_renormalize(
     input_tensor: npt.ArrayLike,
     tau: float = 0.9,
+    chunk_size: int = 2048,
 ) -> np.ndarray:
     """
     Transform a matrix by keeping top-n entries per row and renormalizing.
@@ -40,10 +41,8 @@ def sparsify_and_renormalize(
     Returns:
         Transformed K x V array with sparse, renormalized rows
     """
-    if isinstance(input_tensor, np.ndarray):
-        arr = torch.from_numpy(input_tensor).float()
-    else:
-        arr = input_tensor
+    was_numpy = isinstance(input_tensor, np.ndarray)
+    arr = torch.from_numpy(input_tensor).float() if was_numpy else input_tensor
 
     if arr.dim() != 2:
         raise ValueError(f"Input must be 2D, got {arr.dim()}D")
@@ -51,33 +50,30 @@ def sparsify_and_renormalize(
     K, V = arr.shape
     device = arr.device
 
-    # Sort values in descending order
-    sorted_values, sorted_indices = torch.sort(arr, dim=-1, descending=True)
+    # Process in row-chunks so peak memory is bounded by chunk_size x V,
+    # not K x V (a full torch.sort allocates a same-sized int64 index array).
+    result = torch.zeros_like(arr)
+    for start in range(0, K, chunk_size):
+        end = min(start + chunk_size, K)
+        k = end - start
+        block = arr[start:end]
 
-    # Cumulative sum
-    cumulative_sums = torch.cumsum(sorted_values, dim=-1)
+        sorted_values, sorted_indices = torch.sort(block, dim=-1, descending=True)
+        cumulative_sums = torch.cumsum(sorted_values, dim=-1)
+        n_elements = torch.argmax((cumulative_sums > tau).int(), dim=-1) + 1
+        never_exceeds = (cumulative_sums > tau).sum(dim=-1) == 0
+        n_elements[never_exceeds] = V
 
-    # Find minimum n where cumulative sum exceeds tau
-    n_elements = torch.argmax((cumulative_sums > tau).int(), dim=-1) + 1
+        arange = torch.arange(V, device=device).expand(k, -1)
+        mask_sorted = arange < n_elements.unsqueeze(-1)
+        final_mask = torch.zeros_like(block, dtype=torch.bool)
+        final_mask.scatter_(dim=1, index=sorted_indices, src=mask_sorted)
 
-    # Handle rows that never exceed tau
-    never_exceeds = (cumulative_sums > tau).sum(dim=-1) == 0
-    n_elements[never_exceeds] = V
+        block_result = block * final_mask
+        row_sums = block_result.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        result[start:end] = block_result / row_sums
 
-    # Create mask for top-n elements
-    arange = torch.arange(V, device=device).expand(K, -1)
-    mask_sorted = arange < n_elements.unsqueeze(-1)
-
-    # Un-sort mask
-    final_mask = torch.zeros_like(arr, dtype=torch.bool)
-    final_mask.scatter_(dim=1, index=sorted_indices, src=mask_sorted)
-
-    # Apply mask and renormalize
-    result = arr * final_mask
-    row_sums = result.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-    result = result / row_sums
-
-    return result.numpy()
+    return result.numpy() if was_numpy else result
 
 
 def get_word_embeddings(
@@ -163,6 +159,11 @@ class TopicMerger:
         Pretrained word embedding model for semantic clustering
     embedding_dim : int, default=300
         Dimension for random word embeddings if model not specified
+    word_embeddings : np.ndarray or None, default=None
+        Precomputed word embeddings for the vocabulary (vocab_size x dim). When
+        provided, these are used directly instead of loading ``embedding_model``
+        (or falling back to random embeddings), giving meaningful semantic
+        clustering. Recommended: reuse the document embedding model.
     """
 
     def __init__(
@@ -173,6 +174,7 @@ class TopicMerger:
         sparsity_threshold: float = 0.9,
         embedding_model: str | None = None,
         embedding_dim: int = 300,
+        word_embeddings: np.ndarray | None = None,
     ):
         self.n_topics = n_topics
         self.method = method
@@ -180,6 +182,7 @@ class TopicMerger:
         self.sparsity_threshold = sparsity_threshold
         self.embedding_model = embedding_model
         self.embedding_dim = embedding_dim
+        self.word_embeddings = word_embeddings
 
         # Cluster results
         self.feature_clusters_: np.ndarray | None = None  # K, cluster assignment per feature
@@ -208,21 +211,37 @@ class TopicMerger:
             f"Computing feature embeddings with sparsity threshold={self.sparsity_threshold}"
         )
 
-        # Sparsify and renormalize B
-        B_sparse = sparsify_and_renormalize(
-            feature_word_matrix,
-            tau=self.sparsity_threshold,
-        )
+        # Get word embeddings first (precomputed, model, or random fallback)
+        if self.word_embeddings is not None:
+            word_embeddings = np.asarray(self.word_embeddings, dtype=np.float32)
+            if word_embeddings.shape[0] != len(vocab):
+                raise ValueError(
+                    "word_embeddings has "
+                    f"{word_embeddings.shape[0]} rows but vocab has {len(vocab)} "
+                    "entries"
+                )
+            logger.info(
+                "Using precomputed word embeddings: shape=%s", word_embeddings.shape
+            )
+        else:
+            word_embeddings = get_word_embeddings(
+                vocab=vocab,
+                embedding_model=self.embedding_model,
+                embedding_dim=self.embedding_dim,
+            )
 
-        # Get word embeddings
-        word_embeddings = get_word_embeddings(
-            vocab=vocab,
-            embedding_model=self.embedding_model,
-            embedding_dim=self.embedding_dim,
-        )
-
-        # Compute feature embeddings as weighted sum of word embeddings
-        feature_embeddings = B_sparse @ word_embeddings
+        # Fused sparsify + matmul in feature-row chunks: avoids materializing
+        # the full sparsified B (K x V) alongside the input feature_word_matrix.
+        K = feature_word_matrix.shape[0]
+        dim = word_embeddings.shape[1]
+        feature_embeddings = np.zeros((K, dim), dtype=np.float32)
+        chunk = 2048
+        for start in range(0, K, chunk):
+            end = min(start + chunk, K)
+            block_sparse = sparsify_and_renormalize(
+                feature_word_matrix[start:end], tau=self.sparsity_threshold
+            )
+            feature_embeddings[start:end] = block_sparse @ word_embeddings
 
         logger.info(f"Feature embeddings shape: {feature_embeddings.shape}")
 
@@ -392,8 +411,14 @@ class TopicMerger:
             )
             self.n_topics = len(valid_indices)
 
-        feature_word_valid = feature_word_matrix[valid_indices]
-        feature_weights_valid = feature_weights[valid_indices]
+        # Avoid a full-matrix copy when all features are valid (the dense-θ case),
+        # which would double resident memory (e.g. ~1.2 GB for 24k x 12k).
+        if valid_mask.all():
+            feature_word_valid = feature_word_matrix
+            feature_weights_valid = feature_weights
+        else:
+            feature_word_valid = feature_word_matrix[valid_indices]
+            feature_weights_valid = feature_weights[valid_indices]
 
         # Step 1: Compute feature embeddings
         feature_embeddings = self._compute_feature_embeddings(
