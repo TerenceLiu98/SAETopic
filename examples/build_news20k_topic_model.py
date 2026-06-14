@@ -223,6 +223,12 @@ def main() -> None:
         help="Retopic target after fitting. Use 0 to skip retopic.",
     )
     parser.add_argument("--epochs", type=int, default=30, help="CorpusAdapter epochs.")
+    parser.add_argument(
+        "--vocabulary-size",
+        type=int,
+        default=5000,
+        help="Maximum downstream vocabulary size. Use 0 for unlimited.",
+    )
     parser.add_argument("--min-df", type=int, default=5, help="Vectorizer min document frequency.")
     parser.add_argument(
         "--max-df",
@@ -264,6 +270,24 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument(
+        "--corpus-adapter-batch-size",
+        type=int,
+        default=512,
+        help="Batch size for feature-to-word adaptation.",
+    )
+    parser.add_argument(
+        "--activation-batch-size",
+        type=int,
+        default=256,
+        help="Batch size for SAE activation extraction.",
+    )
+    parser.add_argument(
+        "--embedding-batch-size",
+        type=int,
+        default=64,
+        help="Batch size for document and vocabulary embedding.",
+    )
+    parser.add_argument(
         "--use-ctfidf",
         action="store_true",
         help="Use distinctiveness-weighted display words instead of raw emission words.",
@@ -277,6 +301,7 @@ def main() -> None:
     args = parser.parse_args()
 
     n_docs = None if args.n_docs == 0 else args.n_docs
+    vocabulary_size = None if args.vocabulary_size == 0 else args.vocabulary_size
     print("Loading news-20k downstream corpus...")
     docs, labels, target_names = load_news20k(
         n_docs=n_docs,
@@ -298,9 +323,10 @@ def main() -> None:
         args.ckpt,
         n_topics=args.n_topics,
         corpus_adapter_epochs=args.epochs,
-        corpus_adapter_batch_size=1024,
-        activation_batch_size=512,
-        embedding_batch_size=64,
+        corpus_adapter_batch_size=args.corpus_adapter_batch_size,
+        activation_batch_size=args.activation_batch_size,
+        embedding_batch_size=args.embedding_batch_size,
+        vocabulary_size=vocabulary_size,
         min_df=args.min_df,
         max_df=args.max_df,
         stop_words=(None if args.stop_words.lower() == "none" else args.stop_words),
