@@ -181,6 +181,17 @@ def test_get_topics_returns_all():
     assert set(all_topics.keys()) == set(range(5))
 
 
+def test_get_topics_respects_top_n():
+    """get_topics forwards top_n to each topic."""
+    model = _make_model(n_topics=5)
+    model.fit(_docs())
+
+    all_topics = model.get_topics(top_n=3)
+
+    assert set(all_topics.keys()) == set(range(5))
+    assert all(len(words) == 3 for words in all_topics.values())
+
+
 def test_unfitted_raises():
     """Inspection methods raise before fit."""
     model = _make_model()

@@ -69,9 +69,9 @@ def _print_top_words(model, top_n: int) -> None:
         print(f"  Topic {topic_id:02d}: {words}")
 
 
-def _get_topic_words(model) -> dict[int, list[tuple[str, float]]]:
+def _get_topic_words(model, top_n: int = 20) -> dict[int, list[tuple[str, float]]]:
     return {
-        topic_id: model.get_topic(topic_id)
+        topic_id: model.get_topic(topic_id)[:top_n]
         for topic_id in sorted(topic for topic in model.get_topics() if topic != -1)
     }
 
@@ -238,7 +238,7 @@ def main() -> None:
         if args.top_words_out
         else Path(args.out).with_name("top_words.txt")
     )
-    write_top_words_file(_get_topic_words(model), top_words_out, top_n=20)
+    write_top_words_file(_get_topic_words(model, top_n=20), top_words_out, top_n=20)
     print(f"Wrote {top_words_out}")
 
     _print_top_words(model, top_n=10)

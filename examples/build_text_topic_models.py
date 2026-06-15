@@ -200,9 +200,14 @@ def save_topic_outputs(
     elapsed: float,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
+    topic_words = model.get_topics(top_n=20)
     info = model.get_topic_info()
+    info["Top_Words_20"] = [
+        ", ".join(word for word, _ in topic_words[topic_id])
+        for topic_id in info["Topic"]
+    ]
     info.to_csv(output_dir / "topic_info.csv", index=False)
-    write_top_words_file(model.get_topics(), output_dir / "top_words.txt", top_n=20)
+    write_top_words_file(topic_words, output_dir / "top_words.txt", top_n=20)
 
     summary: dict[str, Any] = {
         "n_docs": len(docs),

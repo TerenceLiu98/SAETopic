@@ -639,9 +639,14 @@ class SAETopicModel:
         self._require_fitted()
         return self.representation_.get_topic_words(topic_id, top_n=top_n)
 
-    def get_topics(self) -> dict[int, list[tuple[str, float]]]:
+    def get_topics(self, top_n: int = 10) -> dict[int, list[tuple[str, float]]]:
         """
         Get top words for all topics.
+
+        Parameters
+        ----------
+        top_n : int, default=10
+            Number of top words per topic
 
         Returns
         -------
@@ -649,7 +654,7 @@ class SAETopicModel:
             Mapping from topic_id to list of (word, score) tuples
         """
         self._require_fitted()
-        return {t: self.get_topic(t) for t in range(self.n_topics)}
+        return {t: self.get_topic(t, top_n=top_n) for t in range(self.n_topics)}
 
     def get_document_info(
         self,

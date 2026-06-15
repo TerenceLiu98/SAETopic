@@ -120,6 +120,16 @@ def main() -> None:
         for path in top_words_files:
             print(f"Evaluating {path}")
             topic_words = load_top_words_file(path, top_n=args.top_n)
+            short_topics = [
+                topic_id
+                for topic_id, words in topic_words.items()
+                if len(words) < args.top_n
+            ]
+            if short_topics:
+                print(
+                    f"  warning: {len(short_topics)} topics have fewer than "
+                    f"{args.top_n} words; metrics will use the available words."
+                )
             result = {
                 "path": str(path),
                 "metrics": {
