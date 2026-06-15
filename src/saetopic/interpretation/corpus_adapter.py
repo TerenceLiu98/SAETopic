@@ -373,35 +373,42 @@ class CorpusAdapter:
             drop_last=False,
         )
 
-        for epoch in range(1, n_epochs + 1):
-            epoch_loss = 0.0
-            total_tokens = 0
-            empty_batches = 0
-            batches = 0
+        total_steps = n_epochs * len(loader)
+        progress = (
+            Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(show_speed=True),
+                TimeRemainingColumn(),
+                TextColumn("• epoch: {task.fields[epoch]}"),
+                TextColumn("• loss: {task.fields[loss]}"),
+            )
+            if verbose
+            else None
+        )
 
-            progress_context = (
-                Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    BarColumn(),
-                    TaskProgressColumn(show_speed=True),
-                    TimeRemainingColumn(),
-                    TextColumn("• loss: {task.fields[loss]}"),
+        progress_cm = progress if progress is not None else nullcontext(None)
+        with progress_cm as active_progress:
+            task_id = (
+                active_progress.add_task(
+                    "[cyan]Fitting CorpusAdapter",
+                    total=total_steps,
+                    epoch=f"0/{n_epochs}",
+                    loss="0.0000",
                 )
-                if verbose
-                else nullcontext(None)
+                if active_progress is not None
+                else None
             )
 
-            with progress_context as progress:
-                task_id = (
-                    progress.add_task(
-                        f"[cyan]Epoch {epoch}/{n_epochs}",
-                        total=len(loader),
-                        loss="0.0000",
-                    )
-                    if progress is not None
-                    else None
-                )
+            for epoch in range(1, n_epochs + 1):
+                epoch_loss = 0.0
+                total_tokens = 0
+                empty_batches = 0
+                batches = 0
+
+                if active_progress is not None and task_id is not None:
+                    active_progress.update(task_id, epoch=f"{epoch}/{n_epochs}")
 
                 for emb_batch, bow_batch in loader:
                     batches += 1
@@ -413,8 +420,8 @@ class CorpusAdapter:
 
                     if not active_vocab_mask.any():
                         empty_batches += 1
-                        if progress is not None and task_id is not None:
-                            progress.update(task_id, advance=1)
+                        if active_progress is not None and task_id is not None:
+                            active_progress.update(task_id, advance=1)
                         continue
 
                     # Subset to active vocabulary
@@ -438,8 +445,8 @@ class CorpusAdapter:
                     active_feature_mask = theta_normalized.sum(dim=0) != 0
                     if not active_feature_mask.any():
                         empty_batches += 1
-                        if progress is not None and task_id is not None:
-                            progress.update(task_id, advance=1)
+                        if active_progress is not None and task_id is not None:
+                            active_progress.update(task_id, advance=1)
                         continue
 
                     # Forward pass with active vocabulary mask
@@ -460,20 +467,20 @@ class CorpusAdapter:
                     epoch_loss += loss.item()
                     total_tokens += bow_subset.sum().item()
 
-                    if progress is not None and task_id is not None:
-                        progress.update(
+                    if active_progress is not None and task_id is not None:
+                        active_progress.update(
                             task_id,
                             advance=1,
                             loss=f"{epoch_loss / max(1, batches):.4f}",
                         )
 
-            avg_loss = epoch_loss / max(total_tokens, 1.0)
-            perplexity = np.exp(avg_loss)
+                avg_loss = epoch_loss / max(total_tokens, 1.0)
+                perplexity = np.exp(avg_loss)
 
-            logger.info(
-                f"Epoch {epoch}: nll/token={avg_loss:.4f}, ppl={perplexity:.3f}, "
-                f"tokens={int(total_tokens):,}, empty_batches={empty_batches}"
-            )
+                logger.info(
+                    f"Epoch {epoch}: nll/token={avg_loss:.4f}, ppl={perplexity:.3f}, "
+                    f"tokens={int(total_tokens):,}, empty_batches={empty_batches}"
+                )
 
         # Extract learned parameters
         self._save_learned_parameters()
