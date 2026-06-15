@@ -21,6 +21,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import time
 from pathlib import Path
@@ -229,7 +230,7 @@ def save_topic_outputs(
         json.dump(summary, f, indent=2, sort_keys=True)
 
 
-def run_dataset(dataset_key: str, args: argparse.Namespace) -> None:
+def run_dataset(dataset_key: str, args: argparse.Namespace, model: SAETopicModel) -> None:
     n_docs = None if args.n_docs == 0 else args.n_docs
     print(f"\n=== Dataset: {dataset_key} ===")
     docs, labels, target_names = load_text_dataset(
@@ -242,10 +243,9 @@ def run_dataset(dataset_key: str, args: argparse.Namespace) -> None:
     print(f"  docs={len(docs):,} | labels={'yes' if labels is not None else 'no'}")
 
     topic_counts = list(dict.fromkeys(args.n_topics))
-    model = build_model(args, n_topics=topic_counts[0])
 
     t0 = time.time()
-    topics, probs = model.fit_transform(docs)
+    topics, probs = model.fit_transform(docs, n_topics=topic_counts[0])
     del topics, probs
     elapsed = time.time() - t0
     output_dir = Path(args.out_dir) / dataset_key / f"topics_{model.n_topics}"
@@ -259,6 +259,8 @@ def run_dataset(dataset_key: str, args: argparse.Namespace) -> None:
         output_dir = Path(args.out_dir) / dataset_key / f"topics_{n_topics}"
         save_topic_outputs(model, docs, labels, output_dir, elapsed)
         print(f"  wrote {output_dir}")
+
+    gc.collect()
 
 
 def main() -> None:
@@ -320,8 +322,15 @@ def main() -> None:
     if args.hf_dataset and len([d for d in args.datasets if d != "news20k"]) > 1:
         raise ValueError("--hf-dataset override is only safe when running one non-news20k dataset")
 
+    topic_counts = list(dict.fromkeys(args.n_topics))
+    model = build_model(args, n_topics=topic_counts[0])
+    print(
+        "Loaded SAE-TM once for all datasets "
+        f"(input_dim={model.sae_input_dim_}, n_features={model.sae_n_features_})"
+    )
+
     for dataset_key in args.datasets:
-        run_dataset(dataset_key, args)
+        run_dataset(dataset_key, args, model)
 
 
 if __name__ == "__main__":
