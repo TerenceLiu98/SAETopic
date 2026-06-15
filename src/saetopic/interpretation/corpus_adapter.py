@@ -8,15 +8,23 @@ topic atoms to a user's corpus vocabulary, following the SAE-TM framework.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Literal
+from contextlib import nullcontext
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 from scipy.sparse import csr_matrix, vstack
-from torch.utils.data import Dataset, DataLoader
-from tqdm.auto import tqdm
+from torch.utils.data import DataLoader, Dataset
 
 if TYPE_CHECKING:
     import torch
@@ -46,7 +54,7 @@ def sparsify_and_renormalize(
     if input_tensor.dim() != 2:
         raise ValueError(f"Input must be 2D, got {input_tensor.dim()}D")
 
-    K, V = input_tensor.shape
+    k_size, vocab_size = input_tensor.shape
     device = input_tensor.device
 
     # Sort values in descending order along each row
@@ -60,10 +68,10 @@ def sparsify_and_renormalize(
 
     # Handle rows that never exceed tau (keep all elements)
     never_exceeds_tau = (cumulative_sums > tau).sum(dim=-1) == 0
-    n_elements[never_exceeds_tau] = V
+    n_elements[never_exceeds_tau] = vocab_size
 
     # Create mask for top-n elements in sorted positions
-    arange_tensor = torch.arange(V, device=device).expand(K, -1)
+    arange_tensor = torch.arange(vocab_size, device=device).expand(k_size, -1)
     mask_sorted = arange_tensor < n_elements.unsqueeze(-1)
 
     # Un-sort mask to match original tensor structure
@@ -86,7 +94,7 @@ class TopicWordModel(nn.Module):
     - pi: Mixture weight between topic and background
 
     Forward pass computes:
-        p(word|theta) = (1-pi) * softmax(theta @ softmax(B)) + pi * softmax(bg)
+        p(word|theta) = (1-pi) * theta @ softmax(B) + pi * softmax(bg)
 
     Supports subset computation for efficient training with sparse BoW.
     """
@@ -131,8 +139,8 @@ class TopicWordModel(nn.Module):
         """
         if active_vocab_mask is None:
             # Full vocabulary computation
-            B_probs = torch.softmax(self.B_logits, dim=1)
-            topic_words = theta @ B_probs
+            b_probs = torch.softmax(self.B_logits, dim=1)
+            topic_words = theta @ b_probs
             bg_probs = torch.softmax(self.bg_logits, dim=0)
         else:
             # Subset computation for efficiency
@@ -140,10 +148,10 @@ class TopicWordModel(nn.Module):
             log_denoms = torch.logsumexp(self.B_logits, dim=1, keepdim=True)  # K x 1
 
             # Subset active columns
-            B_logits_subset = self.B_logits[:, active_vocab_mask]  # K x V_active
-            B_probs_subset = (B_logits_subset - log_denoms).exp()  # K x V_active
+            b_logits_subset = self.B_logits[:, active_vocab_mask]  # K x V_active
+            b_probs_subset = (b_logits_subset - log_denoms).exp()  # K x V_active
 
-            topic_words = theta @ B_probs_subset  # B x V_active
+            topic_words = theta @ b_probs_subset  # B x V_active
 
             # Background subset
             bg_log_denom = torch.logsumexp(self.bg_logits, dim=0)
@@ -356,60 +364,89 @@ class CorpusAdapter:
             drop_last=False,
         )
 
-        # Training loop
-        disable_pbar = not verbose
         for epoch in range(1, n_epochs + 1):
             epoch_loss = 0.0
             total_tokens = 0
             empty_batches = 0
+            batches = 0
 
-            pbar = tqdm(loader, desc=f"Epoch {epoch}/{n_epochs}", disable=disable_pbar)
+            progress_context = (
+                Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(show_speed=True),
+                    TimeRemainingColumn(),
+                    TextColumn("• loss: {task.fields[loss]}"),
+                )
+                if verbose
+                else nullcontext(None)
+            )
 
-            for emb_batch, bow_batch in pbar:
-                optimizer.zero_grad(set_to_none=True)
-
-                # Get sparse columns that have non-zero entries in this batch
-                bow_col_sums = np.asarray(bow_batch.sum(axis=0)).flatten()
-                active_vocab_mask = bow_col_sums > 0
-
-                if not active_vocab_mask.any():
-                    empty_batches += 1
-                    continue
-
-                # Subset to active vocabulary
-                bow_subset = bow_batch[:, active_vocab_mask].toarray()
-                bow_subset = torch.from_numpy(bow_subset).float().to(self.device)
-
-                # Apply IDF weighting if enabled
-                if self.idf_weighting and self.idf_ is not None:
-                    idf_subset = self.idf_[active_vocab_mask]
-                    bow_subset = bow_subset * idf_subset.unsqueeze(0)
-
-                # Compute SAE activations (no grad)
-                with torch.no_grad():
-                    theta = self._compute_theta(
-                        sae, emb_batch.to(self.device, dtype=sae_dtype)
+            with progress_context as progress:
+                task_id = (
+                    progress.add_task(
+                        f"[cyan]Epoch {epoch}/{n_epochs}",
+                        total=len(loader),
+                        loss="0.0000",
                     )
+                    if progress is not None
+                    else None
+                )
 
-                # Normalize theta (row-wise)
-                row_sums = theta.sum(dim=1, keepdim=True).clamp_min(1e-8)
-                theta_normalized = theta / row_sums
+                for emb_batch, bow_batch in loader:
+                    batches += 1
+                    optimizer.zero_grad(set_to_none=True)
 
-                # Forward pass with active vocabulary mask
-                active_mask_tensor = torch.from_numpy(active_vocab_mask).to(self.device)
-                predicted = self._model(theta_normalized, active_vocab_mask=active_mask_tensor)
-                predicted = predicted.clamp(min=1e-8)
+                    # Get sparse columns that have non-zero entries in this batch
+                    bow_col_sums = np.asarray(bow_batch.sum(axis=0)).flatten()
+                    active_vocab_mask = bow_col_sums > 0
 
-                # Loss: negative log likelihood
-                loss = (bow_subset * -predicted.log()).sum()
+                    if not active_vocab_mask.any():
+                        empty_batches += 1
+                        if progress is not None and task_id is not None:
+                            progress.update(task_id, advance=1)
+                        continue
 
-                loss.backward()
-                optimizer.step()
+                    # Subset to active vocabulary
+                    bow_subset = bow_batch[:, active_vocab_mask].toarray()
+                    bow_subset = torch.from_numpy(bow_subset).float().to(self.device)
 
-                epoch_loss += loss.item()
-                total_tokens += bow_subset.sum().item()
+                    # Apply IDF weighting if enabled
+                    if self.idf_weighting and self.idf_ is not None:
+                        idf_subset = self.idf_[active_vocab_mask]
+                        bow_subset = bow_subset * idf_subset.unsqueeze(0)
 
-                pbar.set_postfix({"loss": f"{epoch_loss / max(1, (pbar.n + 1)):.4f}"})
+                    # Compute SAE activations (no grad)
+                    with torch.no_grad():
+                        theta = self._compute_theta(
+                            sae, emb_batch.to(self.device, dtype=sae_dtype)
+                        )
+
+                    # Normalize theta (row-wise)
+                    row_sums = theta.sum(dim=1, keepdim=True).clamp_min(1e-8)
+                    theta_normalized = theta / row_sums
+
+                    # Forward pass with active vocabulary mask
+                    active_mask_tensor = torch.from_numpy(active_vocab_mask).to(self.device)
+                    predicted = self._model(theta_normalized, active_vocab_mask=active_mask_tensor)
+                    predicted = predicted.clamp(min=1e-8)
+
+                    # Loss: negative log likelihood
+                    loss = (bow_subset * -predicted.log()).sum()
+
+                    loss.backward()
+                    optimizer.step()
+
+                    epoch_loss += loss.item()
+                    total_tokens += bow_subset.sum().item()
+
+                    if progress is not None and task_id is not None:
+                        progress.update(
+                            task_id,
+                            advance=1,
+                            loss=f"{epoch_loss / max(1, batches):.4f}",
+                        )
 
             avg_loss = epoch_loss / max(total_tokens, 1.0)
             perplexity = np.exp(avg_loss)
@@ -436,8 +473,8 @@ class CorpusAdapter:
             self._model.cpu()
 
             # Feature-to-word matrix (softmax of logits)
-            B = torch.softmax(self._model.B_logits, dim=1)
-            self.feature_word_matrix_ = B.numpy()
+            b_matrix = torch.softmax(self._model.B_logits, dim=1)
+            self.feature_word_matrix_ = b_matrix.numpy()
 
             # Background distribution
             bg = torch.softmax(self._model.bg_logits, dim=0)
@@ -488,7 +525,7 @@ class CorpusAdapter:
                 return predicted.numpy()
             else:
                 # Use pre-computed matrix
-                B = torch.from_numpy(self.feature_word_matrix_)
+                b_matrix = torch.from_numpy(self.feature_word_matrix_)
                 bg = torch.from_numpy(self.background_distribution_)
                 pi = self.pi_
 
@@ -498,7 +535,7 @@ class CorpusAdapter:
                 theta_normalized = theta / row_sums
 
                 # Compute predictions
-                topic_words = theta_normalized @ B
+                topic_words = theta_normalized @ b_matrix
                 bg_probs = bg.unsqueeze(0)
                 predicted = (1 - pi) * topic_words + pi * bg_probs
 
