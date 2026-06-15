@@ -23,6 +23,14 @@ from collections import Counter, defaultdict
 from typing import Any
 
 import numpy as np
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from sklearn.datasets import fetch_20newsgroups
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
@@ -212,6 +220,38 @@ def _pick_column(dataset: Any, preferred: tuple[str, ...], required: bool = True
     return None
 
 
+def encode_documents_with_progress(
+    model: SAETopicModel,
+    docs: list[str],
+    batch_size: int,
+) -> np.ndarray:
+    """Encode downstream documents with a rich progress bar."""
+    backend = model._get_embedding_backend()
+    chunks: list[np.ndarray] = []
+
+    progress = Progress(
+        TextColumn("[cyan]Encoding documents..."),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        TextColumn("elapsed •"),
+        TimeRemainingColumn(),
+        TextColumn("remaining"),
+    )
+    with progress:
+        task = progress.add_task("encode", total=len(docs))
+        for start in range(0, len(docs), batch_size):
+            batch_docs = docs[start : start + batch_size]
+            batch_embeddings = backend.embed(batch_docs)
+            chunks.append(batch_embeddings)
+            progress.update(task, advance=len(batch_docs))
+
+    if not chunks:
+        return np.zeros((0, 0), dtype=np.float32)
+    return np.vstack(chunks).astype(np.float32, copy=False)
+
+
 def print_cluster_label_summary(
     topics: list[int],
     labels: np.ndarray,
@@ -380,7 +420,14 @@ def main() -> None:
     )
 
     t0 = time.time()
-    topics, probs = model.fit_transform(docs)
+    embeddings = encode_documents_with_progress(
+        model=model,
+        docs=docs,
+        batch_size=args.embedding_batch_size,
+    )
+    print(f"  document embeddings={embeddings.shape}")
+
+    topics, probs = model.fit_transform(docs, embeddings=embeddings)
     print(f"  fit_transform in {time.time() - t0:.1f}s")
     print(
         f"  embeddings={model.embeddings_.shape} | "
