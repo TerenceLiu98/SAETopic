@@ -43,9 +43,12 @@ class SAETMDocumentProcessor:
     def _ensure_nltk_data(self) -> None:
         required_resources = [
             ("tokenizers/punkt", "punkt"),
+            ("tokenizers/punkt_tab", "punkt_tab"),
             ("corpora/stopwords", "stopwords"),
             ("corpora/wordnet", "wordnet"),
+            ("corpora/omw-1.4", "omw-1.4"),
             ("taggers/averaged_perceptron_tagger", "averaged_perceptron_tagger"),
+            ("taggers/averaged_perceptron_tagger_eng", "averaged_perceptron_tagger_eng"),
         ]
         for resource, package in required_resources:
             try:
@@ -54,22 +57,32 @@ class SAETMDocumentProcessor:
             except LookupError:
                 pass
 
-            if not self.nltk.download(package, quiet=True):
+            try:
+                downloaded = self.nltk.download(package, quiet=True)
+            except Exception as exc:
                 raise RuntimeError(
-                    f"Missing NLTK resource {resource!r}. Download it once with "
-                    f"`python -m nltk.downloader {package}` or use stop_words='english'."
+                    f"Missing NLTK resource {resource!r}, and automatic download "
+                    f"failed. Download NLTK data once with "
+                    f"`python -m nltk.downloader {' '.join(pkg for _, pkg in required_resources)}` "
+                    "or use `--stop-words english` / `--stop-words none`."
+                ) from exc
+            if not downloaded:
+                raise RuntimeError(
+                    f"Missing NLTK resource {resource!r}. Download NLTK data once with "
+                    f"`python -m nltk.downloader {' '.join(pkg for _, pkg in required_resources)}` "
+                    "or use `--stop-words english` / `--stop-words none`."
                 )
 
         optional_packages = [
-            ("tokenizers/punkt_tab", "punkt_tab"),
-            ("corpora/omw-1.4", "omw-1.4"),
-            ("taggers/averaged_perceptron_tagger_eng", "averaged_perceptron_tagger_eng"),
         ]
         for resource, package in optional_packages:
             try:
                 self.nltk.data.find(resource)
             except LookupError:
-                self.nltk.download(package, quiet=True)
+                try:
+                    self.nltk.download(package, quiet=True)
+                except Exception:
+                    pass
 
     def _get_pos(self, tag: str) -> str:
         tag_char = tag[0].upper()
