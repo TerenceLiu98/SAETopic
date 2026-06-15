@@ -39,6 +39,10 @@ class SAETopicModel:
         ``(n_docs, dim)`` arrays.
     embedding_task : str, default="clustering"
         Task type for Jina embeddings (e.g., "clustering", "retrieval")
+    merge_embedding_model : str or None, default=None
+        Optional gensim word embedding model used for feature-to-topic merging.
+        Set to ``"word2vec-google-news-300"`` to match SAE-TM's merge script.
+        If None, vocabulary words are embedded with ``embedding_model``.
     sae_model : str, default="saetopic/jina-v5-sae-small"
         Pretrained SAE checkpoint: a Hugging Face id or a local checkpoint
         directory. May also be an already-instantiated SAE module.
@@ -75,7 +79,7 @@ class SAETopicModel:
         Maximum vocabulary size (None = unlimited)
     min_df : int, default=2
         Minimum document frequency for vocabulary terms
-    max_df : float, default=0.95
+    max_df : float, default=1.0
         Maximum document frequency (ratio) for vocabulary terms
     stop_words : str or None, default="english"
         Stop-word/preprocessing mode for the vectorizer: "english", "saetm",
@@ -105,6 +109,7 @@ class SAETopicModel:
         self,
         embedding_model: str | Callable = "jinaai/jina-embeddings-v5-text-small",
         embedding_task: str = "clustering",
+        merge_embedding_model: str | None = None,
         sae_model: str = "saetopic/jina-v5-sae-small",
         n_topics: int = 50,
         top_k_features: int = 32,
@@ -121,7 +126,7 @@ class SAETopicModel:
         sparsity_threshold: float = 0.9,
         vocabulary_size: int | None = None,
         min_df: int = 2,
-        max_df: float = 0.95,
+        max_df: float = 1.0,
         max_seq_length: int | None = 512,
         use_ctfidf: bool = False,
         drop_empty_topics: bool = False,
@@ -130,6 +135,7 @@ class SAETopicModel:
     ):
         self.embedding_model = embedding_model
         self.embedding_task = embedding_task
+        self.merge_embedding_model = merge_embedding_model
         self.sae_model = sae_model
         self.n_topics = n_topics
         self.top_k_features = top_k_features
@@ -167,6 +173,7 @@ class SAETopicModel:
         self.docs_: list[str] | None = None
         self.embeddings_: np.ndarray | None = None
         self.feature_activations_: np.ndarray | None = None
+        self.theta_avg_: np.ndarray | None = None
         self.feature_word_matrix_: np.ndarray | None = None
         self.topic_atom_clusters_: np.ndarray | None = None
         self.topic_word_matrix_: np.ndarray | None = None
@@ -207,6 +214,7 @@ class SAETopicModel:
         init_keys = {
             "embedding_model",
             "embedding_task",
+            "merge_embedding_model",
             "n_topics",
             "top_k_features",
             "min_topic_size",
@@ -372,6 +380,7 @@ class SAETopicModel:
             idf_weighting=self.idf_weighting,
             device=self.device,
             use_sparse_activation=(self.theta_mode == "sparse_topk"),
+            random_state=self.random_state,
         )
         self.adapter_.fit(
             embeddings=torch.from_numpy(self.embeddings_),
@@ -381,10 +390,15 @@ class SAETopicModel:
             batch_size=self.corpus_adapter_batch_size,
         )
         self.feature_word_matrix_ = self.adapter_.feature_word_matrix_
+        self.theta_avg_ = self.adapter_.theta_avg_
         self.idf_ = self.adapter_.idf_
 
         # 6. Word embeddings for meaningful feature clustering (computed once)
-        self.word_embeddings_ = self._compute_word_embeddings(self.vocab_)
+        self.word_embeddings_ = (
+            None
+            if self.merge_embedding_model is not None
+            else self._compute_word_embeddings(self.vocab_)
+        )
 
         # 7. Merge topic atoms into final topics
         self._fit_topics(self.n_topics)
@@ -414,17 +428,22 @@ class SAETopicModel:
             out=np.zeros_like(theta),
             where=row_sums > 0,
         )
-        feature_weights = theta_normalized.mean(axis=0).ravel()
-        feature_weight_sum = feature_weights.sum()
-        if feature_weight_sum > 0:
-            feature_weights = feature_weights / feature_weight_sum
+        if self.theta_avg_ is not None and len(self.theta_avg_) == theta.shape[1]:
+            feature_weights = np.asarray(self.theta_avg_, dtype=np.float32).ravel()
+        else:
+            feature_weights = theta_normalized.mean(axis=0).ravel()
+            feature_weight_sum = feature_weights.sum()
+            if feature_weight_sum > 0:
+                feature_weights = feature_weights / feature_weight_sum
 
         self.merger_ = TopicMerger(
             n_topics=n_topics,
             method=self.cluster_method,
             random_state=self.random_state,
             sparsity_threshold=self.sparsity_threshold,
+            embedding_model=self.merge_embedding_model,
             word_embeddings=self.word_embeddings_,
+            allow_random_word_embeddings=self.merge_embedding_model is None,
         )
         self.merger_.fit(self.feature_word_matrix_, feature_weights, self.vocab_)
 
@@ -655,6 +674,96 @@ class SAETopicModel:
         """
         self._require_fitted()
         return {t: self.get_topic(t, top_n=top_n) for t in range(self.n_topics)}
+
+    def get_cluster_to_feature_indices(self) -> dict[int, list[int]]:
+        """Return SAE-TM-style mapping from merged topic id to SAE feature ids."""
+        self._require_fitted()
+        clusters = np.asarray(self.topic_atom_clusters_)
+        mapping: dict[int, list[int]] = {}
+        for topic_id in range(self.n_topics):
+            mapping[topic_id] = np.where(clusters == topic_id)[0].astype(int).tolist()
+        return mapping
+
+    def get_cluster_info(self) -> "pd.DataFrame":
+        """
+        Return SAE-TM-style cluster metadata.
+
+        Columns mirror the official merge artifact:
+        ``cluster_id``, ``cluster_size``, ``cluster_prob``, ``cluster_words``,
+        and ``cluster_ratio``.
+        """
+        import pandas as pd
+
+        self._require_fitted()
+        if self.merger_ is None or self.merger_.cluster_info_ is None:
+            raise RuntimeError("Cluster information is not available")
+
+        dtm = np.asarray(self.document_topic_matrix_)
+        records = []
+        for info in self.merger_.cluster_info_:
+            cluster_id = int(info["cluster_id"])
+            cluster_ratio = 0.0
+            if dtm.size and cluster_id < dtm.shape[1]:
+                cluster_ratio = float((dtm[:, cluster_id] > 0).mean())
+            records.append(
+                {
+                    "cluster_id": cluster_id,
+                    "cluster_size": int(info["n_features"]),
+                    "cluster_prob": float(info["total_weight"]),
+                    "cluster_words": info["top_words"].replace(" ", ", "),
+                    "cluster_ratio": cluster_ratio,
+                }
+            )
+        return pd.DataFrame(records)
+
+    def get_theta_topic_matrix(
+        self,
+        normalize: bool = False,
+        sparse: bool = True,
+    ):
+        """
+        Return the SAE-TM-style document-topic matrix.
+
+        This aggregates row-normalized SAE feature activations by the learned
+        feature clusters. With ``normalize=False`` and ``sparse=True`` it
+        matches SAE-TM's ``theta_topic_csr.npz`` construction.
+        """
+        self._require_fitted()
+        if self.feature_activations_ is None or self.topic_atom_clusters_ is None:
+            raise RuntimeError("Feature activations and clusters are not available")
+
+        theta = np.asarray(self.feature_activations_, dtype=np.float32)
+        row_sums = theta.sum(axis=1, keepdims=True)
+        theta_normalized = np.divide(
+            theta,
+            np.clip(row_sums, 1e-8, None),
+            out=np.zeros_like(theta),
+            where=row_sums > 0,
+        )
+
+        if not sparse:
+            return self.merger_.transform(theta_normalized, normalize=normalize)
+
+        from scipy import sparse as sp
+
+        clusters = np.asarray(self.topic_atom_clusters_, dtype=np.int32)
+        valid_features = np.where(clusters >= 0)[0].astype(np.int32)
+        mapping_cols = clusters[valid_features]
+        mapping = sp.csr_matrix(
+            (
+                np.ones(len(valid_features), dtype=np.float32),
+                (valid_features, mapping_cols),
+            ),
+            shape=(theta_normalized.shape[1], self.n_topics),
+        )
+        theta_topic = sp.csr_matrix(theta_normalized) @ mapping
+        if normalize:
+            row_sums_sparse = np.asarray(theta_topic.sum(axis=1)).ravel()
+            inv = np.zeros_like(row_sums_sparse, dtype=np.float32)
+            mask = row_sums_sparse > 0
+            inv[mask] = 1.0 / row_sums_sparse[mask]
+            theta_topic = sp.diags(inv) @ theta_topic
+        return theta_topic.tocsr()
 
     def get_document_info(
         self,

@@ -125,7 +125,7 @@ class CorpusVectorizer:
         Maximum vocabulary size (maps to ``max_features``; None = unlimited)
     min_df : int, default=2
         Minimum document frequency for vocabulary terms
-    max_df : float, default=0.95
+    max_df : float, default=1.0
         Maximum document frequency (ratio) for vocabulary terms
     idf_weighting : bool, default=False
         Whether to compute IDF weights (consumed by CorpusAdapter)
@@ -148,7 +148,7 @@ class CorpusVectorizer:
         self,
         vocabulary_size: int | None = None,
         min_df: int = 2,
-        max_df: float = 0.95,
+        max_df: float = 1.0,
         idf_weighting: bool = False,
         stop_words: str | None = "english",
         ngram_range: tuple[int, int] = (1, 1),
@@ -275,7 +275,10 @@ class CorpusVectorizer:
         sparse.csr_matrix
             Bag-of-words matrix (n_docs x vocab_size)
         """
-        self.vectorizer_ = self._build_count_vectorizer()
+        vocabulary = None
+        if self.stop_words == "saetm":
+            vocabulary = self._build_saetm_vocabulary(docs)
+        self.vectorizer_ = self._build_count_vectorizer(vocabulary=vocabulary)
         bow = self.vectorizer_.fit_transform(docs).tocsr()
         self.vocab_ = self.vectorizer_.get_feature_names_out().tolist()
         return bow

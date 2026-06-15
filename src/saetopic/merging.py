@@ -79,6 +79,7 @@ def get_word_embeddings(
     embedding_model: str | None = None,
     embedding_dim: int = 300,
     device: str = "cpu",
+    allow_random_fallback: bool = True,
 ) -> np.ndarray:
     """
     Get word embeddings for vocabulary.
@@ -94,6 +95,9 @@ def get_word_embeddings(
         Dimension of random embeddings if model not specified
     device : str, default="cpu"
         Device for computation
+    allow_random_fallback : bool, default=True
+        If False, raise when ``embedding_model`` cannot be loaded instead of
+        silently using random embeddings.
 
     Returns
     -------
@@ -125,6 +129,10 @@ def get_word_embeddings(
             return np.stack(embeddings)
 
         except Exception as e:
+            if not allow_random_fallback:
+                raise RuntimeError(
+                    f"Failed to load gensim embedding model {embedding_model!r}"
+                ) from e
             logger.warning(f"Failed to load gensim model: {e}. Using random embeddings.")
 
     # Fall back to random embeddings
@@ -162,6 +170,9 @@ class TopicMerger:
         provided, these are used directly instead of loading ``embedding_model``
         (or falling back to random embeddings), giving meaningful semantic
         clustering. Recommended: reuse the document embedding model.
+    allow_random_word_embeddings : bool, default=True
+        Whether to fall back to random word embeddings when ``embedding_model``
+        cannot be loaded. Set False for paper-aligned runs.
     """
 
     def __init__(
@@ -173,6 +184,7 @@ class TopicMerger:
         embedding_model: str | None = None,
         embedding_dim: int = 300,
         word_embeddings: np.ndarray | None = None,
+        allow_random_word_embeddings: bool = True,
     ):
         self.n_topics = n_topics
         self.method = method
@@ -181,6 +193,7 @@ class TopicMerger:
         self.embedding_model = embedding_model
         self.embedding_dim = embedding_dim
         self.word_embeddings = word_embeddings
+        self.allow_random_word_embeddings = allow_random_word_embeddings
 
         # Cluster results
         self.feature_clusters_: np.ndarray | None = None  # K, cluster assignment per feature
@@ -226,6 +239,7 @@ class TopicMerger:
                 vocab=vocab,
                 embedding_model=self.embedding_model,
                 embedding_dim=self.embedding_dim,
+                allow_random_fallback=self.allow_random_word_embeddings,
             )
 
         # Fused sparsify + matmul in feature-row chunks: avoids materializing
@@ -343,7 +357,12 @@ class TopicMerger:
             # Weighted average: theta-weighted sum of word distributions
             # This gives the cluster's topic-word distribution
             weighted_b = cluster_b * cluster_theta[:, np.newaxis]
-            topic_dist = weighted_b.sum(axis=0) / cluster_theta.sum()
+            cluster_weight = cluster_theta.sum()
+            if cluster_weight <= 0:
+                logger.warning(f"Cluster {cluster_id} has non-positive total weight")
+                topic_dist = np.ones(vocab_size, dtype=np.float32) / vocab_size
+            else:
+                topic_dist = weighted_b.sum(axis=0) / cluster_weight
 
             topic_word_matrix[cluster_id] = topic_dist
 
@@ -453,6 +472,7 @@ class TopicMerger:
     def transform(
         self,
         feature_activations: csr_matrix | np.ndarray,
+        normalize: bool = True,
     ) -> np.ndarray:
         """
         Aggregate feature activations to topic probabilities.
@@ -461,6 +481,10 @@ class TopicMerger:
         ----------
         feature_activations : scipy.sparse.csr_matrix or np.ndarray
             Document-feature activations (n_docs x n_features)
+        normalize : bool, default=True
+            Whether to row-normalize the aggregated document-topic matrix.
+            SAE-TM's exported ``theta_topic_csr.npz`` leaves this unnormalized
+            after multiplying normalized theta by the feature-cluster map.
 
         Returns
         -------
@@ -494,6 +518,9 @@ class TopicMerger:
             mask = self.feature_clusters_ == topic_id
             if mask.any():
                 topic_activations[:, topic_id] = feature_activations[:, mask].sum(axis=1)
+
+        if not normalize:
+            return topic_activations
 
         # Normalize to get probabilities
         row_sums = topic_activations.sum(axis=1, keepdims=True)

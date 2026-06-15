@@ -75,6 +75,7 @@ class TestCorpusAdapter:
         assert adapter.vocab_size == 50
         assert adapter.n_features == 128
         assert adapter.idf_weighting is False
+        assert adapter.random_state == 42
         assert not adapter._is_fitted
 
     def test_fit(self, sample_embeddings, sample_bow, dummy_sae):
@@ -97,6 +98,9 @@ class TestCorpusAdapter:
         assert adapter._is_fitted
         assert adapter.feature_word_matrix_ is not None
         assert adapter.feature_word_matrix_.shape == (128, 50)
+        assert adapter.theta_avg_ is not None
+        assert adapter.theta_avg_.shape == (128,)
+        assert np.isclose(adapter.theta_avg_.sum(), 1.0, atol=1e-5)
 
     def test_transform_after_fit(self, sample_embeddings, sample_bow, dummy_sae):
         """Test transform after fitting."""

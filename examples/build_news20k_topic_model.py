@@ -4,7 +4,8 @@ Build downstream topics on news-20k with a trained SAE checkpoint.
 This example uses the 20 Newsgroups corpus as a compact downstream clustering
 benchmark. It does not train an SAE. Instead, it loads an existing SAE
 checkpoint, adapts SAE features to the news vocabulary, merges feature atoms
-into topics, and demonstrates fast retopic.
+into topics, writes SAE-TM-style cluster artifacts, and demonstrates fast
+retopic.
 
 Example:
     python examples/build_news20k_topic_model.py \
@@ -17,9 +18,11 @@ Example:
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import time
 from collections import Counter, defaultdict
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -31,10 +34,12 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
+from scipy.sparse import save_npz
 from sklearn.datasets import fetch_20newsgroups
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 from saetopic import SAETopicModel
+from saetopic.evaluation import write_top_words_file
 
 
 def load_news20k(
@@ -273,6 +278,55 @@ def print_cluster_label_summary(
         print(f"  Topic {topic:02d} ({total:4d} docs): {summary}")
 
 
+def save_saetm_artifacts(
+    model: SAETopicModel,
+    docs: list[str],
+    labels: np.ndarray,
+    topics: list[int],
+    output_dir: Path,
+    elapsed: float,
+    save_theta_topic: bool,
+) -> None:
+    """Write SAE-TM-style cluster artifacts for the fitted model."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    clusters = model.get_cluster_info()
+    clusters.to_csv(output_dir / "clusters.csv", index=False)
+    write_top_words_file(model.get_topics(top_n=50), output_dir / "top_words.txt", top_n=50)
+    with (output_dir / "cluster_to_feature_indices.json").open(
+        "w", encoding="utf-8"
+    ) as f:
+        json.dump(model.get_cluster_to_feature_indices(), f, indent=2, sort_keys=True)
+
+    if save_theta_topic:
+        theta_topic = model.get_theta_topic_matrix(normalize=False, sparse=True)
+        save_npz(output_dir / "theta_topic_csr.npz", theta_topic)
+
+    summary = {
+        "n_docs": len(docs),
+        "n_topics": model.n_topics,
+        "fit_or_retopic_seconds": elapsed,
+        "vocab_size": len(model.vocab_ or []),
+        "embedding_shape": (
+            list(model.embeddings_.shape) if model.embeddings_ is not None else None
+        ),
+        "activation_shape": (
+            list(model.feature_activations_.shape)
+            if model.feature_activations_ is not None
+            else None
+        ),
+        "theta_avg_shape": (
+            list(model.theta_avg_.shape) if model.theta_avg_ is not None else None
+        ),
+        "merge_embedding_model": model.merge_embedding_model,
+        "ARI": adjusted_rand_score(labels, topics),
+        "NMI": normalized_mutual_info_score(labels, topics),
+        "wrote_theta_topic_csr": save_theta_topic,
+    }
+    with (output_dir / "summary.json").open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -304,7 +358,7 @@ def main() -> None:
     parser.add_argument(
         "--max-df",
         type=float,
-        default=0.8,
+        default=1.0,
         help="Vectorizer max document frequency ratio.",
     )
     parser.add_argument(
@@ -369,6 +423,24 @@ def main() -> None:
         help="Use distinctiveness-weighted display words instead of raw emission words.",
     )
     parser.add_argument(
+        "--merge-embedding-model",
+        default="word2vec-google-news-300",
+        help=(
+            "Gensim word embedding model for SAE-TM feature merging. "
+            "Use 'none' to reuse the document embedding backend for vocab words."
+        ),
+    )
+    parser.add_argument(
+        "--artifacts-dir",
+        default=None,
+        help="Directory for clusters.csv/top_words.txt artifacts. Defaults to --out stem.",
+    )
+    parser.add_argument(
+        "--save-theta-topic",
+        action="store_true",
+        help="Write SAE-TM-style theta_topic_csr.npz into the artifacts directory.",
+    )
+    parser.add_argument(
         "--stop-words",
         default="saetm",
         help='Stop-word/preprocessing mode: "saetm", "english", or "none".',
@@ -378,6 +450,9 @@ def main() -> None:
 
     n_docs = None if args.n_docs == 0 else args.n_docs
     vocabulary_size = None if args.vocabulary_size == 0 else args.vocabulary_size
+    merge_embedding_model = (
+        None if args.merge_embedding_model.lower() == "none" else args.merge_embedding_model
+    )
     print("Loading news-20k downstream corpus...")
     docs, labels, target_names = load_news20k(
         n_docs=n_docs,
@@ -399,6 +474,7 @@ def main() -> None:
     model = SAETopicModel.from_pretrained(
         args.ckpt,
         n_topics=args.n_topics,
+        merge_embedding_model=merge_embedding_model,
         corpus_adapter_epochs=args.epochs,
         corpus_adapter_batch_size=args.corpus_adapter_batch_size,
         activation_batch_size=args.activation_batch_size,
@@ -411,6 +487,7 @@ def main() -> None:
         max_seq_length=512,
         use_ctfidf=args.use_ctfidf,
         drop_empty_topics=False,
+        random_state=args.seed,
         device="auto",
     )
     print(
@@ -446,6 +523,22 @@ def main() -> None:
     info.to_csv(args.out, index=False)
     print(f"\nWrote {args.out}")
 
+    artifacts_dir = (
+        Path(args.artifacts_dir)
+        if args.artifacts_dir
+        else Path(args.out).with_suffix("")
+    )
+    save_saetm_artifacts(
+        model,
+        docs,
+        labels,
+        topics,
+        artifacts_dir,
+        elapsed=time.time() - t0,
+        save_theta_topic=args.save_theta_topic,
+    )
+    print(f"Wrote SAE-TM artifacts to {artifacts_dir}")
+
     print("\n=== Top words per topic ===")
     for topic_id in range(model.n_topics):
         words = ", ".join(word for word, _ in model.get_topic(topic_id, top_n=10))
@@ -463,6 +556,17 @@ def main() -> None:
             f"ARI={adjusted_rand_score(labels, retopic_topics):.4f} | "
             f"NMI={normalized_mutual_info_score(labels, retopic_topics):.4f}"
         )
+        retopic_dir = artifacts_dir / f"retopic_{args.retopic}"
+        save_saetm_artifacts(
+            model,
+            docs,
+            labels,
+            retopic_topics,
+            retopic_dir,
+            elapsed=time.time() - t0,
+            save_theta_topic=args.save_theta_topic,
+        )
+        print(f"  wrote SAE-TM artifacts to {retopic_dir}")
         for topic_id in range(model.n_topics):
             words = ", ".join(word for word, _ in model.get_topic(topic_id, top_n=8))
             print(f"  Topic {topic_id:02d}: {words}")

@@ -35,6 +35,7 @@ dependencies = [
     "safetensors",
     "rich",
     "nltk",
+    "gensim>=4.4.0",
 ]
 
 [project.optional-dependencies]

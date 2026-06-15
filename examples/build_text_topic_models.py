@@ -6,8 +6,11 @@ Supported datasets:
 
 For each dataset and topic count, this writes:
     <out-dir>/<dataset>/topics_<n>/topic_info.csv
+    <out-dir>/<dataset>/topics_<n>/clusters.csv
     <out-dir>/<dataset>/topics_<n>/top_words.txt
+    <out-dir>/<dataset>/topics_<n>/cluster_to_feature_indices.json
     <out-dir>/<dataset>/topics_<n>/summary.json
+    <out-dir>/<dataset>/topics_<n>/theta_topic_csr.npz  (with --save-theta-topic)
 
 Example:
     PYTHONPATH=src python examples/build_text_topic_models.py \
@@ -28,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from scipy.sparse import save_npz
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 try:
@@ -174,9 +178,13 @@ def load_text_dataset(
 
 def build_model(args: argparse.Namespace, n_topics: int) -> SAETopicModel:
     vocabulary_size = None if args.vocabulary_size == 0 else args.vocabulary_size
+    merge_embedding_model = (
+        None if args.merge_embedding_model.lower() == "none" else args.merge_embedding_model
+    )
     return SAETopicModel.from_pretrained(
         args.ckpt,
         n_topics=n_topics,
+        merge_embedding_model=merge_embedding_model,
         corpus_adapter_epochs=args.epochs,
         corpus_adapter_batch_size=args.corpus_adapter_batch_size,
         activation_batch_size=args.activation_batch_size,
@@ -189,6 +197,7 @@ def build_model(args: argparse.Namespace, n_topics: int) -> SAETopicModel:
         max_seq_length=args.max_seq_length,
         use_ctfidf=args.use_ctfidf,
         drop_empty_topics=False,
+        random_state=args.seed,
         device=args.device,
     )
 
@@ -199,16 +208,29 @@ def save_topic_outputs(
     labels: np.ndarray | None,
     output_dir: Path,
     elapsed: float,
+    save_theta_topic: bool = False,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     topic_words = model.get_topics(top_n=20)
+    artifact_topic_words = model.get_topics(top_n=50)
     info = model.get_topic_info()
     info["Top_Words_20"] = [
         ", ".join(word for word, _ in topic_words[topic_id])
         for topic_id in info["Topic"]
     ]
     info.to_csv(output_dir / "topic_info.csv", index=False)
-    write_top_words_file(topic_words, output_dir / "top_words.txt", top_n=20)
+    write_top_words_file(artifact_topic_words, output_dir / "top_words.txt", top_n=50)
+
+    clusters = model.get_cluster_info()
+    clusters.to_csv(output_dir / "clusters.csv", index=False)
+    with (output_dir / "cluster_to_feature_indices.json").open(
+        "w", encoding="utf-8"
+    ) as f:
+        json.dump(model.get_cluster_to_feature_indices(), f, indent=2, sort_keys=True)
+
+    if save_theta_topic:
+        theta_topic = model.get_theta_topic_matrix(normalize=False, sparse=True)
+        save_npz(output_dir / "theta_topic_csr.npz", theta_topic)
 
     summary: dict[str, Any] = {
         "n_docs": len(docs),
@@ -221,6 +243,12 @@ def save_topic_outputs(
             if model.feature_activations_ is not None
             else None
         ),
+        "theta_avg_shape": (
+            list(model.theta_avg_.shape) if model.theta_avg_ is not None else None
+        ),
+        "merge_embedding_model": model.merge_embedding_model,
+        "wrote_clusters_csv": True,
+        "wrote_theta_topic_csr": save_theta_topic,
     }
     if labels is not None and model.topics_ is not None and len(labels) == len(model.topics_):
         summary["ARI"] = adjusted_rand_score(labels, model.topics_)
@@ -249,7 +277,14 @@ def run_dataset(dataset_key: str, args: argparse.Namespace, model: SAETopicModel
     del topics, probs
     elapsed = time.time() - t0
     output_dir = Path(args.out_dir) / dataset_key / f"topics_{model.n_topics}"
-    save_topic_outputs(model, docs, labels, output_dir, elapsed)
+    save_topic_outputs(
+        model,
+        docs,
+        labels,
+        output_dir,
+        elapsed,
+        save_theta_topic=args.save_theta_topic,
+    )
     print(f"  wrote {output_dir}")
 
     for n_topics in topic_counts[1:]:
@@ -257,7 +292,14 @@ def run_dataset(dataset_key: str, args: argparse.Namespace, model: SAETopicModel
         model.retopic(n_topics)
         elapsed = time.time() - t0
         output_dir = Path(args.out_dir) / dataset_key / f"topics_{n_topics}"
-        save_topic_outputs(model, docs, labels, output_dir, elapsed)
+        save_topic_outputs(
+            model,
+            docs,
+            labels,
+            output_dir,
+            elapsed,
+            save_theta_topic=args.save_theta_topic,
+        )
         print(f"  wrote {output_dir}")
 
     gc.collect()
@@ -290,11 +332,24 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=30, help="CorpusAdapter epochs.")
     parser.add_argument("--vocabulary-size", type=int, default=5000, help="0 for unlimited.")
     parser.add_argument("--min-df", type=int, default=5)
-    parser.add_argument("--max-df", type=float, default=0.8)
+    parser.add_argument("--max-df", type=float, default=1.0)
     parser.add_argument("--stop-words", default="saetm")
+    parser.add_argument(
+        "--merge-embedding-model",
+        default="word2vec-google-news-300",
+        help=(
+            "Gensim word embedding model for SAE-TM feature merging. "
+            "Use 'none' to reuse the document embedding backend for vocab words."
+        ),
+    )
     parser.add_argument("--theta-mode", default="dense", choices=["dense", "sparse_topk"])
     parser.add_argument("--max-seq-length", type=int, default=512)
     parser.add_argument("--use-ctfidf", action="store_true")
+    parser.add_argument(
+        "--save-theta-topic",
+        action="store_true",
+        help="Write SAE-TM-style theta_topic_csr.npz for each topic granularity.",
+    )
     parser.add_argument("--corpus-adapter-batch-size", type=int, default=512)
     parser.add_argument("--activation-batch-size", type=int, default=256)
     parser.add_argument("--embedding-batch-size", type=int, default=64)

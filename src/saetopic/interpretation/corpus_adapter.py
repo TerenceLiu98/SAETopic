@@ -219,6 +219,8 @@ class CorpusAdapter:
         Learning rate for B matrix optimization
     device : str, default="auto"
         Device for computation ("auto", "cpu", "cuda")
+    random_state : int or None, default=42
+        Random seed for B/p0 initialization and DataLoader shuffling.
     """
 
     def __init__(
@@ -230,6 +232,7 @@ class CorpusAdapter:
         learning_rate: float = 1e-2,
         device: str = "auto",
         use_sparse_activation: bool = False,
+        random_state: int | None = 42,
     ):
         self.vocab_size = vocab_size
         self.n_features = n_features
@@ -237,6 +240,7 @@ class CorpusAdapter:
         self.init_pi = init_pi
         self.learning_rate = learning_rate
         self.use_sparse_activation = use_sparse_activation
+        self.random_state = random_state
 
         # Resolve device
         if device == "auto":
@@ -249,6 +253,7 @@ class CorpusAdapter:
         self.background_distribution_: np.ndarray | None = None
         self.pi_: float | None = None
         self.idf_: np.ndarray | None = None
+        self.theta_avg_: np.ndarray | None = None
 
         # Training state
         self._model: TopicWordModel | None = None
@@ -349,6 +354,11 @@ class CorpusAdapter:
         if self.idf_weighting:
             self.idf_ = self._compute_idf(bow)
 
+        # Match SAE-TM's explicit seeding before B/p0 initialization.
+        if self.random_state is not None:
+            torch.manual_seed(self.random_state)
+            np.random.seed(self.random_state)
+
         # Create model and optimizer
         self._model = TopicWordModel(
             n_features=self.n_features,
@@ -364,6 +374,10 @@ class CorpusAdapter:
 
         # Create dataset and loader
         dataset = SparseBoWDataset(embeddings, bow)
+        generator = None
+        if self.random_state is not None:
+            generator = torch.Generator()
+            generator.manual_seed(self.random_state)
         loader = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -371,6 +385,7 @@ class CorpusAdapter:
             num_workers=num_workers,
             collate_fn=collate_sparse_bow,
             drop_last=False,
+            generator=generator,
         )
 
         total_steps = n_epochs * len(loader)
@@ -389,6 +404,8 @@ class CorpusAdapter:
         )
 
         progress_cm = progress if progress is not None else nullcontext(None)
+        final_theta_sum: torch.Tensor | None = None
+        final_theta_count = 0
         with progress_cm as active_progress:
             task_id = (
                 active_progress.add_task(
@@ -406,6 +423,10 @@ class CorpusAdapter:
                 total_tokens = 0
                 empty_batches = 0
                 batches = 0
+                collect_theta_avg = epoch == n_epochs
+                if collect_theta_avg:
+                    final_theta_sum = torch.zeros(self.n_features, device=self.device)
+                    final_theta_count = 0
 
                 if active_progress is not None and task_id is not None:
                     active_progress.update(task_id, epoch=f"{epoch}/{n_epochs}")
@@ -442,6 +463,10 @@ class CorpusAdapter:
                     # Normalize theta (row-wise)
                     row_sums = theta.sum(dim=1, keepdim=True).clamp_min(1e-8)
                     theta_normalized = theta / row_sums
+                    if collect_theta_avg and final_theta_sum is not None:
+                        final_theta_sum += theta_normalized.sum(dim=0)
+                        final_theta_count += theta_normalized.shape[0]
+
                     active_feature_mask = theta_normalized.sum(dim=0) != 0
                     if not active_feature_mask.any():
                         empty_batches += 1
@@ -481,6 +506,11 @@ class CorpusAdapter:
                     f"Epoch {epoch}: nll/token={avg_loss:.4f}, ppl={perplexity:.3f}, "
                     f"tokens={int(total_tokens):,}, empty_batches={empty_batches}"
                 )
+
+        if final_theta_sum is not None and final_theta_count > 0:
+            theta_avg = (final_theta_sum / final_theta_count).clamp_min(0)
+            theta_avg = theta_avg / theta_avg.sum().clamp_min(1e-8)
+            self.theta_avg_ = theta_avg.detach().cpu().numpy()
 
         # Extract learned parameters
         self._save_learned_parameters()

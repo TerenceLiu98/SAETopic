@@ -71,6 +71,7 @@ def test_model_initialization():
     assert model.embedding_model == "jinaai/jina-embeddings-v5-text-small"
     assert model.embedding_task == "clustering"
     assert model.sae_model == "saetopic/jina-v5-sae-small"
+    assert model.merge_embedding_model is None
     assert model.n_topics == 50
     assert model.top_k_features == 32
     assert model.idf_weighting is False
@@ -82,11 +83,13 @@ def test_model_custom_params():
     """Test that SAETopicModel can be initialized with custom parameters."""
     model = SAETopicModel(
         embedding_model="custom-model",
+        merge_embedding_model="word2vec-google-news-300",
         n_topics=100,
         random_state=123,
     )
 
     assert model.embedding_model == "custom-model"
+    assert model.merge_embedding_model == "word2vec-google-news-300"
     assert model.n_topics == 100
     assert model.random_state == 123
 
@@ -122,6 +125,9 @@ def test_fit_transform_shapes():
     assert probs.shape == (n_docs, 5)
     assert model.embeddings_.shape == (n_docs, DIM)
     assert model.feature_activations_.shape == (n_docs, NFEAT)
+    assert model.theta_avg_.shape == (NFEAT,)
+    assert np.isclose(model.theta_avg_.sum(), 1.0, atol=1e-5)
+    assert model.adapter_.random_state == model.random_state
     assert model.feature_word_matrix_.shape == (NFEAT, len(model.vocab_))
     assert model.topic_word_matrix_.shape == (5, len(model.vocab_))
     assert model.document_topic_matrix_.shape == (n_docs, 5)
@@ -190,6 +196,49 @@ def test_get_topics_respects_top_n():
 
     assert set(all_topics.keys()) == set(range(5))
     assert all(len(words) == 3 for words in all_topics.values())
+
+
+def test_get_cluster_info_matches_saetm_columns():
+    """SAE-TM-style cluster artifact exposes expected columns."""
+    model = _make_model(n_topics=5)
+    model.fit(_docs())
+
+    clusters = model.get_cluster_info()
+
+    assert list(clusters.columns) == [
+        "cluster_id",
+        "cluster_size",
+        "cluster_prob",
+        "cluster_words",
+        "cluster_ratio",
+    ]
+    assert len(clusters) == 5
+    assert clusters["cluster_size"].sum() == (model.topic_atom_clusters_ >= 0).sum()
+
+
+def test_get_cluster_to_feature_indices_covers_assigned_features():
+    """Cluster-to-feature mapping matches the fitted feature cluster labels."""
+    model = _make_model(n_topics=5)
+    model.fit(_docs())
+
+    mapping = model.get_cluster_to_feature_indices()
+    assigned = sorted(feature for features in mapping.values() for feature in features)
+    expected = sorted(np.where(model.topic_atom_clusters_ >= 0)[0].tolist())
+
+    assert set(mapping) == set(range(5))
+    assert assigned == expected
+
+
+def test_get_theta_topic_matrix_sparse_matches_dense():
+    """SAE-TM-style theta-topic matrix can be exported as CSR."""
+    model = _make_model(n_topics=5)
+    model.fit(_docs())
+
+    dense = model.get_theta_topic_matrix(normalize=False, sparse=False)
+    sparse = model.get_theta_topic_matrix(normalize=False, sparse=True)
+
+    assert sparse.shape == dense.shape == (len(_docs()), 5)
+    assert np.allclose(sparse.toarray(), dense, atol=1e-6)
 
 
 def test_unfitted_raises():
