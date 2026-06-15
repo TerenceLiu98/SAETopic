@@ -73,6 +73,9 @@ def test_model_initialization():
     assert model.sae_model == "saetopic/jina-v5-sae-small"
     assert model.n_topics == 50
     assert model.top_k_features == 32
+    assert model.idf_weighting is False
+    assert model.use_ctfidf is False
+    assert model.drop_empty_topics is False
 
 
 def test_model_custom_params():

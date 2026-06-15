@@ -74,6 +74,7 @@ class TestCorpusAdapter:
         )
         assert adapter.vocab_size == 50
         assert adapter.n_features == 128
+        assert adapter.idf_weighting is False
         assert not adapter._is_fitted
 
     def test_fit(self, sample_embeddings, sample_bow, dummy_sae):
@@ -161,9 +162,9 @@ class TestCorpusAdapter:
             verbose=False,
         )
 
-        B = adapter.get_feature_word_matrix()
-        assert B.shape == (128, 50)
-        assert np.allclose(B.sum(axis=1), 1.0, atol=1e-5)  # Rows sum to ~1
+        b_matrix = adapter.get_feature_word_matrix()
+        assert b_matrix.shape == (128, 50)
+        assert np.allclose(b_matrix.sum(axis=1), 1.0, atol=1e-5)  # Rows sum to ~1
 
     def test_get_top_words_for_feature(
         self, sample_embeddings, sample_bow, dummy_sae, sample_vocab
@@ -207,11 +208,11 @@ class TestTopicMerger:
     def feature_word_matrix(self):
         """Create sample feature-to-word matrix."""
         np.random.seed(42)
-        K, V = 128, 50
+        n_features, vocab_size = 128, 50
         # Create probability distributions
-        B = np.random.rand(K, V).astype(np.float32)
-        B = B / B.sum(axis=1, keepdims=True)
-        return B
+        b_matrix = np.random.rand(n_features, vocab_size).astype(np.float32)
+        b_matrix = b_matrix / b_matrix.sum(axis=1, keepdims=True)
+        return b_matrix
 
     @pytest.fixture
     def feature_weights(self):
@@ -270,7 +271,8 @@ class TestTopicMerger:
         )
 
         assert result.shape == (100, 10)
-        assert np.allclose(result.sum(axis=1), 1.0, atol=1e-5)  # Rows sum to ~1
+        row_sums = result.sum(axis=1)
+        assert np.allclose(row_sums[row_sums > 0], 1.0, atol=1e-5)  # Non-zero rows sum to ~1
         assert merger._is_fitted
 
     def test_transform(
@@ -288,7 +290,27 @@ class TestTopicMerger:
         result = merger.transform(feature_activations)
 
         assert result.shape == (100, 10)
-        assert np.allclose(result.sum(axis=1), 1.0, atol=1e-5)
+        row_sums = result.sum(axis=1)
+        assert np.allclose(row_sums[row_sums > 0], 1.0, atol=1e-5)
+
+    def test_transform_keeps_zero_activation_rows_zero(
+        self, feature_word_matrix, feature_weights, feature_activations, sample_vocab
+    ):
+        """Rows with no SAE activations stay zero, matching sparse matrix aggregation."""
+        merger = TopicMerger(n_topics=10, random_state=42)
+        merger.fit(
+            feature_word_matrix=feature_word_matrix,
+            feature_weights=feature_weights,
+            vocab=sample_vocab,
+        )
+
+        feature_activations = feature_activations.copy()
+        feature_activations[0] = 0
+        result = merger.transform(feature_activations)
+
+        assert np.allclose(result[0], 0.0)
+        row_sums = result[1:].sum(axis=1)
+        assert np.allclose(row_sums[row_sums > 0], 1.0, atol=1e-5)
 
     def test_get_topic_info(
         self, feature_word_matrix, feature_weights, sample_vocab

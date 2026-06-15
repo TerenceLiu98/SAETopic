@@ -4,6 +4,8 @@ Vectorizer for corpus vocabulary and bag-of-words construction.
 
 from __future__ import annotations
 
+import collections
+import math
 import re
 from typing import TYPE_CHECKING
 
@@ -125,7 +127,7 @@ class CorpusVectorizer:
         Minimum document frequency for vocabulary terms
     max_df : float, default=0.95
         Maximum document frequency (ratio) for vocabulary terms
-    idf_weighting : bool, default=True
+    idf_weighting : bool, default=False
         Whether to compute IDF weights (consumed by CorpusAdapter)
     stop_words : str or None, default="english"
         Stop-word/preprocessing mode. Use "saetm" to match the SAE-TM BoW
@@ -147,7 +149,7 @@ class CorpusVectorizer:
         vocabulary_size: int | None = None,
         min_df: int = 2,
         max_df: float = 0.95,
-        idf_weighting: bool = True,
+        idf_weighting: bool = False,
         stop_words: str | None = "english",
         ngram_range: tuple[int, int] = (1, 1),
         token_pattern: str | None = None,
@@ -164,7 +166,7 @@ class CorpusVectorizer:
         self.vectorizer_ = None
         self.vocab_: list[str] | None = None
 
-    def _build_count_vectorizer(self):
+    def _build_count_vectorizer(self, vocabulary: list[str] | None = None):
         from sklearn.feature_extraction.text import CountVectorizer
 
         kwargs: dict = dict(
@@ -178,12 +180,46 @@ class CorpusVectorizer:
             kwargs["tokenizer"] = processor.process
             kwargs["token_pattern"] = None
             kwargs["lowercase"] = False
+            if vocabulary is not None:
+                kwargs["vocabulary"] = vocabulary
         else:
             kwargs["token_pattern"] = self.token_pattern
             kwargs["stop_words"] = self.stop_words
-        if self.vocabulary_size:
+        if self.vocabulary_size and vocabulary is None:
             kwargs["max_features"] = self.vocabulary_size
         return CountVectorizer(**kwargs)
+
+    def _build_saetm_vocabulary(self, docs: list[str]) -> list[str] | None:
+        if not self.vocabulary_size:
+            return None
+
+        processor = SAETMDocumentProcessor()
+        doc_freq: collections.Counter[str] = collections.Counter()
+        n_docs = len(docs)
+        if n_docs == 0:
+            return []
+
+        if isinstance(self.min_df, float):
+            min_doc_count = math.ceil(self.min_df * n_docs)
+        else:
+            min_doc_count = int(self.min_df)
+
+        if isinstance(self.max_df, float):
+            max_doc_count = math.floor(self.max_df * n_docs)
+        else:
+            max_doc_count = int(self.max_df)
+
+        for doc in docs:
+            tokens = processor.process(doc)
+            doc_freq.update(set(tokens))
+
+        items = [
+            token
+            for token, df in doc_freq.items()
+            if df >= min_doc_count and df <= max_doc_count
+        ]
+        items.sort(key=lambda token: (-doc_freq[token], token))
+        return items[: self.vocabulary_size]
 
     def fit(self, docs: list[str]) -> "CorpusVectorizer":
         """
@@ -199,7 +235,10 @@ class CorpusVectorizer:
         CorpusVectorizer
             Fitted vectorizer instance
         """
-        self.vectorizer_ = self._build_count_vectorizer()
+        vocabulary = None
+        if self.stop_words == "saetm":
+            vocabulary = self._build_saetm_vocabulary(docs)
+        self.vectorizer_ = self._build_count_vectorizer(vocabulary=vocabulary)
         self.vectorizer_.fit(docs)
         self.vocab_ = self.vectorizer_.get_feature_names_out().tolist()
         return self

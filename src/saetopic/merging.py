@@ -8,14 +8,12 @@ following the SAE-TM framework.
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 import torch
 from scipy.sparse import csr_matrix
 from sklearn.cluster import AgglomerativeClustering, KMeans
-from tqdm.auto import tqdm
 
 if TYPE_CHECKING:
     import numpy.typing as npt
@@ -47,14 +45,14 @@ def sparsify_and_renormalize(
     if arr.dim() != 2:
         raise ValueError(f"Input must be 2D, got {arr.dim()}D")
 
-    K, V = arr.shape
+    n_rows, vocab_size = arr.shape
     device = arr.device
 
     # Process in row-chunks so peak memory is bounded by chunk_size x V,
     # not K x V (a full torch.sort allocates a same-sized int64 index array).
     result = torch.zeros_like(arr)
-    for start in range(0, K, chunk_size):
-        end = min(start + chunk_size, K)
+    for start in range(0, n_rows, chunk_size):
+        end = min(start + chunk_size, n_rows)
         k = end - start
         block = arr[start:end]
 
@@ -62,9 +60,9 @@ def sparsify_and_renormalize(
         cumulative_sums = torch.cumsum(sorted_values, dim=-1)
         n_elements = torch.argmax((cumulative_sums > tau).int(), dim=-1) + 1
         never_exceeds = (cumulative_sums > tau).sum(dim=-1) == 0
-        n_elements[never_exceeds] = V
+        n_elements[never_exceeds] = vocab_size
 
-        arange = torch.arange(V, device=device).expand(k, -1)
+        arange = torch.arange(vocab_size, device=device).expand(k, -1)
         mask_sorted = arange < n_elements.unsqueeze(-1)
         final_mask = torch.zeros_like(block, dtype=torch.bool)
         final_mask.scatter_(dim=1, index=sorted_indices, src=mask_sorted)
@@ -232,12 +230,12 @@ class TopicMerger:
 
         # Fused sparsify + matmul in feature-row chunks: avoids materializing
         # the full sparsified B (K x V) alongside the input feature_word_matrix.
-        K = feature_word_matrix.shape[0]
+        n_features = feature_word_matrix.shape[0]
         dim = word_embeddings.shape[1]
-        feature_embeddings = np.zeros((K, dim), dtype=np.float32)
+        feature_embeddings = np.zeros((n_features, dim), dtype=np.float32)
         chunk = 2048
-        for start in range(0, K, chunk):
-            end = min(start + chunk, K)
+        for start in range(0, n_features, chunk):
+            end = min(start + chunk, n_features)
             block_sparse = sparsify_and_renormalize(
                 feature_word_matrix[start:end], tau=self.sparsity_threshold
             )
@@ -271,7 +269,6 @@ class TopicMerger:
             clusterer = KMeans(
                 n_clusters=self.n_topics,
                 random_state=self.random_state,
-                n_init=10,
             )
             if feature_weights is not None:
                 labels = clusterer.fit_predict(
@@ -289,7 +286,7 @@ class TopicMerger:
         else:
             raise ValueError(f"Unknown clustering method: {self.method}")
 
-        logger.info(f"Clustering complete. Feature distribution:")
+        logger.info("Clustering complete. Feature distribution:")
         unique, counts = np.unique(labels, return_counts=True)
         for u, c in zip(unique, counts):
             logger.info(f"  Cluster {u}: {c} features")
@@ -340,13 +337,13 @@ class TopicMerger:
                 continue
 
             # Get feature-to-word distributions for this cluster
-            cluster_B = feature_word_matrix[cluster_features]
+            cluster_b = feature_word_matrix[cluster_features]
             cluster_theta = feature_weights[cluster_features]
 
             # Weighted average: theta-weighted sum of word distributions
             # This gives the cluster's topic-word distribution
-            weighted_B = cluster_B * cluster_theta[:, np.newaxis]
-            topic_dist = weighted_B.sum(axis=0) / cluster_theta.sum()
+            weighted_b = cluster_b * cluster_theta[:, np.newaxis]
+            topic_dist = weighted_b.sum(axis=0) / cluster_theta.sum()
 
             topic_word_matrix[cluster_id] = topic_dist
 
@@ -501,13 +498,12 @@ class TopicMerger:
         # Normalize to get probabilities
         row_sums = topic_activations.sum(axis=1, keepdims=True)
 
-        # For documents with no activation in any cluster, assign uniform distribution
-        empty_rows = (row_sums == 0).flatten()
-        if empty_rows.any():
-            topic_activations[empty_rows] = 1.0 / n_topics
-            row_sums[empty_rows] = 1.0
-
-        topic_probs = topic_activations / row_sums
+        topic_probs = np.divide(
+            topic_activations,
+            row_sums,
+            out=np.zeros_like(topic_activations),
+            where=row_sums > 0,
+        )
 
         return topic_probs
 

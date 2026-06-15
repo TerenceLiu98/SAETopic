@@ -125,6 +125,7 @@ class TopicWordModel(nn.Module):
         self,
         theta: torch.Tensor,
         active_vocab_mask: torch.Tensor | None = None,
+        active_feature_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Compute word probabilities from feature activations.
@@ -133,22 +134,30 @@ class TopicWordModel(nn.Module):
             theta: Normalized feature activations (B x K)
             active_vocab_mask: Optional boolean mask (V,) for active vocabulary.
                 If provided, only computes probabilities for active words.
+            active_feature_mask: Optional boolean mask (K,) for SAE features active
+                in the current batch.
 
         Returns:
             Word probabilities (B x V) or (B x V_active) if mask provided
         """
+        if active_feature_mask is not None:
+            theta = theta[:, active_feature_mask]
+            b_logits = self.B_logits[active_feature_mask]
+        else:
+            b_logits = self.B_logits
+
         if active_vocab_mask is None:
             # Full vocabulary computation
-            b_probs = torch.softmax(self.B_logits, dim=1)
+            b_probs = torch.softmax(b_logits, dim=1)
             topic_words = theta @ b_probs
             bg_probs = torch.softmax(self.bg_logits, dim=0)
         else:
             # Subset computation for efficiency
             # Compute log-normalizer over full vocab for numerical stability
-            log_denoms = torch.logsumexp(self.B_logits, dim=1, keepdim=True)  # K x 1
+            log_denoms = torch.logsumexp(b_logits, dim=1, keepdim=True)  # K_active x 1
 
             # Subset active columns
-            b_logits_subset = self.B_logits[:, active_vocab_mask]  # K x V_active
+            b_logits_subset = b_logits[:, active_vocab_mask]  # K_active x V_active
             b_probs_subset = (b_logits_subset - log_denoms).exp()  # K x V_active
 
             topic_words = theta @ b_probs_subset  # B x V_active
@@ -202,7 +211,7 @@ class CorpusAdapter:
         Size of corpus vocabulary
     n_features : int
         Number of SAE features (topic atoms)
-    idf_weighting : bool, default=True
+    idf_weighting : bool, default=False
         Whether to use IDF weighting in learning
     init_pi : float, default=0.3
         Initial background mixture parameter
@@ -216,7 +225,7 @@ class CorpusAdapter:
         self,
         vocab_size: int,
         n_features: int,
-        idf_weighting: bool = True,
+        idf_weighting: bool = False,
         init_pi: float = 0.3,
         learning_rate: float = 1e-2,
         device: str = "auto",
@@ -347,11 +356,11 @@ class CorpusAdapter:
             init_pi=self.init_pi,
         ).to(self.device)
 
-        # No weight decay on logits
-        optimizer = optim.AdamW([
-            {"params": [self._model.B_logits, self._model.bg_logits], "weight_decay": 0.0},
-            {"params": [self._model.pi_logit], "weight_decay": 1e-5},
-        ], lr=self.learning_rate)
+        # Match SAE-TM: learn B and background logits; keep pi fixed as a buffer.
+        optimizer = optim.AdamW(
+            [{"params": [self._model.B_logits, self._model.bg_logits], "weight_decay": 0.0}],
+            lr=self.learning_rate,
+        )
 
         # Create dataset and loader
         dataset = SparseBoWDataset(embeddings, bow)
@@ -426,10 +435,20 @@ class CorpusAdapter:
                     # Normalize theta (row-wise)
                     row_sums = theta.sum(dim=1, keepdim=True).clamp_min(1e-8)
                     theta_normalized = theta / row_sums
+                    active_feature_mask = theta_normalized.sum(dim=0) != 0
+                    if not active_feature_mask.any():
+                        empty_batches += 1
+                        if progress is not None and task_id is not None:
+                            progress.update(task_id, advance=1)
+                        continue
 
                     # Forward pass with active vocabulary mask
                     active_mask_tensor = torch.from_numpy(active_vocab_mask).to(self.device)
-                    predicted = self._model(theta_normalized, active_vocab_mask=active_mask_tensor)
+                    predicted = self._model(
+                        theta_normalized,
+                        active_vocab_mask=active_mask_tensor,
+                        active_feature_mask=active_feature_mask,
+                    )
                     predicted = predicted.clamp(min=1e-8)
 
                     # Loss: negative log likelihood

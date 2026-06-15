@@ -40,7 +40,7 @@ class SAETopicConfig:
     n_topics: int = 50
     top_k_features: int = 32
     min_topic_size: int | None = None
-    idf_weighting: bool = True
+    idf_weighting: bool = False
     device: str = "auto"
     random_state: int = 42
 

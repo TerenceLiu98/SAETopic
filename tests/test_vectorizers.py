@@ -1,5 +1,6 @@
 """Tests for corpus vectorization utilities."""
 
+from examples.build_news20k_topic_model import _strip_20newsgroups_metadata
 from saetopic import vectorizers
 from saetopic.vectorizers import CorpusVectorizer
 
@@ -40,3 +41,53 @@ def test_saetm_preprocessing_uses_document_processor(monkeypatch):
     assert "just" not in vocab
     assert "thanks" not in vocab
     assert "edu" not in vocab
+
+
+def test_saetm_vocabulary_size_uses_document_frequency(monkeypatch):
+    """SAE-TM vocab truncation ranks lemmas by document frequency, then token."""
+
+    class FakeSAETMDocumentProcessor:
+        def process(self, text):
+            return text.split()
+
+    monkeypatch.setattr(
+        vectorizers,
+        "SAETMDocumentProcessor",
+        FakeSAETMDocumentProcessor,
+    )
+    docs = [
+        "alpha alpha alpha rare",
+        "beta gamma",
+        "beta delta",
+    ]
+
+    vectorizer = CorpusVectorizer(
+        vocabulary_size=2,
+        min_df=1,
+        max_df=1.0,
+        stop_words="saetm",
+    )
+    vectorizer.fit(docs)
+
+    assert vectorizer.vocab_ == ["beta", "alpha"]
+
+
+def test_news20k_metadata_stripping_removes_headers_quotes_and_footer():
+    text = """From: user@example.com
+Subject: Re: graphics
+
+This line should stay.
+> quoted line should go
+In article someone wrote something
+Another useful line.
+--
+signature should go
+"""
+
+    cleaned = _strip_20newsgroups_metadata(text)
+
+    assert "This line should stay." in cleaned
+    assert "Another useful line." in cleaned
+    assert "From:" not in cleaned
+    assert "quoted line" not in cleaned
+    assert "signature" not in cleaned

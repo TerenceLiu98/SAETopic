@@ -52,8 +52,9 @@ class SAETopicModel:
     vectorizer_model : Any, default=None
         Custom fitted vectorizer exposing ``fit``/``transform``/``vocab_``.
         If None, a :class:`CorpusVectorizer` is built from the parameters below.
-    idf_weighting : bool, default=True
-        Whether to use IDF weighting in corpus adaptation
+    idf_weighting : bool, default=False
+        Whether to use IDF weighting in corpus adaptation. Disabled by default
+        to match SAE-TM's ``interpret_sae.py`` default.
     device : str, default="auto"
         Device for computation ("auto", "cpu", "cuda", "mps")
     random_state : int, default=42
@@ -87,14 +88,17 @@ class SAETopicModel:
     max_seq_length : int or None, default=512
         Max input sequence length for the embedder. Set to match the SAE's
         training chunk size so inference embeddings stay in-distribution.
-    use_ctfidf : bool, default=True
+    use_ctfidf : bool, default=False
         Use c-TF-IDF topic-word scoring for ``get_topic`` / ``get_topic_info``,
         so topic words are ranked by distinctiveness across topics rather than
         raw emission probability. Down-weights corpus-common words (e.g.
-        "events", "born", month names).
-    drop_empty_topics : bool, default=True
+        "events", "born", month names). Disabled by default to keep the
+        displayed topic-word scores aligned with SAE-TM's merged word-emission
+        probabilities.
+    drop_empty_topics : bool, default=False
         Drop clusters to which no document is assigned (count == 0) and
-        renumber the remaining topics, so the output never shows empty topics.
+        renumber the remaining topics. Disabled by default to preserve the
+        requested KMeans topic count, matching SAE-TM's cluster export.
     """
 
     def __init__(
@@ -106,7 +110,7 @@ class SAETopicModel:
         top_k_features: int = 32,
         min_topic_size: int | None = None,
         vectorizer_model: Any = None,
-        idf_weighting: bool = True,
+        idf_weighting: bool = False,
         device: str = "auto",
         random_state: int = 42,
         corpus_adapter_epochs: int = 50,
@@ -119,8 +123,8 @@ class SAETopicModel:
         min_df: int = 2,
         max_df: float = 0.95,
         max_seq_length: int | None = 512,
-        use_ctfidf: bool = True,
-        drop_empty_topics: bool = True,
+        use_ctfidf: bool = False,
+        drop_empty_topics: bool = False,
         stop_words: str | None = "english",
         theta_mode: str = "dense",
     ):
@@ -411,6 +415,9 @@ class SAETopicModel:
             where=row_sums > 0,
         )
         feature_weights = theta_normalized.mean(axis=0).ravel()
+        feature_weight_sum = feature_weights.sum()
+        if feature_weight_sum > 0:
+            feature_weights = feature_weights / feature_weight_sum
 
         self.merger_ = TopicMerger(
             n_topics=n_topics,

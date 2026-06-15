@@ -17,6 +17,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import re
 import time
 from collections import Counter, defaultdict
 from typing import Any
@@ -37,6 +38,7 @@ def load_news20k(
     hf_split: str,
     sklearn_data_home: str | None,
     download_sklearn: bool,
+    remove_metadata: bool,
 ) -> tuple[list[str], np.ndarray, list[str]]:
     """Load and optionally subsample the 20 Newsgroups corpus."""
     if data_source == "hf":
@@ -44,6 +46,7 @@ def load_news20k(
             dataset_name=hf_dataset,
             split=hf_split,
             categories=categories,
+            remove_metadata=remove_metadata,
         )
     elif data_source == "sklearn":
         docs, labels, target_names = load_news20k_from_sklearn(
@@ -51,6 +54,7 @@ def load_news20k(
             categories=categories,
             data_home=sklearn_data_home,
             download_if_missing=download_sklearn,
+            remove_metadata=remove_metadata,
         )
     else:
         raise ValueError(f"Unknown data source: {data_source}")
@@ -69,13 +73,14 @@ def load_news20k_from_sklearn(
     categories: list[str] | None,
     data_home: str | None,
     download_if_missing: bool,
+    remove_metadata: bool,
 ) -> tuple[list[str], np.ndarray, list[str]]:
     """Load 20 Newsgroups through sklearn's local cache/downloader."""
     dataset = fetch_20newsgroups(
         subset="all",
         categories=categories,
         data_home=data_home,
-        remove=("headers", "footers", "quotes"),
+        remove=("headers", "footers", "quotes") if remove_metadata else (),
         shuffle=True,
         random_state=seed,
         download_if_missing=download_if_missing,
@@ -96,6 +101,7 @@ def load_news20k_from_hf(
     dataset_name: str,
     split: str,
     categories: list[str] | None,
+    remove_metadata: bool,
 ) -> tuple[list[str], np.ndarray, list[str]]:
     """Load 20 Newsgroups from a Hugging Face dataset cache or repo."""
     try:
@@ -148,6 +154,8 @@ def load_news20k_from_hf(
 
     for row in dataset:
         text = str(row[text_column]).strip()
+        if remove_metadata:
+            text = _strip_20newsgroups_metadata(text)
         if not text:
             continue
 
@@ -169,6 +177,29 @@ def load_news20k_from_hf(
         labels.append(label_id)
 
     return docs, np.asarray(labels), target_names
+
+
+def _strip_20newsgroups_metadata(text: str) -> str:
+    """Best-effort equivalent of sklearn's headers/footers/quotes removal."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+    for idx, line in enumerate(lines):
+        if not line.strip():
+            lines = lines[idx + 1 :]
+            break
+
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped == "--":
+            break
+        if stripped.startswith((">", "|")):
+            continue
+        if re.match(r"^(writes|wrote|in article|article|from|subject):", stripped, re.I):
+            continue
+        cleaned.append(line)
+
+    return "\n".join(cleaned).strip()
 
 
 def _pick_column(dataset: Any, preferred: tuple[str, ...], required: bool = True) -> str | None:
@@ -268,6 +299,11 @@ def main() -> None:
         action="store_true",
         help="Allow sklearn to download from its upstream URL if the cache is missing.",
     )
+    parser.add_argument(
+        "--keep-news-metadata",
+        action="store_true",
+        help="Keep 20 Newsgroups headers, footers, and quoted text.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument(
         "--corpus-adapter-batch-size",
@@ -312,6 +348,7 @@ def main() -> None:
         hf_split=args.hf_split,
         sklearn_data_home=args.sklearn_data_home,
         download_sklearn=args.download_sklearn,
+        remove_metadata=not args.keep_news_metadata,
     )
     print(
         f"  docs={len(docs):,} | categories={len(target_names)} | "
@@ -333,7 +370,7 @@ def main() -> None:
         theta_mode="dense",
         max_seq_length=512,
         use_ctfidf=args.use_ctfidf,
-        drop_empty_topics=True,
+        drop_empty_topics=False,
         device="auto",
     )
     print(

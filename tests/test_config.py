@@ -14,6 +14,7 @@ def test_default_saetopic_config():
     assert config.sae_model == "saetopic/jina-v5-sae-small"
     assert config.n_topics == 50
     assert config.top_k_features == 32
+    assert config.idf_weighting is False
     assert config.random_state == 42
 
 
