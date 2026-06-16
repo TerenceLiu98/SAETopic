@@ -402,6 +402,10 @@ def summarize_metric(values: Mapping[int, float]) -> float:
     return float(np.mean(list(values.values()))) if values else 0.0
 
 
+def _percent_scores(values: Mapping[int, float]) -> dict[int, float]:
+    return {topic_id: score * 100.0 for topic_id, score in values.items()}
+
+
 def evaluate_topic_words(
     topic_words: TopicWords,
     *,
@@ -448,10 +452,11 @@ def evaluate_topic_words(
             repetitions=repetitions,
             seed=seed,
         )
+        ci_percent = _percent_scores(ci)
         result["CR"] = summarize_metric(cr)
-        result["CI"] = summarize_metric(ci)
+        result["CI"] = summarize_metric(ci_percent)
         result["CR_by_topic"] = cr
-        result["CI_by_topic"] = ci
+        result["CI_by_topic"] = ci_percent
     return result
 
 

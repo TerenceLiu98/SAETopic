@@ -9,6 +9,7 @@ from saetopic.evaluation import (
     compute_intruder_detection,
     compute_unique_word_diversity,
     compute_wmd_diversity,
+    evaluate_topic_words,
     load_saetm_word2vec_cache,
     load_top_words_file,
     parse_coherence_score,
@@ -157,3 +158,28 @@ def test_intruder_detection_with_batched_llm():
 
     assert set(scores) == {0, 1}
     assert [len(batch) for batch in batches] == [1, 1]
+
+
+def test_evaluate_topic_words_reports_ci_as_percent():
+    topic_words = {
+        0: ["space", "space", "space", "space", "space"],
+        1: ["car", "car", "car", "car", "car"],
+    }
+
+    def llm(prompt: str) -> str:
+        if "coherence" in prompt:
+            return '{"rationale": "coherent", "score": 90}'
+        if prompt.count("space") == 4:
+            return "car"
+        return "space"
+
+    result = evaluate_topic_words(
+        topic_words,
+        llm=llm,
+        word_embeddings={"space": [0.0, 0.0], "car": [1.0, 1.0]},
+        repetitions=1,
+        seed=0,
+    )
+
+    assert result["CI"] == 100.0
+    assert result["CI_by_topic"] == {0: 100.0, 1: 100.0}

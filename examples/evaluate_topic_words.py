@@ -352,6 +352,7 @@ def main() -> None:
                 )
                 progress.update(ci_task, completed=ci_total)
                 progress.remove_task(ci_task)
+                ci = {topic_id: score * 100.0 for topic_id, score in ci.items()}
                 result["metrics"]["CR"] = summarize_metric(cr)
                 result["metrics"]["CI"] = summarize_metric(ci)
                 result["CR_by_topic"] = cr
