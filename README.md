@@ -1,4 +1,15 @@
-# SAETopic
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="demo/logit-dark.svg">
+    <img alt="SSAETopic" src="https://32cf906.webp.li/2026/06/SAETopic-removebg-preview.png" width="150">
+  </picture>
+
+  <h1>SAETopic</h1>
+
+  ![visitors](https://visitor-badge.laobi.icu/badge?page_id=TerenceLiu98/SAETopic)
+  
+</div>
+
 
 > **Sparse Autoencoder topic-atom training and planned topic inference**
 
