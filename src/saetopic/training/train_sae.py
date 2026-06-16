@@ -1175,6 +1175,35 @@ def _format_embedding_progress_remaining(
     return "unknown"
 
 
+def _embedding_progress_total(dataset: Any, total_samples: int | None) -> int | None:
+    """Choose the progress-bar total without mixing source and embedding units."""
+    if total_samples is not None:
+        return total_samples
+
+    source_total = getattr(dataset, "source_total", None)
+    if isinstance(source_total, int):
+        return source_total
+
+    return None
+
+
+def _embedding_progress_completed(
+    dataset: Any,
+    total_samples: int | None,
+    n_saved: int,
+    n_pending: int = 0,
+) -> int:
+    """Choose the completed value in the same unit as the progress-bar total."""
+    if total_samples is not None:
+        return n_saved + n_pending
+
+    source_rows_seen = getattr(dataset, "source_rows_seen", None)
+    if isinstance(source_rows_seen, int):
+        return source_rows_seen
+
+    return n_saved + n_pending
+
+
 def compute_and_save_embeddings(
     dataset: StreamingEmbeddingDataset,
     output_path: str | Path,
@@ -1371,22 +1400,26 @@ def compute_and_save_embeddings(
             chunk_pending = 0
             chunk_index += 1
 
+        progress_total = _embedding_progress_total(dataset, total_samples)
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             TaskProgressColumn(),
             TextColumn("• {task.fields[remaining]} remaining"),
+            TextColumn("• {task.fields[embedded]} embedded"),
             TimeRemainingColumn(),
         ) as progress:
             task = progress.add_task(
                 "[cyan]Computing embeddings...",
-                total=total_samples,
+                total=progress_total,
                 remaining=_format_embedding_progress_remaining(
                     dataset,
                     total_samples,
                     n_total,
                 ),
+                embedded="0",
             )
 
             for batch in dataset:
@@ -1422,8 +1455,13 @@ def compute_and_save_embeddings(
 
                 progress.update(
                     task,
-                    completed=n_total,
+                    completed=_embedding_progress_completed(
+                        dataset,
+                        total_samples,
+                        n_total,
+                    ),
                     remaining=remaining,
+                    embedded=f"{n_total:,}",
                 )
 
                 # Print progress periodically
@@ -1628,23 +1666,27 @@ def _compute_and_save_sharded_embeddings(
         shard_index += 1
         write_manifest(partial_manifest_path, completed=False)
 
+    progress_total = _embedding_progress_total(dataset, total_samples)
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
         TaskProgressColumn(),
         TextColumn("• {task.fields[remaining]} remaining"),
+        TextColumn("• {task.fields[embedded]} embedded"),
         TextColumn("• {task.fields[shards]} shards"),
         TimeRemainingColumn(),
     ) as progress:
         task = progress.add_task(
             "[cyan]Computing embeddings...",
-            total=total_samples,
+            total=progress_total,
             remaining=_format_embedding_progress_remaining(
                 dataset,
                 total_samples,
                 n_total,
             ),
+            embedded=f"{n_total:,}",
             shards="0",
         )
         if n_total:
@@ -1655,8 +1697,13 @@ def _compute_and_save_sharded_embeddings(
             )
             progress.update(
                 task,
-                completed=n_total,
+                completed=_embedding_progress_completed(
+                    dataset,
+                    total_samples,
+                    n_total,
+                ),
                 remaining=remaining,
+                embedded=f"{n_total:,}",
                 shards=f"{len(shards):,}",
             )
 
@@ -1704,8 +1751,14 @@ def _compute_and_save_sharded_embeddings(
 
             progress.update(
                 task,
-                completed=n_total + shard_pending,
+                completed=_embedding_progress_completed(
+                    dataset,
+                    total_samples,
+                    n_total,
+                    pending_rows,
+                ),
                 remaining=remaining,
+                embedded=f"{n_total + pending_rows:,}",
                 shards=f"{len(shards):,}",
             )
 
