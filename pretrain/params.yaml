@@ -80,6 +80,17 @@ topics:
       hf_split: train+test
       text_column: text
       label_column: label
+    - key: yelp
+      hf_dataset: Yelp/yelp_review_full
+      hf_split: train
+      text_column: text
+      label_column: label
+    - key: dailymail
+      hf_dataset: ccdv/cnn_dailymail
+      hf_subset: 3.0.0
+      hf_split: train
+      text_column: article
+      label_column: null
   n_docs: 0
   n_topics: [50, 100, 200, 300, 500]
   save_theta_topic: false
