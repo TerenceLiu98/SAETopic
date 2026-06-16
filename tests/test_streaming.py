@@ -283,8 +283,20 @@ def test_create_streaming_dataset_forwards_local_options_to_dataset(monkeypatch)
     assert dataset.seed == 123
     assert captured["args"] == ("mock/dataset",)
     assert captured["kwargs"]["split"] == "train"
+    assert captured["kwargs"]["streaming"] is True
+    assert "num_proc" not in captured["kwargs"]
     assert "normalize" not in captured["kwargs"]
     assert "seed" not in captured["kwargs"]
+
+    create_streaming_dataset(
+        dataset_name="mock/dataset",
+        split="train",
+        embedder=MockEmbedder(),
+        streaming=False,
+        num_proc=4,
+    )
+    assert captured["kwargs"]["streaming"] is False
+    assert captured["kwargs"]["num_proc"] == 4
 
 
 def test_streaming_dataset_token_chunking_and_max_samples_per_iter():

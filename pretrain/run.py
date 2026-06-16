@@ -169,6 +169,7 @@ def run_embeddings(config: dict[str, Any]) -> tuple[int, int]:
         normalize=bool(dataset_cfg.get("normalize", True)),
         seed=get_seed(config),
         streaming=bool(dataset_cfg.get("streaming", True)),
+        num_proc=dataset_cfg.get("num_proc", 16),
         max_samples=dataset_cfg.get("max_samples"),
         task=dataset_cfg.get("task", "clustering"),
     )

@@ -659,6 +659,7 @@ def create_streaming_dataset(
     normalize: bool = True,
     seed: int = 42,
     streaming: bool = True,
+    num_proc: int | None = 16,
     max_samples: int | None = None,
     skip_samples: int = 0,
     task: str = "clustering",
@@ -709,6 +710,10 @@ def create_streaming_dataset(
         Random seed for streaming buffer shuffling
     streaming : bool, default=True
         Use streaming mode (set to False for small datasets)
+    num_proc : int or None, default=16
+        Number of dataset-loading processes for non-streaming HuggingFace
+        datasets. Ignored when ``streaming=True`` because HuggingFace Datasets
+        does not support streaming with ``num_proc``.
     max_samples : int or None, default=None
         Maximum samples to stream
     skip_samples : int, default=0
@@ -758,13 +763,15 @@ def create_streaming_dataset(
     if subset is not None:
         load_args.append(subset)
 
-    hf_dataset = load_dataset(
-        *load_args,
-        split=split,
-        streaming=streaming,
-        num_proc=16,
+    load_kwargs = {
+        "split": split,
+        "streaming": streaming,
         **hf_kwargs,
-    )
+    }
+    if not streaming and num_proc is not None:
+        load_kwargs["num_proc"] = num_proc
+
+    hf_dataset = load_dataset(*load_args, **load_kwargs)
 
     return StreamingEmbeddingDataset(
         hf_dataset,
