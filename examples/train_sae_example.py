@@ -9,14 +9,20 @@ full training example.
 
 import numpy as np
 import torch
+from datasets import load_dataset
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    TextColumn,
+    TimeRemainingColumn,
+)
+from sentence_transformers import SentenceTransformer
+from torch.utils.data import random_split
 
 # Example 1: Complete pipeline - HuggingFace dataset → embeddings → training
 # -------------------------------------------------
 # Recommended workflow for large-scale training
-from datasets import load_dataset
-from sentence_transformers import SentenceTransformer
-from torch.utils.data import random_split
-
 from saetopic.training import compute_and_save_embeddings, train_sae
 from saetopic.training.data import EmbeddingDataset
 from saetopic.training.train_sae import TrainingConfig
@@ -197,13 +203,28 @@ texts = [
     # ... more documents
 ]
 
-# Compute embeddings
-embeddings = embedder.encode(
-    texts,
-    task="clustering",  # Important for Jina v5
-    batch_size=32,
-    show_progress_bar=True,
-)
+# Compute embeddings with Rich progress instead of SentenceTransformers' tqdm bar.
+embedding_batches = []
+encode_batch_size = 32
+with Progress(
+    TextColumn("[cyan]Encoding documents..."),
+    BarColumn(),
+    MofNCompleteColumn(),
+    TimeRemainingColumn(),
+) as progress:
+    task = progress.add_task("encode", total=len(texts))
+    for start in range(0, len(texts), encode_batch_size):
+        batch_texts = texts[start : start + encode_batch_size]
+        embedding_batches.append(
+            embedder.encode(
+                batch_texts,
+                task="clustering",  # Important for Jina v5
+                batch_size=encode_batch_size,
+                show_progress_bar=False,
+            )
+        )
+        progress.update(task, advance=len(batch_texts))
+embeddings = np.vstack(embedding_batches)
 
 # Save embeddings
 np.save("my_embeddings.npy", embeddings)

@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import random
-import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 
@@ -108,6 +107,7 @@ def _resolve_word_embeddings(
     topics: dict[int, list[str]],
     word_embeddings: Mapping[str, Sequence[float]] | None,
     embedding_model: str | Callable | None,
+    mean_embedding: Sequence[float] | None = None,
 ) -> dict[str, np.ndarray]:
     vocab = sorted({word.lower() for words in topics.values() for word in words})
     if not vocab:
@@ -119,12 +119,15 @@ def _resolve_word_embeddings(
             str(word).lower(): np.asarray(embedding, dtype=np.float32)
             for word, embedding in word_embeddings.items()
         }
-        if available:
+        if mean_embedding is not None:
+            fallback_embedding = np.asarray(mean_embedding, dtype=np.float32)
+        elif available:
             mean_embedding = np.mean(np.stack(list(available.values())), axis=0)
+            fallback_embedding = np.asarray(mean_embedding, dtype=np.float32)
         else:
-            mean_embedding = np.zeros(1, dtype=np.float32)
+            fallback_embedding = np.zeros(1, dtype=np.float32)
         for word in vocab:
-            resolved[word] = available.get(word, mean_embedding)
+            resolved[word] = available.get(word, fallback_embedding)
         return resolved
 
     if embedding_model is None:
@@ -132,27 +135,54 @@ def _resolve_word_embeddings(
     return _embedding_lookup_from_backend(vocab, embedding_model)
 
 
-def _uniform_wmd(emb_a: np.ndarray, emb_b: np.ndarray) -> float:
-    """Compute WMD for equally weighted word lists.
+def load_saetm_word2vec_cache(path: str | Path) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Load the word2vec cache format used by the SAE-TM reference implementation."""
+    path = Path(path)
+    embeddings_path = path / "embeddings.np.npy"
+    vocabulary_path = path / "vocabulary.json"
+    if not embeddings_path.exists() or not vocabulary_path.exists():
+        raise FileNotFoundError(
+            "SAE-TM word2vec cache requires embeddings.np.npy and vocabulary.json "
+            f"under {path}"
+        )
 
-    SAE-TM evaluates top-k word lists with the same k. In that common case,
-    uniform EMD reduces to a minimum-cost bipartite matching.
-    """
+    embeddings = np.load(embeddings_path)
+    vocabulary = json.loads(vocabulary_path.read_text(encoding="utf-8"))
+    word_embeddings = {
+        str(word).lower(): np.asarray(embeddings[idx], dtype=np.float32)
+        for idx, word in enumerate(vocabulary)
+    }
+    mean_embedding = np.asarray(embeddings.mean(axis=0), dtype=np.float32)
+    return word_embeddings, mean_embedding
+
+
+def _uniform_wmd(emb_a: np.ndarray, emb_b: np.ndarray) -> float:
+    """Compute SAE-TM's uniform Word Mover's Distance for two topic word lists."""
     if emb_a.size == 0 or emb_b.size == 0:
         return 0.0
-    if len(emb_a) != len(emb_b):
-        n = min(len(emb_a), len(emb_b))
-        emb_a = emb_a[:n]
-        emb_b = emb_b[:n]
-    cost = np.linalg.norm(emb_a[:, None, :] - emb_b[None, :, :], axis=2)
-    row_ind, col_ind = linear_sum_assignment(cost)
-    return float(cost[row_ind, col_ind].mean())
+    na, nb = len(emb_a), len(emb_b)
+    try:
+        import ot
+
+        dist_a = np.ones(na) / na
+        dist_b = np.ones(nb) / nb
+        cost = ot.dist(np.asarray(emb_a), np.asarray(emb_b), metric="euclidean")
+        return float(ot.emd2(dist_a, dist_b, cost))
+    except ImportError:
+        if na != nb:
+            n = min(na, nb)
+            emb_a = emb_a[:n]
+            emb_b = emb_b[:n]
+        cost = np.linalg.norm(emb_a[:, None, :] - emb_b[None, :, :], axis=2)
+        row_ind, col_ind = linear_sum_assignment(cost)
+        return float(cost[row_ind, col_ind].mean())
 
 
 def compute_wmd_diversity(
     topic_words: TopicWords,
     top_n: int = 20,
     word_embeddings: Mapping[str, Sequence[float]] | None = None,
+    mean_embedding: Sequence[float] | None = None,
     embedding_model: str | Callable | None = None,
 ) -> float:
     """Compute D: average pairwise WMD between topic top-word lists."""
@@ -160,10 +190,21 @@ def compute_wmd_diversity(
     if len(topics) < 2:
         return 0.0
 
-    embedding_lookup = _resolve_word_embeddings(topics, word_embeddings, embedding_model)
+    embedding_lookup = _resolve_word_embeddings(
+        topics,
+        word_embeddings,
+        embedding_model,
+        mean_embedding=mean_embedding,
+    )
     topic_embeddings = []
     for words in topics.values():
-        embeddings = [embedding_lookup[word.lower()] for word in words if word.lower() in embedding_lookup]
+        embeddings = []
+        for word in words:
+            key = word.lower()
+            if key in embedding_lookup:
+                embeddings.append(embedding_lookup[key])
+            elif mean_embedding is not None:
+                embeddings.append(np.asarray(mean_embedding, dtype=np.float32))
         if embeddings:
             topic_embeddings.append(np.stack(embeddings).astype(np.float32, copy=False))
 
@@ -184,6 +225,7 @@ def compute_diversity(
     top_n: int = 20,
     method: str = "wmd",
     word_embeddings: Mapping[str, Sequence[float]] | None = None,
+    mean_embedding: Sequence[float] | None = None,
     embedding_model: str | Callable | None = None,
 ) -> float:
     """Compute topic diversity.
@@ -196,6 +238,7 @@ def compute_diversity(
             topic_words,
             top_n=top_n,
             word_embeddings=word_embeddings,
+            mean_embedding=mean_embedding,
             embedding_model=embedding_model,
         )
     if method == "unique":
@@ -210,11 +253,14 @@ def create_coherence_prompt(word_list: Sequence[str]) -> str:
         "You are an expert in semantics and lexical relationships. Your task is to evaluate "
         f"the coherence of the following list of words: '{words_str}'.\n\n"
         "Coherence is how well the words belong to a single, clear, and specific category.\n"
-        "- A score of 100 means the words are extremely coherent.\n"
-        "- A score around 50 means the words are moderately coherent.\n"
+        "- A score of 100 means the words are extremely coherent "
+        "(e.g., all are types of citrus fruits).\n"
+        "- A score around 50 means the words are moderately coherent "
+        "(e.g., all are 'vehicles' but mix cars, boats, and planes).\n"
         "- A score of 0 means the words are completely unrelated.\n\n"
-        'Provide your analysis as a JSON object with two keys: "rationale" and "score". '
-        'The "score" must be an integer between 0 and 100. '
+        'Provide your analysis as a JSON object with two keys: "rationale" and "score".\n'
+        '- "rationale": A brief, one-sentence explanation for your score.\n'
+        '- "score": An integer between 0 and 100.\n\n'
         "Your response MUST be only the JSON object and nothing else."
     )
 
@@ -235,23 +281,17 @@ def parse_coherence_score(text: str) -> int | None:
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
-        match = re.search(r"\b(100|[1-9]?\d)\b", cleaned)
-        if not match:
-            return None
-        return int(match.group(1))
+        return None
     score = data.get("score")
     if isinstance(score, bool):
         return None
-    if isinstance(score, (int, float)) and 0 <= score <= 100:
-        return int(score)
+    if isinstance(score, int) and 0 <= score <= 100:
+        return score
     return None
 
 
 def _normalize_answer(text: str) -> str:
-    text = text.strip().lower()
-    text = text.replace("```", "")
-    text = re.sub(r"[^a-z0-9_\- ]+", "", text)
-    return text.strip().split()[0] if text.strip() else ""
+    return text.strip().lower()
 
 
 def compute_coherence_rating(
@@ -259,21 +299,22 @@ def compute_coherence_rating(
     llm: LLMCallable,
     llm_batch: LLMBatchCallable | None = None,
     llm_batch_size: int | None = None,
-    top_n: int = 20,
+    top_n: int | None = None,
     sample_size: int = 5,
     repetitions: int = 3,
-    seed: int = 42,
+    seed: int | None = None,
 ) -> dict[int, float]:
     """Compute CR per topic with an LLM callable."""
-    rng = random.Random(seed)
-    topics = normalize_topic_words(topic_words, top_n=top_n)
+    rng = random if seed is None else random.Random(seed)
+    pool_size = sample_size if top_n is None else top_n
+    topics = normalize_topic_words(topic_words, top_n=None)
     scores: dict[int, list[int]] = {}
 
     jobs: list[tuple[int, str]] = []
     for topic_id, words in topics.items():
-        if len(words) < sample_size:
+        if len(words) < pool_size or pool_size < sample_size:
             continue
-        pool = words[:top_n]
+        pool = words[:pool_size]
         for _ in range(repetitions):
             sample = rng.sample(pool, sample_size)
             rng.shuffle(sample)
@@ -306,14 +347,15 @@ def compute_intruder_detection(
     llm: LLMCallable,
     llm_batch: LLMBatchCallable | None = None,
     llm_batch_size: int | None = None,
-    top_n: int = 20,
+    top_n: int | None = None,
     sample_size: int = 4,
     repetitions: int = 3,
-    seed: int = 42,
+    seed: int | None = None,
 ) -> dict[int, float]:
     """Compute CI per topic with an LLM callable."""
-    rng = random.Random(seed)
-    topics = normalize_topic_words(topic_words, top_n=top_n)
+    rng = random if seed is None else random.Random(seed)
+    pool_size = sample_size if top_n is None else top_n
+    topics = normalize_topic_words(topic_words, top_n=None)
     topic_ids = sorted(topics)
     if len(topic_ids) < 2:
         return {}
@@ -322,7 +364,7 @@ def compute_intruder_detection(
     jobs: list[tuple[int, str, str]] = []
     for topic_id in topic_ids:
         words = topics[topic_id]
-        if len(words) < sample_size:
+        if len(words) < pool_size or pool_size < sample_size:
             continue
         intruder_candidates = [other for other in topic_ids if other != topic_id and topics[other]]
         if not intruder_candidates:
@@ -330,7 +372,7 @@ def compute_intruder_detection(
         for _ in range(repetitions):
             other_id = rng.choice(intruder_candidates)
             intruder = rng.choice(topics[other_id])
-            sample = rng.sample(words[:top_n], sample_size)
+            sample = rng.sample(words[:pool_size], sample_size)
             test_words = sample + [intruder]
             rng.shuffle(test_words)
             jobs.append((topic_id, intruder.lower(), create_intruder_prompt(test_words)))
@@ -368,11 +410,12 @@ def evaluate_topic_words(
     llm_batch_size: int | None = None,
     embedding_model: str | Callable | None = None,
     word_embeddings: Mapping[str, Sequence[float]] | None = None,
+    mean_embedding: Sequence[float] | None = None,
     top_n: int = 20,
     sample_size: int = 5,
     intruder_sample_size: int = 4,
     repetitions: int = 3,
-    seed: int = 42,
+    seed: int | None = None,
 ) -> dict[str, float | dict[int, float]]:
     """Compute available paper-aligned metrics for a topic-word mapping."""
     result: dict[str, float | dict[int, float]] = {
@@ -380,6 +423,7 @@ def evaluate_topic_words(
             topic_words,
             top_n=top_n,
             word_embeddings=word_embeddings,
+            mean_embedding=mean_embedding,
             embedding_model=embedding_model,
         )
     }
@@ -389,7 +433,7 @@ def evaluate_topic_words(
             llm=llm,
             llm_batch=llm_batch,
             llm_batch_size=llm_batch_size,
-            top_n=top_n,
+            top_n=sample_size,
             sample_size=sample_size,
             repetitions=repetitions,
             seed=seed,
@@ -399,7 +443,7 @@ def evaluate_topic_words(
             llm=llm,
             llm_batch=llm_batch,
             llm_batch_size=llm_batch_size,
-            top_n=top_n,
+            top_n=sample_size,
             sample_size=intruder_sample_size,
             repetitions=repetitions,
             seed=seed,

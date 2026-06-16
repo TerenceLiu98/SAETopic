@@ -1,5 +1,6 @@
 import json
 
+import numpy as np
 import pytest
 
 from saetopic.evaluation import (
@@ -8,6 +9,7 @@ from saetopic.evaluation import (
     compute_intruder_detection,
     compute_unique_word_diversity,
     compute_wmd_diversity,
+    load_saetm_word2vec_cache,
     load_top_words_file,
     parse_coherence_score,
     summarize_metric,
@@ -54,15 +56,29 @@ def test_wmd_diversity_with_supplied_embeddings():
 
 def test_parse_coherence_score_json_and_fallback():
     assert parse_coherence_score(json.dumps({"rationale": "ok", "score": 77})) == 77
-    assert parse_coherence_score("score: 42") == 42
+    assert parse_coherence_score("score: 42") is None
+    assert parse_coherence_score(json.dumps({"rationale": "ok", "score": 77.0})) is None
     assert parse_coherence_score("not a score") is None
 
 
+def test_load_saetm_word2vec_cache(tmp_path):
+    embeddings = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    np.save(tmp_path / "embeddings.np.npy", embeddings)
+    (tmp_path / "vocabulary.json").write_text(json.dumps(["Space", "car"]))
+
+    word_embeddings, mean_embedding = load_saetm_word2vec_cache(tmp_path)
+
+    assert set(word_embeddings) == {"space", "car"}
+    assert np.allclose(word_embeddings["space"], [1.0, 2.0])
+    assert np.allclose(mean_embedding, [2.0, 3.0])
+
+
 def test_coherence_rating_with_callable_llm():
-    topic_words = {0: ["space", "orbit", "nasa", "moon", "planet"]}
+    topic_words = {0: ["space", "orbit", "nasa", "moon", "planet", "ignored"]}
 
     def llm(prompt: str) -> str:
         assert "space" in prompt or "orbit" in prompt or "nasa" in prompt
+        assert "ignored" not in prompt
         return '{"rationale": "coherent", "score": 90}'
 
     scores = compute_coherence_rating(topic_words, llm=llm, repetitions=2, seed=0)
@@ -97,11 +113,12 @@ def test_coherence_rating_with_batched_llm():
 
 def test_intruder_detection_with_callable_llm():
     topic_words = {
-        0: ["space", "orbit", "nasa", "moon", "planet"],
-        1: ["car", "engine", "road", "wheel", "drive"],
+        0: ["space", "orbit", "nasa", "moon", "planet", "ignored"],
+        1: ["car", "engine", "road", "wheel", "drive", "ignored"],
     }
 
     def llm(prompt: str) -> str:
+        assert "ignored" not in prompt
         if "car" in prompt:
             return "car"
         return "space"

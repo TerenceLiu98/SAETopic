@@ -36,6 +36,7 @@ dependencies = [
     "rich",
     "nltk",
     "gensim>=4.4.0",
+    "pot",
 ]
 
 [project.optional-dependencies]
