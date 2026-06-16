@@ -547,6 +547,12 @@ def run_topics(config: dict[str, Any]) -> None:
         console.print(f"Preloading merge word embedding model once: {merge_embedding_model}")
         preload_word_embedding_model(str(merge_embedding_model))
 
+    model = build_topic_model(config, topic_counts[0])
+    console.print(
+        "Loaded SAE-TM once for all topic datasets "
+        f"(input_dim={model.sae_input_dim_}, n_features={model.sae_n_features_})"
+    )
+
     for dataset_cfg in topic_cfg.get("datasets", []):
         dataset_key = dataset_cfg["key"]
         n_docs = dataset_cfg.get("n_docs", default_n_docs)
@@ -555,7 +561,6 @@ def run_topics(config: dict[str, Any]) -> None:
         docs, labels, _ = load_topic_dataset(dataset_cfg, n_docs=n_docs, seed=get_seed(config))
         console.print(f"  docs={len(docs):,} | labels={'yes' if labels is not None else 'no'}")
 
-        model = build_topic_model(config, topic_counts[0])
         t0 = time.time()
         topics, probs = model.fit_transform(docs, n_topics=topic_counts[0])
         del topics, probs
@@ -584,7 +589,6 @@ def run_topics(config: dict[str, Any]) -> None:
             )
             console.print(f"  wrote {output_dir}")
 
-        del model
         gc.collect()
 
 
