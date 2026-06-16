@@ -3,7 +3,7 @@
 
 Prefer:
 
-    PYTHONPATH=src python pretrain/run.py --stages embeddings train_sae
+    PYTHONPATH=src python pretrain/run.py --config pretrain/params.yaml.example --stages embeddings train_sae
 """
 
 from run import main

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the SAETopic pretraining workflow from ``pretrain/params.yaml``.
+"""Run the SAETopic pretraining workflow from a YAML config.
 
 This script is intentionally independent from ``examples/``. It only imports
 library code from ``src/saetopic`` and keeps pretraining-specific orchestration
@@ -794,7 +794,7 @@ def run_stage(stage: str, config: dict[str, Any]) -> None:
 
 def main(default_stages: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="pretrain/params.yaml")
+    parser.add_argument("--config", default="pretrain/params.yaml.example")
     parser.add_argument(
         "--stages",
         nargs="+",
