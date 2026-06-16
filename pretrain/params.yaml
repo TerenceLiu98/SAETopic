@@ -103,7 +103,7 @@ topics:
   max_df: 1.0
   stop_words: saetm
   theta_mode: dense
-  max_seq_length: 512
+  max_seq_length: 1024
   use_ctfidf: false
   merge_embedding_model: word2vec-google-news-300
   device: auto
