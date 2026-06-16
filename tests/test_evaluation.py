@@ -71,6 +71,30 @@ def test_coherence_rating_with_callable_llm():
     assert summarize_metric(scores) == 90.0
 
 
+def test_coherence_rating_with_batched_llm():
+    topic_words = {0: ["space", "orbit", "nasa", "moon", "planet"]}
+    batches = []
+
+    def llm(prompt: str) -> str:
+        raise AssertionError(f"single-call LLM should not be used: {prompt}")
+
+    def llm_batch(prompts):
+        batches.append(list(prompts))
+        return ['{"rationale": "coherent", "score": 80}' for _ in prompts]
+
+    scores = compute_coherence_rating(
+        topic_words,
+        llm=llm,
+        llm_batch=llm_batch,
+        llm_batch_size=2,
+        repetitions=3,
+        seed=0,
+    )
+
+    assert scores == {0: 80.0}
+    assert [len(batch) for batch in batches] == [2, 1]
+
+
 def test_intruder_detection_with_callable_llm():
     topic_words = {
         0: ["space", "orbit", "nasa", "moon", "planet"],
@@ -86,3 +110,33 @@ def test_intruder_detection_with_callable_llm():
 
     assert set(scores) == {0, 1}
     assert all(0.0 <= score <= 1.0 for score in scores.values())
+
+
+def test_intruder_detection_with_batched_llm():
+    topic_words = {
+        0: ["space", "orbit", "nasa", "moon", "planet"],
+        1: ["car", "engine", "road", "wheel", "drive"],
+    }
+    batches = []
+
+    def llm(prompt: str) -> str:
+        raise AssertionError(f"single-call LLM should not be used: {prompt}")
+
+    def llm_batch(prompts):
+        batches.append(list(prompts))
+        responses = []
+        for prompt in prompts:
+            responses.append("car" if "car" in prompt else "space")
+        return responses
+
+    scores = compute_intruder_detection(
+        topic_words,
+        llm=llm,
+        llm_batch=llm_batch,
+        llm_batch_size=1,
+        repetitions=1,
+        seed=2,
+    )
+
+    assert set(scores) == {0, 1}
+    assert [len(batch) for batch in batches] == [1, 1]

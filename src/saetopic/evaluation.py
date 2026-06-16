@@ -24,6 +24,15 @@ from scipy.optimize import linear_sum_assignment
 
 TopicWords = Mapping[int, Sequence[str | tuple[str, float]]]
 LLMCallable = Callable[[str], str]
+LLMBatchCallable = Callable[[Sequence[str]], Sequence[str]]
+
+
+def _iter_batches(items: Sequence, batch_size: int | None):
+    if batch_size is None or batch_size <= 0:
+        yield items
+        return
+    for start in range(0, len(items), batch_size):
+        yield items[start : start + batch_size]
 
 
 def _words_only(words: Sequence[str | tuple[str, float]], top_n: int | None = None) -> list[str]:
@@ -248,6 +257,8 @@ def _normalize_answer(text: str) -> str:
 def compute_coherence_rating(
     topic_words: TopicWords,
     llm: LLMCallable,
+    llm_batch: LLMBatchCallable | None = None,
+    llm_batch_size: int | None = None,
     top_n: int = 20,
     sample_size: int = 5,
     repetitions: int = 3,
@@ -258,6 +269,7 @@ def compute_coherence_rating(
     topics = normalize_topic_words(topic_words, top_n=top_n)
     scores: dict[int, list[int]] = {}
 
+    jobs: list[tuple[int, str]] = []
     for topic_id, words in topics.items():
         if len(words) < sample_size:
             continue
@@ -265,7 +277,24 @@ def compute_coherence_rating(
         for _ in range(repetitions):
             sample = rng.sample(pool, sample_size)
             rng.shuffle(sample)
-            score = parse_coherence_score(llm(create_coherence_prompt(sample)))
+            jobs.append((topic_id, create_coherence_prompt(sample)))
+
+    if llm_batch is not None:
+        for batch in _iter_batches(jobs, llm_batch_size):
+            prompts = [prompt for _, prompt in batch]
+            responses = list(llm_batch(prompts))
+            if len(responses) != len(batch):
+                raise ValueError(
+                    "llm_batch must return exactly one response per prompt "
+                    f"(got {len(responses)} responses for {len(batch)} prompts)"
+                )
+            for (topic_id, _), response in zip(batch, responses, strict=True):
+                score = parse_coherence_score(response)
+                if score is not None:
+                    scores.setdefault(topic_id, []).append(score)
+    else:
+        for topic_id, prompt in jobs:
+            score = parse_coherence_score(llm(prompt))
             if score is not None:
                 scores.setdefault(topic_id, []).append(score)
 
@@ -275,6 +304,8 @@ def compute_coherence_rating(
 def compute_intruder_detection(
     topic_words: TopicWords,
     llm: LLMCallable,
+    llm_batch: LLMBatchCallable | None = None,
+    llm_batch_size: int | None = None,
     top_n: int = 20,
     sample_size: int = 4,
     repetitions: int = 3,
@@ -288,6 +319,7 @@ def compute_intruder_detection(
         return {}
 
     scores: dict[int, list[float]] = {}
+    jobs: list[tuple[int, str, str]] = []
     for topic_id in topic_ids:
         words = topics[topic_id]
         if len(words) < sample_size:
@@ -301,7 +333,23 @@ def compute_intruder_detection(
             sample = rng.sample(words[:top_n], sample_size)
             test_words = sample + [intruder]
             rng.shuffle(test_words)
-            predicted = _normalize_answer(llm(create_intruder_prompt(test_words)))
+            jobs.append((topic_id, intruder.lower(), create_intruder_prompt(test_words)))
+
+    if llm_batch is not None:
+        for batch in _iter_batches(jobs, llm_batch_size):
+            prompts = [prompt for _, _, prompt in batch]
+            responses = list(llm_batch(prompts))
+            if len(responses) != len(batch):
+                raise ValueError(
+                    "llm_batch must return exactly one response per prompt "
+                    f"(got {len(responses)} responses for {len(batch)} prompts)"
+                )
+            for (topic_id, intruder, _), response in zip(batch, responses, strict=True):
+                predicted = _normalize_answer(response)
+                scores.setdefault(topic_id, []).append(float(predicted == intruder))
+    else:
+        for topic_id, intruder, prompt in jobs:
+            predicted = _normalize_answer(llm(prompt))
             scores.setdefault(topic_id, []).append(float(predicted == intruder.lower()))
 
     return {topic_id: float(np.mean(values)) for topic_id, values in scores.items() if values}
@@ -316,6 +364,8 @@ def evaluate_topic_words(
     topic_words: TopicWords,
     *,
     llm: LLMCallable | None = None,
+    llm_batch: LLMBatchCallable | None = None,
+    llm_batch_size: int | None = None,
     embedding_model: str | Callable | None = None,
     word_embeddings: Mapping[str, Sequence[float]] | None = None,
     top_n: int = 20,
@@ -337,6 +387,8 @@ def evaluate_topic_words(
         cr = compute_coherence_rating(
             topic_words,
             llm=llm,
+            llm_batch=llm_batch,
+            llm_batch_size=llm_batch_size,
             top_n=top_n,
             sample_size=sample_size,
             repetitions=repetitions,
@@ -345,6 +397,8 @@ def evaluate_topic_words(
         ci = compute_intruder_detection(
             topic_words,
             llm=llm,
+            llm_batch=llm_batch,
+            llm_batch_size=llm_batch_size,
             top_n=top_n,
             sample_size=intruder_sample_size,
             repetitions=repetitions,

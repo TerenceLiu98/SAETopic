@@ -59,17 +59,24 @@ def _build_vllm_callable(model_name: str, max_model_len: int, tensor_parallel_si
         gpu_memory_utilization=0.9,
     )
 
-    def call(prompt: str) -> str:
-        formatted = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        params = SamplingParams(max_tokens=512, temperature=0.0)
-        outputs = llm.generate([formatted], params)
-        return outputs[0].outputs[0].text
+    class VLLMCallable:
+        def __call__(self, prompt: str) -> str:
+            return self.batch([prompt])[0]
 
-    return call
+        def batch(self, prompts: list[str]) -> list[str]:
+            formatted = [
+                tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                for prompt in prompts
+            ]
+            params = SamplingParams(max_tokens=512, temperature=0.0)
+            outputs = llm.generate(formatted, params)
+            return [output.outputs[0].text for output in outputs]
+
+    return VLLMCallable()
 
 
 def main() -> None:
@@ -93,6 +100,12 @@ def main() -> None:
     parser.add_argument("--llm-model", default="microsoft/phi-4")
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument(
+        "--llm-batch-size",
+        type=int,
+        default=32,
+        help="Number of CI/CR prompts sent to the LLM in each batch.",
+    )
     parser.add_argument("--top-n", type=int, default=20)
     parser.add_argument("--k", type=int, default=5, help="Words sampled for CR.")
     parser.add_argument("--n", type=int, default=4, help="Main words sampled for CI.")
@@ -144,6 +157,8 @@ def main() -> None:
                 cr = compute_coherence_rating(
                     topic_words,
                     llm=llm,
+                    llm_batch=getattr(llm, "batch", None),
+                    llm_batch_size=args.llm_batch_size,
                     top_n=args.top_n,
                     sample_size=args.k,
                     repetitions=args.r,
@@ -152,6 +167,8 @@ def main() -> None:
                 ci = compute_intruder_detection(
                     topic_words,
                     llm=llm,
+                    llm_batch=getattr(llm, "batch", None),
+                    llm_batch_size=args.llm_batch_size,
                     top_n=args.top_n,
                     sample_size=args.n,
                     repetitions=args.r,
