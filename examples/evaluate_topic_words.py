@@ -39,7 +39,16 @@ from saetopic.evaluation import (
 )
 
 
-def _build_vllm_callable(model_name: str, max_model_len: int, tensor_parallel_size: int):
+def _build_vllm_callable(
+    model_name: str,
+    max_model_len: int,
+    tensor_parallel_size: int,
+    llm_max_tokens: int,
+    gpu_memory_utilization: float,
+    max_num_seqs: int | None,
+    max_num_batched_tokens: int | None,
+    enforce_eager: bool,
+):
     try:
         from transformers import AutoTokenizer
         from vllm import LLM, SamplingParams
@@ -50,14 +59,20 @@ def _build_vllm_callable(model_name: str, max_model_len: int, tensor_parallel_si
         ) from exc
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    llm = LLM(
-        model=model_name,
-        trust_remote_code=True,
-        dtype="auto",
-        tensor_parallel_size=tensor_parallel_size,
-        max_model_len=max_model_len,
-        gpu_memory_utilization=0.9,
-    )
+    llm_kwargs = {
+        "model": model_name,
+        "trust_remote_code": True,
+        "dtype": "auto",
+        "tensor_parallel_size": tensor_parallel_size,
+        "max_model_len": max_model_len,
+        "gpu_memory_utilization": gpu_memory_utilization,
+        "enforce_eager": enforce_eager,
+    }
+    if max_num_seqs is not None:
+        llm_kwargs["max_num_seqs"] = max_num_seqs
+    if max_num_batched_tokens is not None:
+        llm_kwargs["max_num_batched_tokens"] = max_num_batched_tokens
+    llm = LLM(**llm_kwargs)
 
     class VLLMCallable:
         def __call__(self, prompt: str) -> str:
@@ -72,7 +87,7 @@ def _build_vllm_callable(model_name: str, max_model_len: int, tensor_parallel_si
                 )
                 for prompt in prompts
             ]
-            params = SamplingParams(max_tokens=512, temperature=0.0)
+            params = SamplingParams(max_tokens=llm_max_tokens, temperature=0.0)
             outputs = llm.generate(formatted, params)
             return [output.outputs[0].text for output in outputs]
 
@@ -101,6 +116,35 @@ def main() -> None:
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument(
+        "--llm-max-tokens",
+        type=int,
+        default=128,
+        help="Maximum generated tokens per CI/CR judge prompt.",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.85,
+        help="vLLM GPU memory utilization fraction.",
+    )
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=None,
+        help="Optional vLLM cap on concurrent sequences.",
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=None,
+        help="Optional vLLM cap on batched prefill/decode tokens.",
+    )
+    parser.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        help="Disable CUDA graph capture in vLLM to reduce extra memory pressure.",
+    )
+    parser.add_argument(
         "--llm-batch-size",
         type=int,
         default=32,
@@ -124,6 +168,11 @@ def main() -> None:
             model_name=args.llm_model,
             max_model_len=args.max_model_len,
             tensor_parallel_size=args.tensor_parallel_size,
+            llm_max_tokens=args.llm_max_tokens,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_num_seqs=args.max_num_seqs,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            enforce_eager=args.enforce_eager,
         )
 
     out_path = Path(args.out)
