@@ -41,6 +41,7 @@ except ImportError:
 
 from saetopic import SAETopicModel
 from saetopic.evaluation import write_top_words_file
+from saetopic.merging import preload_word_embedding_model
 
 HF_DATASET_DEFAULTS: dict[str, dict[str, Any]] = {
     "imdb": {
@@ -376,6 +377,13 @@ def main() -> None:
 
     if args.hf_dataset and len([d for d in args.datasets if d != "news20k"]) > 1:
         raise ValueError("--hf-dataset override is only safe when running one non-news20k dataset")
+
+    merge_embedding_model = (
+        None if args.merge_embedding_model.lower() == "none" else args.merge_embedding_model
+    )
+    if merge_embedding_model is not None:
+        print(f"Preloading merge word embedding model once: {merge_embedding_model}")
+        preload_word_embedding_model(merge_embedding_model)
 
     topic_counts = list(dict.fromkeys(args.n_topics))
     model = build_model(args, n_topics=topic_counts[0])

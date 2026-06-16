@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from scipy.sparse import csr_matrix
 
+from saetopic import merging
 from saetopic.interpretation import CorpusAdapter
 from saetopic.merging import TopicMerger
 
@@ -242,6 +243,40 @@ class TestTopicMerger:
         assert merger.n_topics == 10
         assert merger.method == "kmeans"
         assert not merger._is_fitted
+
+    def test_load_gensim_model_reuses_cache(self, monkeypatch, tmp_path):
+        """Repeated gensim model loads reuse the in-process keyed-vector cache."""
+        calls = 0
+        fake_model = object()
+
+        def fake_load_word2vec_format(path, binary):
+            nonlocal calls
+            calls += 1
+            assert path == str(tmp_path / "vectors.gz")
+            assert binary is True
+            return fake_model
+
+        monkeypatch.setattr(merging, "_GENSIM_MODEL_CACHE", {})
+        monkeypatch.setattr(
+            merging,
+            "_resolve_local_gensim_path",
+            lambda name: tmp_path / "vectors.gz",
+        )
+
+        from gensim.models import KeyedVectors
+
+        monkeypatch.setattr(
+            KeyedVectors,
+            "load_word2vec_format",
+            fake_load_word2vec_format,
+        )
+
+        first = merging._load_gensim_model("fake-word2vec")
+        second = merging._load_gensim_model("fake-word2vec")
+
+        assert calls == 1
+        assert first is fake_model
+        assert second is fake_model
 
     def test_fit(
         self, feature_word_matrix, feature_weights, sample_vocab

@@ -8,7 +8,9 @@ following the SAE-TM framework.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Literal
+import os
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import torch
@@ -19,6 +21,55 @@ if TYPE_CHECKING:
     import numpy.typing as npt
 
 logger = logging.getLogger(__name__)
+
+_GENSIM_MODEL_CACHE: dict[str, Any] = {}
+
+
+def _resolve_local_gensim_path(embedding_model: str) -> Path | None:
+    """Return a local gensim-data vector file path when it exists."""
+    explicit_path = Path(embedding_model).expanduser()
+    if explicit_path.exists():
+        return explicit_path
+
+    base_dir = Path(os.environ.get("GENSIM_DATA_DIR", "~/gensim-data")).expanduser()
+    model_dir = base_dir / embedding_model
+    candidates = [
+        model_dir / f"{embedding_model}.gz",
+        model_dir / embedding_model,
+        model_dir / f"{embedding_model}.bin",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _load_gensim_model(embedding_model: str):
+    """Load a gensim keyed-vector model, preferring local cache over downloader metadata."""
+    if embedding_model in _GENSIM_MODEL_CACHE:
+        return _GENSIM_MODEL_CACHE[embedding_model]
+
+    local_path = _resolve_local_gensim_path(embedding_model)
+    if local_path is not None:
+        from gensim.models import KeyedVectors
+
+        logger.info("Loading local gensim vectors from %s", local_path)
+        model = KeyedVectors.load_word2vec_format(str(local_path), binary=True)
+    else:
+        import gensim.downloader as api
+
+        logger.info(f"Loading gensim model via downloader: {embedding_model}")
+        model = api.load(embedding_model)
+
+    _GENSIM_MODEL_CACHE[embedding_model] = model
+    return model
+
+
+def preload_word_embedding_model(embedding_model: str | None) -> None:
+    """Load and cache a gensim word embedding model once for a long-running process."""
+    if embedding_model is None:
+        return
+    _load_gensim_model(embedding_model)
 
 
 def sparsify_and_renormalize(
@@ -108,25 +159,25 @@ def get_word_embeddings(
 
     if embedding_model is not None:
         try:
-            import gensim.downloader as api
-
-            logger.info(f"Loading gensim model: {embedding_model}")
-            w2v = api.load(embedding_model)
+            w2v = _load_gensim_model(embedding_model)
 
             embeddings = []
             missing = 0
+            mean_vector = None
 
             for word in vocab:
                 try:
                     embeddings.append(w2v[word])
                 except KeyError:
                     # Use mean embedding for missing words
-                    embeddings.append(w2v.get_mean_vector(w2v.key_to_index.keys()))
+                    if mean_vector is None:
+                        mean_vector = w2v.get_mean_vector(w2v.key_to_index.keys())
+                    embeddings.append(mean_vector)
                     missing += 1
 
             logger.info(f"Loaded embeddings: {missing} words missing from model")
 
-            return np.stack(embeddings)
+            return np.stack(embeddings).astype(np.float32, copy=False)
 
         except Exception as e:
             if not allow_random_fallback:
