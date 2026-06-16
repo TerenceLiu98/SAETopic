@@ -29,8 +29,10 @@ dataset:
   encode_batch_size: 128
   encode_device: auto_multi_cuda
   encode_chunk_size: 128
-  text_chunk_size: 1024
-  text_chunk_overlap: 32
+  text_split_strategy: paragraph
+  min_sentences_per_chunk: 5
+  text_chunk_size: null
+  text_chunk_overlap: 0
   normalize: true
   max_samples: null
   task: clustering
@@ -46,7 +48,7 @@ sae:
   val_fraction: 0.05
   training:
     input_dim: 768
-    expansion_factor: 32
+    expansion_factor: 64
     top_k: 32
     architecture: batch_topk
     learning_rate: 0.001

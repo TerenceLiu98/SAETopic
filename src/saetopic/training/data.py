@@ -8,6 +8,7 @@ for training sparse autoencoders.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -302,6 +303,13 @@ class StreamingEmbeddingDataset:
         before embedding. This avoids truncating long FineWiki-style articles.
     text_chunk_overlap : int, default=0
         Number of tokenizer tokens to overlap between adjacent text chunks.
+    text_split_strategy : {"token", "paragraph"}, default="token"
+        How to split text before embedding. ``"token"`` uses fixed-size
+        tokenizer chunks. ``"paragraph"`` uses blank-line-separated
+        paragraphs, matching the SAE-TM foundation-SAE preprocessing style.
+    min_sentences_per_chunk : int, default=1
+        Minimum number of sentence-like spans required for a chunk when using
+        ``text_split_strategy="paragraph"``.
     normalize : bool, default=True
         Whether to L2-normalize embeddings
     seed : int, default=42
@@ -353,6 +361,8 @@ class StreamingEmbeddingDataset:
         encode_chunk_size: int | None = None,
         text_chunk_size: int | None = None,
         text_chunk_overlap: int = 0,
+        text_split_strategy: str = "token",
+        min_sentences_per_chunk: int = 1,
         normalize: bool = True,
         seed: int = 42,
         max_samples: int | None = None,
@@ -369,6 +379,8 @@ class StreamingEmbeddingDataset:
         self.encode_chunk_size = encode_chunk_size
         self.text_chunk_size = text_chunk_size
         self.text_chunk_overlap = text_chunk_overlap
+        self.text_split_strategy = text_split_strategy
+        self.min_sentences_per_chunk = min_sentences_per_chunk
         self.normalize = normalize
         self.max_samples = max_samples
         self.skip_samples = skip_samples
@@ -380,8 +392,12 @@ class StreamingEmbeddingDataset:
 
         if self.skip_samples < 0:
             raise ValueError("skip_samples must be non-negative")
+        if self.text_split_strategy not in {"token", "paragraph"}:
+            raise ValueError("text_split_strategy must be 'token' or 'paragraph'")
         if self.text_chunk_size is not None and self.text_chunk_size <= 0:
             raise ValueError("text_chunk_size must be greater than 0")
+        if self.min_sentences_per_chunk <= 0:
+            raise ValueError("min_sentences_per_chunk must be greater than 0")
         if self.encode_chunk_size is not None and self.encode_chunk_size <= 0:
             raise ValueError("encode_chunk_size must be greater than 0")
         if self.text_chunk_overlap < 0:
@@ -453,6 +469,9 @@ class StreamingEmbeddingDataset:
         if not text:
             return []
 
+        if self.text_split_strategy == "paragraph":
+            return self._split_text_by_paragraphs(text)
+
         if self.text_chunk_size is None:
             return [text]
 
@@ -479,6 +498,30 @@ class StreamingEmbeddingDataset:
                 chunks.append(chunk)
 
         return chunks
+
+    def _split_text_by_paragraphs(self, text: str) -> list[str]:
+        """Split text into paragraph-like chunks with a sentence-count filter."""
+        paragraphs = [
+            paragraph.strip()
+            for paragraph in re.split(r"\n\s*\n+", text)
+            if paragraph.strip()
+        ]
+        if not paragraphs:
+            paragraphs = [text]
+
+        return [
+            paragraph
+            for paragraph in paragraphs
+            if self._count_sentences(paragraph) >= self.min_sentences_per_chunk
+        ]
+
+    @staticmethod
+    def _count_sentences(text: str) -> int:
+        """Count sentence-like spans without requiring external NLP resources."""
+        spans = re.findall(r"[^.!?\n]+[.!?]+", text)
+        if spans:
+            return len(spans)
+        return 1 if text.strip() else 0
 
     def _split_text_by_words(self, text: str) -> list[str]:
         """Fallback chunking when the embedder does not expose a tokenizer."""
@@ -611,6 +654,8 @@ def create_streaming_dataset(
     encode_chunk_size: int | None = None,
     text_chunk_size: int | None = None,
     text_chunk_overlap: int = 0,
+    text_split_strategy: str = "token",
+    min_sentences_per_chunk: int = 1,
     normalize: bool = True,
     seed: int = 42,
     streaming: bool = True,
@@ -653,6 +698,11 @@ def create_streaming_dataset(
         Split long documents into chunks of this many tokenizer tokens
     text_chunk_overlap : int, default=0
         Number of tokenizer tokens to overlap between adjacent chunks
+    text_split_strategy : {"token", "paragraph"}, default="token"
+        How to split text before embedding. ``"paragraph"`` uses
+        blank-line-separated paragraphs and filters by sentence count.
+    min_sentences_per_chunk : int, default=1
+        Minimum sentence-like spans per paragraph chunk.
     normalize : bool, default=True
         Whether to L2-normalize embeddings before yielding/saving them
     seed : int, default=42
@@ -727,6 +777,8 @@ def create_streaming_dataset(
         encode_chunk_size=encode_chunk_size,
         text_chunk_size=text_chunk_size,
         text_chunk_overlap=text_chunk_overlap,
+        text_split_strategy=text_split_strategy,
+        min_sentences_per_chunk=min_sentences_per_chunk,
         normalize=normalize,
         seed=seed,
         max_samples=max_samples,

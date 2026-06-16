@@ -337,6 +337,49 @@ def test_streaming_dataset_token_chunking_and_max_samples_per_iter():
     assert embedder.encoded_texts[:2] == ["a b c", "c d e"]
 
 
+def test_streaming_dataset_paragraph_chunking_filters_by_sentence_count():
+    """Test SAE-TM-style paragraph chunking with a minimum sentence filter."""
+    from saetopic.training.data import StreamingEmbeddingDataset
+
+    class MockEmbedder:
+        def __init__(self):
+            self.encoded_texts = []
+
+        def encode(self, texts, **kwargs):
+            import numpy as np
+
+            self.encoded_texts.extend(texts)
+            return np.random.randn(len(texts), 8).astype(np.float32)
+
+    class MockDataset:
+        def __iter__(self):
+            yield {
+                "text": (
+                    "Too short. Only two.\n\n"
+                    "One. Two. Three. Four. Five.\n\n"
+                    "Also enough! This is two. This is three. This is four. This is five."
+                )
+            }
+
+    embedder = MockEmbedder()
+    dataset = StreamingEmbeddingDataset(
+        MockDataset(),
+        embedder,
+        buffer_size=10,
+        embedding_batch_size=10,
+        text_split_strategy="paragraph",
+        min_sentences_per_chunk=5,
+    )
+
+    batches = list(dataset)
+
+    assert sum(batch.shape[0] for batch in batches) == 2
+    assert embedder.encoded_texts == [
+        "One. Two. Three. Four. Five.",
+        "Also enough! This is two. This is three. This is four. This is five.",
+    ]
+
+
 def test_sae_trainer_streaming_mode():
     """Test SAETrainer with streaming dataset."""
     from saetopic.sae.modules import create_sae

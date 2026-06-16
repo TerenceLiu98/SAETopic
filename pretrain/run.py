@@ -164,6 +164,8 @@ def run_embeddings(config: dict[str, Any]) -> tuple[int, int]:
         encode_chunk_size=dataset_cfg.get("encode_chunk_size"),
         text_chunk_size=dataset_cfg.get("text_chunk_size"),
         text_chunk_overlap=int(dataset_cfg.get("text_chunk_overlap", 0)),
+        text_split_strategy=dataset_cfg.get("text_split_strategy", "token"),
+        min_sentences_per_chunk=int(dataset_cfg.get("min_sentences_per_chunk", 1)),
         normalize=bool(dataset_cfg.get("normalize", True)),
         seed=get_seed(config),
         streaming=bool(dataset_cfg.get("streaming", True)),
