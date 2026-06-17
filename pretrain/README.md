@@ -125,7 +125,10 @@ PYTHONPATH=src python pretrain/run.py \
 - `chunks.sanitize_urls: true` replaces text URLs before saving chunks so Jina
   omni does not treat FineWiki links as image/video/audio/PDF inputs.
 - Embedding generation can use multiple GPUs when `dataset.encode_device` is
-  `auto_multi_cuda`. SAE training is currently single-device.
+  `auto_multi_cuda` with the SentenceTransformers backend. When
+  `embedding_model.inference_backend: vllm`, vLLM ignores `dataset.encode_device`
+  and uses `embedding_model.vllm.tensor_parallel_size` / `CUDA_VISIBLE_DEVICES`
+  instead. SAE training is currently single-device.
 - `embeddings.chunk_size` controls how many embeddings are written per shard.
   It does not control text chunk size or encoder batch size.
 - `dataset.buffer_size` controls the shuffle buffer over saved text chunks
@@ -133,8 +136,12 @@ PYTHONPATH=src python pretrain/run.py \
   chunk texts are handed to each dataset yield, while `dataset.encode_batch_size`
   is forwarded to SentenceTransformers/Jina as the internal encode batch size.
 - The example config uses `jinaai/jina-embeddings-v5-omni-nano` with
+  `embedding_model.inference_backend: vllm`,
   `model_kwargs.default_task: clustering`, `model_kwargs.modality: text`, and
-  `dataset.encode_method: document` for a FineWiki-only Jina omni SAE.
+  `dataset.encode_method: document` for a FineWiki-only Jina omni SAE. The vLLM
+  backend prepends `Document: ` for document encoding and requests
+  `PoolingParams(dimensions=embedding_model.truncate_dim)` when truncation is
+  configured.
 - If you change the embedding model, also change `embeddings.path` and
   `sae.training.output_dir` to avoid mixing old embeddings/checkpoints. If you
   change chunking settings, also change `chunks.path`, `dataset.chunks_path`,

@@ -12,6 +12,7 @@ pipeline:
 
 embedding_model:
   name: jinaai/jina-embeddings-v5-omni-nano
+  inference_backend: vllm
   trust_remote_code: true
   device: auto
   dtype: bfloat16
@@ -21,6 +22,11 @@ embedding_model:
   model_kwargs:
     default_task: clustering
     modality: text
+  vllm:
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    max_model_len: 1024
+    disable_custom_all_reduce: true
 
 dataset:
   source: chunks

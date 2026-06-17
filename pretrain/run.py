@@ -121,12 +121,193 @@ def encode_device(setting: Any) -> str | list[str] | None:
     return str(setting)
 
 
+class VLLMEmbeddingBackend:
+    """Small adapter exposing a SentenceTransformer-like embedding interface."""
+
+    def __init__(
+        self,
+        model_name: str,
+        *,
+        task: str = "clustering",
+        trust_remote_code: bool = True,
+        truncate_dim: int | None = None,
+        prompt_prefix: str = "Document: ",
+        query_prefix: str = "Query: ",
+        **llm_kwargs: Any,
+    ):
+        try:
+            from vllm import LLM, PoolingParams
+        except ImportError as exc:
+            raise ImportError(
+                "vLLM is required for embedding_model.inference_backend: vllm. "
+                "Install vllm or switch back to sentence_transformers."
+            ) from exc
+
+        self.task = task
+        self.truncate_dim = truncate_dim
+        self.prompt_prefix = prompt_prefix
+        self.query_prefix = query_prefix
+        self._pooling_params_cls = PoolingParams
+        self.llm = LLM(
+            model=model_name,
+            runner="pooling",
+            trust_remote_code=trust_remote_code,
+            **llm_kwargs,
+        )
+
+    @staticmethod
+    def _prefixed(text: str, prefix: str) -> str:
+        if text.startswith(("Document: ", "Query: ")):
+            return text
+        return f"{prefix}{text}"
+
+    @staticmethod
+    def _extract_embedding(output: Any) -> np.ndarray:
+        outputs = getattr(output, "outputs", None)
+        if outputs is None:
+            raise TypeError(f"Unexpected vLLM embedding output: {type(output)!r}")
+
+        embedding = getattr(outputs, "embedding", None)
+        if embedding is None and isinstance(outputs, list) and outputs:
+            embedding = getattr(outputs[0], "embedding", None)
+        if embedding is None and isinstance(outputs, dict):
+            embedding = outputs.get("embedding")
+        if embedding is None:
+            raise TypeError(f"Could not find embedding in vLLM output: {type(output)!r}")
+
+        return np.asarray(embedding, dtype=np.float32)
+
+    def _embed_prompts(
+        self,
+        texts: list[str],
+        *,
+        prefix: str | None = None,
+        truncate_dim: int | None = None,
+        **_: Any,
+    ) -> np.ndarray:
+        prompts = [self._prefixed(text, prefix) if prefix else text for text in texts]
+        requests = [{"prompt": prompt} for prompt in prompts]
+
+        dimensions = truncate_dim if truncate_dim is not None else self.truncate_dim
+        pooling_params = None
+        if dimensions is not None:
+            pooling_params = self._pooling_params_cls(dimensions=int(dimensions))
+
+        if pooling_params is None:
+            outputs = self.llm.embed(requests)
+        else:
+            outputs = self.llm.embed(requests, pooling_params=pooling_params)
+
+        return np.stack([self._extract_embedding(output) for output in outputs], axis=0)
+
+    def encode(
+        self,
+        texts: str | list[str],
+        *,
+        prompt_name: str | None = None,
+        truncate_dim: int | None = None,
+        **_: Any,
+    ) -> np.ndarray:
+        text_list = [texts] if isinstance(texts, str) else list(texts)
+        prefix = None
+        if prompt_name == "document":
+            prefix = self.prompt_prefix
+        elif prompt_name == "query":
+            prefix = self.query_prefix
+        return self._embed_prompts(text_list, prefix=prefix, truncate_dim=truncate_dim)
+
+    def encode_document(self, texts: str | list[str], **kwargs: Any) -> np.ndarray:
+        text_list = [texts] if isinstance(texts, str) else list(texts)
+        return self._embed_prompts(text_list, prefix=self.prompt_prefix, **kwargs)
+
+    def encode_query(self, texts: str | list[str], **kwargs: Any) -> np.ndarray:
+        text_list = [texts] if isinstance(texts, str) else list(texts)
+        return self._embed_prompts(text_list, prefix=self.query_prefix, **kwargs)
+
+
+def _vllm_tensor_parallel_size(value: Any) -> int:
+    if value in {None, "auto"}:
+        if torch.cuda.is_available():
+            return max(int(torch.cuda.device_count()), 1)
+        return 1
+    return int(value)
+
+
+def build_vllm_embedder(model_cfg: dict[str, Any]) -> VLLMEmbeddingBackend:
+    """Build a vLLM pooling embedder from ``embedding_model`` config."""
+    model_kwargs = dict(model_cfg.get("model_kwargs") or {})
+    vllm_cfg = dict(model_cfg.get("vllm") or {})
+    hf_overrides = dict(vllm_cfg.pop("hf_overrides", {}) or {})
+
+    task = str(
+        model_cfg.get("task")
+        or model_kwargs.get("default_task")
+        or hf_overrides.get("task")
+        or "clustering"
+    )
+    hf_overrides.setdefault("task", task)
+    if "modality" in model_kwargs:
+        hf_overrides.setdefault("modality", model_kwargs["modality"])
+
+    llm_kwargs: dict[str, Any] = {"hf_overrides": hf_overrides}
+    if "tensor_parallel_size" in vllm_cfg:
+        llm_kwargs["tensor_parallel_size"] = _vllm_tensor_parallel_size(
+            vllm_cfg.pop("tensor_parallel_size")
+        )
+    for key in (
+        "gpu_memory_utilization",
+        "max_model_len",
+        "max_num_seqs",
+        "enforce_eager",
+        "disable_custom_all_reduce",
+        "quantization",
+    ):
+        if key in vllm_cfg and vllm_cfg[key] is not None:
+            llm_kwargs[key] = vllm_cfg.pop(key)
+
+    dtype = model_cfg.get("dtype")
+    if "dtype" in vllm_cfg:
+        dtype = vllm_cfg.pop("dtype")
+    if dtype is not None:
+        llm_kwargs["dtype"] = str(dtype)
+    if "max_model_len" not in llm_kwargs and model_cfg.get("max_seq_length") is not None:
+        llm_kwargs["max_model_len"] = int(model_cfg["max_seq_length"])
+    llm_kwargs.update(vllm_cfg)
+
+    return VLLMEmbeddingBackend(
+        model_cfg["name"],
+        task=task,
+        trust_remote_code=bool(model_cfg.get("trust_remote_code", True)),
+        truncate_dim=(
+            None
+            if model_cfg.get("truncate_dim") is None
+            else int(model_cfg["truncate_dim"])
+        ),
+        prompt_prefix=str(model_cfg.get("document_prefix", "Document: ")),
+        query_prefix=str(model_cfg.get("query_prefix", "Query: ")),
+        **llm_kwargs,
+    )
+
+
 def build_embedder(config: dict[str, Any]):
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+    model_cfg = config["embedding_model"]
+    backend = str(
+        model_cfg.get("inference_backend")
+        or model_cfg.get("backend")
+        or "sentence_transformers"
+    ).lower()
+    if backend in {"vllm", "vllm_pooling"}:
+        return build_vllm_embedder(model_cfg)
+    if backend not in {"sentence_transformers", "sentence-transformers", "st"}:
+        raise ValueError(
+            "embedding_model.inference_backend must be "
+            "'sentence_transformers' or 'vllm'"
+        )
+
     from sentence_transformers import SentenceTransformer
 
-    model_cfg = config["embedding_model"]
     device = model_device(model_cfg.get("device"))
     dtype = torch_dtype(model_cfg.get("dtype"))
 
