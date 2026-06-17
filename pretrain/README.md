@@ -141,7 +141,9 @@ PYTHONPATH=src python pretrain/run.py \
   `dataset.encode_method: document` for a FineWiki-only Jina omni SAE. The vLLM
   backend prepends `Document: ` for document encoding and requests
   `PoolingParams(dimensions=embedding_model.truncate_dim)` when truncation is
-  configured.
+  configured. The vLLM backend only forwards `task` to `hf_overrides` by
+  default; forwarding `modality: text` can fail on vLLM versions that profile
+  multimodal pooling models with dummy image inputs during engine startup.
 - If you change the embedding model, also change `embeddings.path` and
   `sae.training.output_dir` to avoid mixing old embeddings/checkpoints. If you
   change chunking settings, also change `chunks.path`, `dataset.chunks_path`,

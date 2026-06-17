@@ -246,8 +246,6 @@ def build_vllm_embedder(model_cfg: dict[str, Any]) -> VLLMEmbeddingBackend:
         or "clustering"
     )
     hf_overrides.setdefault("task", task)
-    if "modality" in model_kwargs:
-        hf_overrides.setdefault("modality", model_kwargs["modality"])
 
     llm_kwargs: dict[str, Any] = {"hf_overrides": hf_overrides}
     if "tensor_parallel_size" in vllm_cfg:

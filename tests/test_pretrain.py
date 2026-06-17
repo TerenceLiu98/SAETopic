@@ -83,7 +83,6 @@ def test_build_embedder_vllm_backend(monkeypatch):
     assert llm_kwargs["max_model_len"] == 1024
     assert llm_kwargs["hf_overrides"] == {
         "task": "clustering",
-        "modality": "text",
     }
 
     assert embedder.llm.requests == [
