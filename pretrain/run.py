@@ -176,6 +176,7 @@ def run_embeddings(config: dict[str, Any]) -> tuple[int, int]:
         sanitize_urls=bool(dataset_cfg.get("sanitize_urls", False)),
         num_chunk_workers=int(dataset_cfg.get("num_chunk_workers", 1)),
         chunk_worker_batch_size=int(dataset_cfg.get("chunk_worker_batch_size", 1024)),
+        prefetch_buffers=int(dataset_cfg.get("prefetch_buffers", 2)),
     )
 
     return compute_and_save_embeddings(

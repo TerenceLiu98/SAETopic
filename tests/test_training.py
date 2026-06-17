@@ -964,6 +964,7 @@ def test_cli_embed_passes_streaming_and_sentence_transformer_args(monkeypatch):
         text_chunk_overlap=32,
         num_chunk_workers=4,
         chunk_worker_batch_size=512,
+        prefetch_buffers=3,
         max_seq_length=1024,
         truncate_dim=512,
         save_chunk_size=5000,
@@ -998,6 +999,7 @@ def test_cli_embed_passes_streaming_and_sentence_transformer_args(monkeypatch):
     assert captured_streaming["text_chunk_overlap"] == 32
     assert captured_streaming["num_chunk_workers"] == 4
     assert captured_streaming["chunk_worker_batch_size"] == 512
+    assert captured_streaming["prefetch_buffers"] == 3
     assert captured_streaming["normalize"] is False
     assert captured_streaming["seed"] == 123
     assert captured_streaming["max_samples"] == 1000

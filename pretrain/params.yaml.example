@@ -30,19 +30,20 @@ dataset:
   split: train
   text_column: text
   streaming: false
-  buffer_size: 200000
+  buffer_size: 32768
   embedding_batch_size: 2048
   encode_batch_size: 128
   encode_device: auto_multi_cuda
   encode_chunk_size: 128
-  num_chunk_workers: 8
+  num_chunk_workers: 48
   chunk_worker_batch_size: 4096
+  prefetch_buffers: 2
   text_split_strategy: paragraph
   min_sentences_per_chunk: 5
   text_chunk_size: null
   text_chunk_overlap: 0
   normalize: true
-  num_proc: 16
+  num_proc: 32
   max_samples: null
   task: clustering
   # For Jina omni non-retrieval tasks, the model card recommends document

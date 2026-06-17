@@ -391,6 +391,12 @@ def main() -> None:
         help="Source rows dispatched per parallel text-chunking batch",
     )
     embed_parser.add_argument(
+        "--prefetch-buffers",
+        type=int,
+        default=2,
+        help="Prepared text buffers queued ahead while GPU encoding runs",
+    )
+    embed_parser.add_argument(
         "--max-seq-length",
         type=int,
         default=512,
@@ -648,6 +654,7 @@ def compute_embeddings_from_args(args: argparse.Namespace) -> None:
         text_chunk_overlap=args.text_chunk_overlap,
         num_chunk_workers=args.num_chunk_workers,
         chunk_worker_batch_size=args.chunk_worker_batch_size,
+        prefetch_buffers=args.prefetch_buffers,
         normalize=not args.no_normalize_embeddings,
         seed=args.seed,
         max_samples=args.max_samples,

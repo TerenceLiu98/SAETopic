@@ -12,6 +12,8 @@ import re
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from queue import Full, Queue
+from threading import Event, Thread
 from typing import Any, Literal, cast
 
 import numpy as np
@@ -344,6 +346,9 @@ class StreamingEmbeddingDataset:
         Number of threads used to split source rows into text chunks.
     chunk_worker_batch_size : int, default=1024
         Source rows collected before dispatching one parallel chunking batch.
+    prefetch_buffers : int, default=2
+        Number of prepared text buffers to keep queued while the GPU encodes
+        the current buffer. This overlaps CPU chunking with embedding.
 
     Examples
     --------
@@ -396,6 +401,7 @@ class StreamingEmbeddingDataset:
         sanitize_urls: bool = False,
         num_chunk_workers: int = 1,
         chunk_worker_batch_size: int = 1024,
+        prefetch_buffers: int = 2,
     ):
         self.base_dataset = hf_dataset
         self.embedder = embedder
@@ -420,6 +426,7 @@ class StreamingEmbeddingDataset:
         self.sanitize_urls = sanitize_urls
         self.num_chunk_workers = num_chunk_workers
         self.chunk_worker_batch_size = chunk_worker_batch_size
+        self.prefetch_buffers = prefetch_buffers
         self.source_rows_seen = 0
         self.safe_resume_cursor = {
             "source_rows_seen": int(self.skip_source_rows),
@@ -440,6 +447,8 @@ class StreamingEmbeddingDataset:
             raise ValueError("num_chunk_workers must be greater than 0")
         if self.chunk_worker_batch_size <= 0:
             raise ValueError("chunk_worker_batch_size must be greater than 0")
+        if self.prefetch_buffers < 0:
+            raise ValueError("prefetch_buffers must be non-negative")
         if self.text_split_strategy not in {"token", "paragraph"}:
             raise ValueError("text_split_strategy must be 'token' or 'paragraph'")
         if self.text_chunk_size is not None and self.text_chunk_size <= 0:
@@ -713,14 +722,14 @@ class StreamingEmbeddingDataset:
             self._embedding_dim = self._get_embedding_dim()
         return self._embedding_dim
 
-    def __iter__(self):
-        """Iterate over batches of embeddings."""
+    def _iter_text_buffers(self) -> Iterator[tuple[list[str], dict[str, int]]]:
+        """Build shuffled text buffers from chunked source rows."""
         import random
 
         random.seed(self.seed)
         texts_buffer: list[str] = []
         n_samples_skipped = 0
-        n_samples_yielded = 0
+        n_samples_buffered = 0
         self.source_rows_seen = int(self.skip_source_rows)
         self.safe_resume_cursor = {
             "source_rows_seen": int(self.skip_source_rows),
@@ -728,77 +737,116 @@ class StreamingEmbeddingDataset:
         }
         buffer_safe_source_rows_seen = int(self.skip_source_rows)
         buffer_safe_chunks_seen = int(self.skip_chunk_offset)
+
+        stop_after_buffer = False
+        for source_row_index, text_chunks in self._iter_chunked_rows():
+            chunks_seen = self.skip_chunk_offset + n_samples_skipped + n_samples_buffered
+
+            if self.max_samples is not None and chunks_seen >= self.max_samples:
+                break
+
+            for text_chunk in text_chunks:
+                chunks_seen = (
+                    self.skip_chunk_offset
+                    + n_samples_skipped
+                    + n_samples_buffered
+                    + len(texts_buffer)
+                )
+
+                if self.max_samples is not None and chunks_seen >= self.max_samples:
+                    stop_after_buffer = True
+                    break
+
+                if n_samples_skipped < self.skip_samples:
+                    n_samples_skipped += 1
+                    continue
+
+                texts_buffer.append(text_chunk)
+
+            if not stop_after_buffer:
+                buffer_safe_source_rows_seen = source_row_index
+                buffer_safe_chunks_seen = (
+                    self.skip_chunk_offset
+                    + n_samples_skipped
+                    + n_samples_buffered
+                    + len(texts_buffer)
+                )
+
+            if len(texts_buffer) >= self.buffer_size:
+                random.shuffle(texts_buffer)
+                buffer = texts_buffer
+                texts_buffer = []
+                n_samples_buffered += len(buffer)
+                yield buffer, {
+                    "source_rows_seen": int(buffer_safe_source_rows_seen),
+                    "chunks_seen": int(buffer_safe_chunks_seen),
+                }
+
+            if stop_after_buffer:
+                break
+
+        if texts_buffer:
+            random.shuffle(texts_buffer)
+            yield texts_buffer, {
+                "source_rows_seen": int(buffer_safe_source_rows_seen),
+                "chunks_seen": int(buffer_safe_chunks_seen),
+            }
+
+    def _iter_prefetched_text_buffers(self) -> Iterator[tuple[list[str], dict[str, int]]]:
+        """Prefetch prepared text buffers so CPU chunking overlaps GPU encode."""
+        if self.prefetch_buffers == 0:
+            yield from self._iter_text_buffers()
+            return
+
+        stop_event = Event()
+        item_queue: Queue[Any] = Queue(maxsize=self.prefetch_buffers)
+        sentinel = object()
+
+        def put_item(item: Any) -> bool:
+            while not stop_event.is_set():
+                try:
+                    item_queue.put(item, timeout=0.1)
+                    return True
+                except Full:
+                    continue
+            return False
+
+        def produce() -> None:
+            try:
+                for item in self._iter_text_buffers():
+                    if not put_item(item):
+                        return
+            except BaseException as exc:
+                put_item(exc)
+            finally:
+                put_item(sentinel)
+
+        producer = Thread(target=produce, name="saetopic-text-buffer-producer", daemon=True)
+        producer.start()
+
+        try:
+            while True:
+                item = item_queue.get()
+                if item is sentinel:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                yield cast(tuple[list[str], dict[str, int]], item)
+        finally:
+            stop_event.set()
+            producer.join(timeout=1.0)
+
+    def __iter__(self):
+        """Iterate over batches of embeddings."""
         self._start_encode_pool()
 
         try:
-            stop_after_buffer = False
-            for source_row_index, text_chunks in self._iter_chunked_rows():
-                chunks_seen = self.skip_chunk_offset + n_samples_skipped + n_samples_yielded
-
-                if self.max_samples is not None and chunks_seen >= self.max_samples:
-                    break
-
-                for text_chunk in text_chunks:
-                    chunks_seen = (
-                        self.skip_chunk_offset
-                        + n_samples_skipped
-                        + n_samples_yielded
-                        + len(texts_buffer)
-                    )
-
-                    if self.max_samples is not None and chunks_seen >= self.max_samples:
-                        stop_after_buffer = True
-                        break
-
-                    if n_samples_skipped < self.skip_samples:
-                        n_samples_skipped += 1
-                        continue
-
-                    texts_buffer.append(text_chunk)
-
-                if not stop_after_buffer:
-                    buffer_safe_source_rows_seen = source_row_index
-                    buffer_safe_chunks_seen = (
-                        self.skip_chunk_offset
-                        + n_samples_skipped
-                        + n_samples_yielded
-                        + len(texts_buffer)
-                    )
-
-                # When buffer is full, encode and yield
-                if len(texts_buffer) >= self.buffer_size:
-                    # Shuffle buffer
-                    random.shuffle(texts_buffer)
-
-                    # Encode in batches
-                    for i in range(0, len(texts_buffer), self.embedding_batch_size):
-                        batch_texts = texts_buffer[i : i + self.embedding_batch_size]
-
-                        embeddings = self._embed_text_batch(batch_texts)
-                        n_samples_yielded += embeddings.shape[0]
-                        if i + self.embedding_batch_size >= len(texts_buffer):
-                            self.safe_resume_cursor = {
-                                "source_rows_seen": int(buffer_safe_source_rows_seen),
-                                "chunks_seen": int(buffer_safe_chunks_seen),
-                            }
-                        yield embeddings
-
-                    texts_buffer = []
-
-                if stop_after_buffer:
-                    break
-
-            # Yield remaining items
-            if texts_buffer:
+            for texts_buffer, buffer_cursor in self._iter_prefetched_text_buffers():
                 for i in range(0, len(texts_buffer), self.embedding_batch_size):
                     batch_texts = texts_buffer[i : i + self.embedding_batch_size]
                     embeddings = self._embed_text_batch(batch_texts)
-                    n_samples_yielded += embeddings.shape[0]
                     if i + self.embedding_batch_size >= len(texts_buffer):
-                        self.safe_resume_cursor = {
-                            "source_rows_seen": int(buffer_safe_source_rows_seen),
-                            "chunks_seen": int(buffer_safe_chunks_seen),
-                        }
+                        self.safe_resume_cursor = buffer_cursor
                     yield embeddings
         finally:
             self._stop_encode_pool()
@@ -832,6 +880,7 @@ def create_streaming_dataset(
     sanitize_urls: bool = False,
     num_chunk_workers: int = 1,
     chunk_worker_batch_size: int = 1024,
+    prefetch_buffers: int = 2,
     **hf_kwargs,
 ) -> StreamingEmbeddingDataset:
     """
@@ -901,6 +950,8 @@ def create_streaming_dataset(
         Number of threads used to split source rows into text chunks.
     chunk_worker_batch_size : int, default=1024
         Source rows collected before dispatching one parallel chunking batch.
+    prefetch_buffers : int, default=2
+        Number of prepared text buffers queued ahead of GPU encoding.
     **hf_kwargs
         Additional arguments for load_dataset
 
@@ -978,4 +1029,5 @@ def create_streaming_dataset(
         sanitize_urls=sanitize_urls,
         num_chunk_workers=num_chunk_workers,
         chunk_worker_batch_size=chunk_worker_batch_size,
+        prefetch_buffers=prefetch_buffers,
     )
