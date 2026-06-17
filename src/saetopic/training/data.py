@@ -13,7 +13,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from queue import Full, Queue
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import Any, Literal, cast
 
 import numpy as np
@@ -310,10 +310,12 @@ class StreamingEmbeddingDataset:
         before embedding. This avoids truncating long FineWiki-style articles.
     text_chunk_overlap : int, default=0
         Number of tokenizer tokens to overlap between adjacent text chunks.
-    text_split_strategy : {"token", "paragraph"}, default="token"
+    text_split_strategy : {"token", "paragraph", "word"}, default="token"
         How to split text before embedding. ``"token"`` uses fixed-size
         tokenizer chunks. ``"paragraph"`` uses blank-line-separated
         paragraphs, matching the SAE-TM foundation-SAE preprocessing style.
+        ``"word"`` uses whitespace chunks and avoids tokenizer work during
+        dataset preparation.
     min_sentences_per_chunk : int, default=1
         Minimum number of sentence-like spans required for a chunk when using
         ``text_split_strategy="paragraph"``.
@@ -434,6 +436,7 @@ class StreamingEmbeddingDataset:
         }
         self.source_total = self._infer_source_total()
         self._encode_pool: dict[str, Any] | None = None
+        self._tokenizer_lock = Lock()
 
         if self.skip_samples < 0:
             raise ValueError("skip_samples must be non-negative")
@@ -449,8 +452,10 @@ class StreamingEmbeddingDataset:
             raise ValueError("chunk_worker_batch_size must be greater than 0")
         if self.prefetch_buffers < 0:
             raise ValueError("prefetch_buffers must be non-negative")
-        if self.text_split_strategy not in {"token", "paragraph"}:
-            raise ValueError("text_split_strategy must be 'token' or 'paragraph'")
+        if self.text_split_strategy not in {"token", "paragraph", "word"}:
+            raise ValueError(
+                "text_split_strategy must be 'token', 'paragraph', or 'word'"
+            )
         if self.text_chunk_size is not None and self.text_chunk_size <= 0:
             raise ValueError("text_chunk_size must be greater than 0")
         if self.min_sentences_per_chunk <= 0:
@@ -534,11 +539,15 @@ class StreamingEmbeddingDataset:
         if self.text_chunk_size is None:
             return [text]
 
+        if self.text_split_strategy == "word":
+            return self._split_text_by_words(text)
+
         tokenizer = getattr(self.embedder, "tokenizer", None)
         if tokenizer is None:
             return self._split_text_by_words(text)
 
-        token_ids = tokenizer.encode(text, add_special_tokens=False)
+        with self._tokenizer_lock:
+            token_ids = tokenizer.encode(text, add_special_tokens=False)
         if len(token_ids) <= self.text_chunk_size:
             return [text]
 
@@ -548,11 +557,12 @@ class StreamingEmbeddingDataset:
             chunk_ids = token_ids[start : start + self.text_chunk_size]
             if not chunk_ids:
                 continue
-            chunk = tokenizer.decode(
-                chunk_ids,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=True,
-            ).strip()
+            with self._tokenizer_lock:
+                chunk = tokenizer.decode(
+                    chunk_ids,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=True,
+                ).strip()
             if chunk:
                 chunks.append(chunk)
 
@@ -794,7 +804,13 @@ class StreamingEmbeddingDataset:
 
     def _iter_prefetched_text_buffers(self) -> Iterator[tuple[list[str], dict[str, int]]]:
         """Prefetch prepared text buffers so CPU chunking overlaps GPU encode."""
-        if self.prefetch_buffers == 0:
+        # HF fast tokenizers cannot be safely used by chunking workers while
+        # SentenceTransformers encode tokenizes in the main thread.
+        if self.prefetch_buffers == 0 or (
+            self.text_split_strategy == "token"
+            and self.text_chunk_size is not None
+            and getattr(self.embedder, "tokenizer", None) is not None
+        ):
             yield from self._iter_text_buffers()
             return
 
@@ -917,9 +933,10 @@ def create_streaming_dataset(
         Split long documents into chunks of this many tokenizer tokens
     text_chunk_overlap : int, default=0
         Number of tokenizer tokens to overlap between adjacent chunks
-    text_split_strategy : {"token", "paragraph"}, default="token"
+    text_split_strategy : {"token", "paragraph", "word"}, default="token"
         How to split text before embedding. ``"paragraph"`` uses
         blank-line-separated paragraphs and filters by sentence count.
+        ``"word"`` uses fast whitespace chunks.
     min_sentences_per_chunk : int, default=1
         Minimum sentence-like spans per paragraph chunk.
     normalize : bool, default=True

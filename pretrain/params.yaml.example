@@ -38,9 +38,9 @@ dataset:
   num_chunk_workers: 48
   chunk_worker_batch_size: 4096
   prefetch_buffers: 2
-  text_split_strategy: paragraph
-  min_sentences_per_chunk: 5
-  text_chunk_size: null
+  text_split_strategy: word
+  min_sentences_per_chunk: 1
+  text_chunk_size: 384
   text_chunk_overlap: 0
   normalize: true
   num_proc: 32

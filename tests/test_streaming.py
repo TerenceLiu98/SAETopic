@@ -383,6 +383,40 @@ def test_streaming_dataset_token_chunking_and_max_samples_per_iter():
     assert embedder.encoded_texts[:2] == ["a b c", "c d e"]
 
 
+def test_streaming_dataset_word_chunking_avoids_tokenizer():
+    """Test fast word chunking does not need the embedder tokenizer."""
+    from saetopic.training.data import StreamingEmbeddingDataset
+
+    class MockEmbedder:
+        def __init__(self):
+            self.encoded_texts = []
+
+        def encode(self, texts, **kwargs):
+            import numpy as np
+
+            self.encoded_texts.extend(texts)
+            return np.random.randn(len(texts), 8).astype(np.float32)
+
+    class MockDataset:
+        def __iter__(self):
+            yield {"text": "a b c d e f"}
+
+    embedder = MockEmbedder()
+    dataset = StreamingEmbeddingDataset(
+        MockDataset(),
+        embedder,
+        buffer_size=10,
+        embedding_batch_size=10,
+        text_split_strategy="word",
+        text_chunk_size=3,
+        text_chunk_overlap=1,
+    )
+
+    list(dataset)
+
+    assert embedder.encoded_texts == ["a b c", "c d e", "e f"]
+
+
 def test_streaming_dataset_paragraph_chunking_filters_by_sentence_count():
     """Test SAE-TM-style paragraph chunking with a minimum sentence filter."""
     from saetopic.training.data import StreamingEmbeddingDataset
