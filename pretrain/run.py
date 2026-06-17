@@ -237,6 +237,8 @@ def build_vllm_embedder(model_cfg: dict[str, Any]) -> VLLMEmbeddingBackend:
     """Build a vLLM pooling embedder from ``embedding_model`` config."""
     model_kwargs = dict(model_cfg.get("model_kwargs") or {})
     vllm_cfg = dict(model_cfg.get("vllm") or {})
+    vllm_cfg.setdefault("language_model_only", True)
+    vllm_cfg.setdefault("skip_mm_profiling", True)
     hf_overrides = dict(vllm_cfg.pop("hf_overrides", {}) or {})
 
     task = str(

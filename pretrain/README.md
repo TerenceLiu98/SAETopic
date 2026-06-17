@@ -144,6 +144,10 @@ PYTHONPATH=src python pretrain/run.py \
   configured. The vLLM backend only forwards `task` to `hf_overrides` by
   default; forwarding `modality: text` can fail on vLLM versions that profile
   multimodal pooling models with dummy image inputs during engine startup.
+  `embedding_model.vllm.language_model_only: true` and
+  `embedding_model.vllm.skip_mm_profiling: true` are enabled by default for
+  text-only pretraining so vLLM does not reserve/profile image, video, or audio
+  inputs.
 - If you change the embedding model, also change `embeddings.path` and
   `sae.training.output_dir` to avoid mixing old embeddings/checkpoints. If you
   change chunking settings, also change `chunks.path`, `dataset.chunks_path`,

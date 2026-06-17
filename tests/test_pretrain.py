@@ -79,6 +79,8 @@ def test_build_embedder_vllm_backend(monkeypatch):
     assert llm_kwargs["tensor_parallel_size"] == 1
     assert llm_kwargs["gpu_memory_utilization"] == 0.8
     assert llm_kwargs["disable_custom_all_reduce"] is True
+    assert llm_kwargs["language_model_only"] is True
+    assert llm_kwargs["skip_mm_profiling"] is True
     assert llm_kwargs["dtype"] == "bfloat16"
     assert llm_kwargs["max_model_len"] == 1024
     assert llm_kwargs["hf_overrides"] == {

@@ -23,6 +23,8 @@ embedding_model:
     default_task: clustering
     modality: text
   vllm:
+    language_model_only: true
+    skip_mm_profiling: true
     tensor_parallel_size: 1
     gpu_memory_utilization: 0.9
     max_model_len: 1024
