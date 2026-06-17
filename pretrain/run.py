@@ -13,6 +13,7 @@ import gc
 import json
 import os
 import re
+import shutil
 import time
 from dataclasses import fields
 from pathlib import Path
@@ -49,11 +50,17 @@ from saetopic.evaluation import (
     write_top_words_file,
 )
 from saetopic.merging import preload_word_embedding_model
-from saetopic.training import compute_and_save_embeddings, create_streaming_dataset, train_sae
+from saetopic.training import (
+    StreamingEmbeddingDataset,
+    compute_and_save_embeddings,
+    create_streaming_dataset,
+    train_sae,
+)
 from saetopic.training.data import EmbeddingDataset
 from saetopic.training.train_sae import TrainingConfig
 
 console = Console()
+TEXT_URL_PATTERN = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -149,38 +156,277 @@ def build_embedder(config: dict[str, Any]):
     return embedder
 
 
+def split_text_by_words(text: str, chunk_size: int | None, overlap: int) -> list[str]:
+    """Split text into whitespace-word chunks for the offline chunk stage."""
+    text = text.strip()
+    if not text:
+        return []
+    if chunk_size is None:
+        return [text]
+
+    words = text.split()
+    if len(words) <= chunk_size:
+        return [text]
+
+    chunks = []
+    step = chunk_size - overlap
+    for start in range(0, len(words), step):
+        chunk = " ".join(words[start : start + chunk_size]).strip()
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+
+def split_text_by_paragraphs(text: str, min_sentences: int) -> list[str]:
+    """Split text into paragraph chunks with a sentence-count filter."""
+    text = text.strip()
+    if not text:
+        return []
+
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"\n\s*\n+", text)
+        if paragraph.strip()
+    ]
+    if not paragraphs:
+        paragraphs = [text]
+
+    return [
+        paragraph
+        for paragraph in paragraphs
+        if count_sentences(paragraph) >= min_sentences
+    ]
+
+
+def count_sentences(text: str) -> int:
+    """Count sentence-like spans without external NLP resources."""
+    spans = re.findall(r"[^.!?\n]+[.!?]+", text)
+    if spans:
+        return len(spans)
+    return 1 if text.strip() else 0
+
+
+def run_chunks(config: dict[str, Any]) -> tuple[int, Path]:
+    """Create a flat, saved-to-disk text chunk dataset from the configured source."""
+    try:
+        from datasets import load_dataset, load_from_disk
+    except ImportError as exc:
+        raise ImportError(
+            "datasets package is required for the chunks stage. "
+            "Install with the training extras."
+        ) from exc
+
+    dataset_cfg = config["dataset"]
+    chunks_cfg = config.get("chunks", {})
+    chunks_path = resolve_path(chunks_cfg.get("path"))
+    if chunks_path is None:
+        raise ValueError("chunks.path is required for the chunks stage")
+
+    if chunks_path.exists():
+        try:
+            chunk_dataset = load_from_disk(str(chunks_path))
+        except Exception as exc:
+            if not bool(chunks_cfg.get("overwrite", False)):
+                raise ValueError(
+                    f"chunks.path exists but is not a readable saved dataset: {chunks_path}. "
+                    "Set chunks.overwrite: true to rebuild it."
+                ) from exc
+        else:
+            if bool(chunks_cfg.get("resume", True)) and not bool(
+                chunks_cfg.get("overwrite", False)
+            ):
+                console.print(
+                    f"Found existing chunk dataset at {chunks_path}: "
+                    f"{len(chunk_dataset):,} chunks"
+                )
+                return int(len(chunk_dataset)), chunks_path
+
+    temp_path = chunks_path.with_name(f"{chunks_path.name}.building")
+    if temp_path.exists():
+        if not bool(chunks_cfg.get("overwrite", False)):
+            raise ValueError(
+                f"Temporary chunk build directory exists: {temp_path}. "
+                "Remove it or set chunks.overwrite: true."
+            )
+        shutil.rmtree(temp_path)
+    if chunks_path.exists() and bool(chunks_cfg.get("overwrite", False)):
+        shutil.rmtree(chunks_path)
+
+    strategy = str(chunks_cfg.get("strategy", dataset_cfg.get("text_split_strategy", "word")))
+    if strategy not in {"word", "paragraph"}:
+        raise ValueError(
+            "chunks.strategy currently supports 'word' or 'paragraph'. "
+            "Use word for fast FineWiki preprocessing."
+        )
+
+    text_column = chunks_cfg.get("text_column", dataset_cfg.get("text_column", "text"))
+    chunk_size = chunks_cfg.get("chunk_size", dataset_cfg.get("text_chunk_size", 384))
+    chunk_size = None if chunk_size is None else int(chunk_size)
+    overlap = int(chunks_cfg.get("chunk_overlap", dataset_cfg.get("text_chunk_overlap", 0)))
+    min_words = int(chunks_cfg.get("min_words", 1))
+    min_sentences = int(
+        chunks_cfg.get(
+            "min_sentences_per_chunk",
+            dataset_cfg.get("min_sentences_per_chunk", 1),
+        )
+    )
+    sanitize_urls = bool(chunks_cfg.get("sanitize_urls", dataset_cfg.get("sanitize_urls", True)))
+    num_proc = chunks_cfg.get("num_proc", dataset_cfg.get("num_proc", 16))
+    map_batch_size = int(chunks_cfg.get("map_batch_size", 1000))
+    max_source_rows = chunks_cfg.get("max_source_rows")
+
+    load_args = [dataset_cfg["name"]]
+    if dataset_cfg.get("subset") is not None:
+        load_args.append(dataset_cfg.get("subset"))
+    load_kwargs = {
+        "split": dataset_cfg.get("split", "train"),
+        "streaming": False,
+    }
+    if num_proc is not None:
+        load_kwargs["num_proc"] = int(num_proc)
+
+    console.print(
+        f"Loading source dataset {dataset_cfg['name']} for chunking "
+        f"with strategy={strategy}"
+    )
+    source_dataset = load_dataset(*load_args, **load_kwargs)
+    if max_source_rows is not None:
+        source_dataset = source_dataset.select(range(min(int(max_source_rows), len(source_dataset))))
+
+    remove_columns = list(source_dataset.column_names)
+
+    def chunk_batch(batch: dict[str, list[Any]], indices: list[int]) -> dict[str, list[Any]]:
+        out_source_row: list[int] = []
+        out_chunk_index: list[int] = []
+        out_text: list[str] = []
+        out_n_words: list[int] = []
+
+        for row_index, raw_text in zip(indices, batch[text_column]):
+            text = "" if raw_text is None else str(raw_text)
+            if sanitize_urls:
+                text = TEXT_URL_PATTERN.sub("[URL]", text)
+
+            if strategy == "paragraph":
+                chunks = split_text_by_paragraphs(text, min_sentences=min_sentences)
+            else:
+                chunks = split_text_by_words(text, chunk_size=chunk_size, overlap=overlap)
+
+            for chunk_index, chunk in enumerate(chunks):
+                n_words = len(chunk.split())
+                if n_words < min_words:
+                    continue
+                out_source_row.append(int(row_index))
+                out_chunk_index.append(int(chunk_index))
+                out_text.append(chunk)
+                out_n_words.append(int(n_words))
+
+        return {
+            "source_row": out_source_row,
+            "chunk_index": out_chunk_index,
+            "text": out_text,
+            "n_words": out_n_words,
+        }
+
+    console.print(f"Writing chunk dataset to {chunks_path}")
+    chunk_dataset = source_dataset.map(
+        chunk_batch,
+        batched=True,
+        batch_size=map_batch_size,
+        with_indices=True,
+        num_proc=None if num_proc is None else int(num_proc),
+        remove_columns=remove_columns,
+        desc="Chunking FineWiki",
+    )
+    temp_path.parent.mkdir(parents=True, exist_ok=True)
+    chunk_dataset.save_to_disk(str(temp_path), num_proc=None if num_proc is None else int(num_proc))
+
+    manifest = {
+        "format": "saetopic.text_chunks.v1",
+        "source_dataset": dataset_cfg["name"],
+        "subset": dataset_cfg.get("subset"),
+        "split": dataset_cfg.get("split", "train"),
+        "text_column": text_column,
+        "strategy": strategy,
+        "chunk_size": chunk_size,
+        "chunk_overlap": overlap,
+        "min_words": min_words,
+        "min_sentences_per_chunk": min_sentences,
+        "sanitize_urls": sanitize_urls,
+        "n_chunks": int(len(chunk_dataset)),
+    }
+    (temp_path / "chunk_manifest.json").write_text(json.dumps(manifest, indent=2))
+    temp_path.replace(chunks_path)
+
+    console.print(f"Saved {len(chunk_dataset):,} text chunks to {chunks_path}")
+    return int(len(chunk_dataset)), chunks_path
+
+
 def run_embeddings(config: dict[str, Any]) -> tuple[int, int]:
     dataset_cfg = config["dataset"]
     embedding_cfg = config["embeddings"]
 
     embedder = build_embedder(config)
-    dataset = create_streaming_dataset(
-        dataset_name=dataset_cfg["name"],
-        subset=dataset_cfg.get("subset"),
-        split=dataset_cfg.get("split", "train"),
-        text_column=dataset_cfg.get("text_column", "text"),
-        embedder=embedder,
-        buffer_size=int(dataset_cfg.get("buffer_size", 10000)),
-        embedding_batch_size=int(dataset_cfg.get("embedding_batch_size", 256)),
-        encode_batch_size=int(dataset_cfg.get("encode_batch_size", 32)),
-        encode_device=encode_device(dataset_cfg.get("encode_device")),
-        encode_chunk_size=dataset_cfg.get("encode_chunk_size"),
-        text_chunk_size=dataset_cfg.get("text_chunk_size"),
-        text_chunk_overlap=int(dataset_cfg.get("text_chunk_overlap", 0)),
-        text_split_strategy=dataset_cfg.get("text_split_strategy", "token"),
-        min_sentences_per_chunk=int(dataset_cfg.get("min_sentences_per_chunk", 1)),
-        normalize=bool(dataset_cfg.get("normalize", True)),
-        seed=get_seed(config),
-        streaming=bool(dataset_cfg.get("streaming", True)),
-        num_proc=dataset_cfg.get("num_proc", 16),
-        max_samples=dataset_cfg.get("max_samples"),
-        task=dataset_cfg.get("task", "clustering"),
-        encode_method=dataset_cfg.get("encode_method", "encode"),
-        sanitize_urls=bool(dataset_cfg.get("sanitize_urls", False)),
-        num_chunk_workers=int(dataset_cfg.get("num_chunk_workers", 1)),
-        chunk_worker_batch_size=int(dataset_cfg.get("chunk_worker_batch_size", 1024)),
-        prefetch_buffers=int(dataset_cfg.get("prefetch_buffers", 2)),
-    )
+    if dataset_cfg.get("source") == "chunks":
+        try:
+            from datasets import load_from_disk
+        except ImportError as exc:
+            raise ImportError(
+                "datasets package is required to load precomputed chunks."
+            ) from exc
+
+        chunks_cfg = config.get("chunks", {})
+        chunks_path = resolve_path(dataset_cfg.get("chunks_path") or chunks_cfg.get("path"))
+        if chunks_path is None:
+            raise ValueError("dataset.chunks_path or chunks.path is required")
+        chunk_dataset = load_from_disk(str(chunks_path))
+        dataset = StreamingEmbeddingDataset(
+            chunk_dataset,
+            embedder,
+            text_column=dataset_cfg.get("text_column", "text"),
+            buffer_size=int(dataset_cfg.get("buffer_size", 10000)),
+            embedding_batch_size=int(dataset_cfg.get("embedding_batch_size", 256)),
+            encode_batch_size=int(dataset_cfg.get("encode_batch_size", 32)),
+            encode_device=encode_device(dataset_cfg.get("encode_device")),
+            encode_chunk_size=dataset_cfg.get("encode_chunk_size"),
+            text_chunk_size=None,
+            text_split_strategy="word",
+            normalize=bool(dataset_cfg.get("normalize", True)),
+            seed=get_seed(config),
+            max_samples=dataset_cfg.get("max_samples"),
+            task=dataset_cfg.get("task", "clustering"),
+            encode_method=dataset_cfg.get("encode_method", "encode"),
+            sanitize_urls=bool(dataset_cfg.get("sanitize_urls", False)),
+            num_chunk_workers=1,
+            prefetch_buffers=int(dataset_cfg.get("prefetch_buffers", 2)),
+        )
+    else:
+        dataset = create_streaming_dataset(
+            dataset_name=dataset_cfg["name"],
+            subset=dataset_cfg.get("subset"),
+            split=dataset_cfg.get("split", "train"),
+            text_column=dataset_cfg.get("text_column", "text"),
+            embedder=embedder,
+            buffer_size=int(dataset_cfg.get("buffer_size", 10000)),
+            embedding_batch_size=int(dataset_cfg.get("embedding_batch_size", 256)),
+            encode_batch_size=int(dataset_cfg.get("encode_batch_size", 32)),
+            encode_device=encode_device(dataset_cfg.get("encode_device")),
+            encode_chunk_size=dataset_cfg.get("encode_chunk_size"),
+            text_chunk_size=dataset_cfg.get("text_chunk_size"),
+            text_chunk_overlap=int(dataset_cfg.get("text_chunk_overlap", 0)),
+            text_split_strategy=dataset_cfg.get("text_split_strategy", "token"),
+            min_sentences_per_chunk=int(dataset_cfg.get("min_sentences_per_chunk", 1)),
+            normalize=bool(dataset_cfg.get("normalize", True)),
+            seed=get_seed(config),
+            streaming=bool(dataset_cfg.get("streaming", True)),
+            num_proc=dataset_cfg.get("num_proc", 16),
+            max_samples=dataset_cfg.get("max_samples"),
+            task=dataset_cfg.get("task", "clustering"),
+            encode_method=dataset_cfg.get("encode_method", "encode"),
+            sanitize_urls=bool(dataset_cfg.get("sanitize_urls", False)),
+            num_chunk_workers=int(dataset_cfg.get("num_chunk_workers", 1)),
+            chunk_worker_batch_size=int(dataset_cfg.get("chunk_worker_batch_size", 1024)),
+            prefetch_buffers=int(dataset_cfg.get("prefetch_buffers", 2)),
+        )
 
     return compute_and_save_embeddings(
         dataset=dataset,
@@ -788,7 +1034,10 @@ def run_evaluate(config: dict[str, Any]) -> None:
 
 
 def run_stage(stage: str, config: dict[str, Any]) -> None:
-    if stage == "embeddings":
+    if stage == "chunks":
+        n_chunks, chunks_path = run_chunks(config)
+        console.print(f"Saved {n_chunks:,} text chunks to {chunks_path}")
+    elif stage == "embeddings":
         n_embeddings, embedding_dim = run_embeddings(config)
         console.print(f"Saved {n_embeddings:,} embeddings of dimension {embedding_dim}")
     elif stage == "train_sae":
@@ -808,7 +1057,7 @@ def main(default_stages: list[str] | None = None) -> None:
         "--stages",
         nargs="+",
         default=None,
-        help="Stages to run: embeddings train_sae topics evaluate. Defaults to pipeline.stages.",
+        help="Stages to run: chunks embeddings train_sae topics evaluate. Defaults to pipeline.stages.",
     )
     args = parser.parse_args()
 

@@ -4,27 +4,27 @@ project:
 
 pipeline:
   stages:
+    - chunks
     - embeddings
     - train_sae
     - topics
     - evaluate
 
 embedding_model:
-  name: jinaai/jina-embeddings-v5-text-small
+  name: jinaai/jina-embeddings-v5-omni-nano
   trust_remote_code: true
   device: auto
   dtype: bfloat16
   truncate_dim: 768
   max_seq_length: 1024
   attn_implementation: null
-  model_kwargs: {}
-  # For a FineWiki-only Jina omni SAE, set name to
-  # jinaai/jina-embeddings-v5-omni-nano and replace model_kwargs with:
-  # model_kwargs:
-  #   default_task: clustering
-  #   modality: text
+  model_kwargs:
+    default_task: clustering
+    modality: text
 
 dataset:
+  source: chunks
+  chunks_path: /home/jovyan/helloworld-datavol-1/SAETopic/chunks/finewiki_word384
   name: HuggingFaceFW/finewiki
   subset: en
   split: train
@@ -49,11 +49,24 @@ dataset:
   # For Jina omni non-retrieval tasks, the model card recommends document
   # encoding; sanitize_urls prevents FineWiki text links from being treated as
   # image/video/audio/PDF inputs.
-  encode_method: encode
+  encode_method: document
   sanitize_urls: false
 
+chunks:
+  path: /home/jovyan/helloworld-datavol-1/SAETopic/chunks/finewiki_word384
+  strategy: word
+  chunk_size: 384
+  chunk_overlap: 0
+  min_words: 64
+  sanitize_urls: true
+  num_proc: 64
+  map_batch_size: 2000
+  resume: true
+  overwrite: false
+  max_source_rows: null
+
 embeddings:
-  path: /home/jovyan/helloworld-datavol-1/SAETopic/embeddings/finewiki_embeddings
+  path: /home/jovyan/helloworld-datavol-1/SAETopic/embeddings/finewiki_word384_omni_embeddings
   chunk_size: 50000
   resume: true
 
