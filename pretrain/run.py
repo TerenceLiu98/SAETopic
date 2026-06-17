@@ -209,12 +209,14 @@ def count_sentences(text: str) -> int:
 def run_chunks(config: dict[str, Any]) -> tuple[int, Path]:
     """Create a flat, saved-to-disk text chunk dataset from the configured source."""
     try:
-        from datasets import load_dataset, load_from_disk
+        from datasets import disable_progress_bar, load_dataset, load_from_disk
     except ImportError as exc:
         raise ImportError(
             "datasets package is required for the chunks stage. "
             "Install with the training extras."
         ) from exc
+
+    disable_progress_bar()
 
     dataset_cfg = config["dataset"]
     chunks_cfg = config.get("chunks", {})
@@ -327,18 +329,33 @@ def run_chunks(config: dict[str, Any]) -> tuple[int, Path]:
             "n_words": out_n_words,
         }
 
-    console.print(f"Writing chunk dataset to {chunks_path}")
-    chunk_dataset = source_dataset.map(
-        chunk_batch,
-        batched=True,
-        batch_size=map_batch_size,
-        with_indices=True,
-        num_proc=None if num_proc is None else int(num_proc),
-        remove_columns=remove_columns,
-        desc="Chunking FineWiki",
-    )
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        progress.add_task("[cyan]Chunking FineWiki", total=None)
+        chunk_dataset = source_dataset.map(
+            chunk_batch,
+            batched=True,
+            batch_size=map_batch_size,
+            with_indices=True,
+            num_proc=None if num_proc is None else int(num_proc),
+            remove_columns=remove_columns,
+        )
     temp_path.parent.mkdir(parents=True, exist_ok=True)
-    chunk_dataset.save_to_disk(str(temp_path), num_proc=None if num_proc is None else int(num_proc))
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        progress.add_task("[cyan]Saving chunk dataset", total=None)
+        chunk_dataset.save_to_disk(
+            str(temp_path),
+            num_proc=None if num_proc is None else int(num_proc),
+        )
 
     manifest = {
         "format": "saetopic.text_chunks.v1",

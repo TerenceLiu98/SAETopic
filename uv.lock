@@ -615,7 +615,6 @@ dependencies = [
     { name = "pyarrow" },
     { name = "pyyaml" },
     { name = "requests" },
-    { name = "tqdm" },
     { name = "xxhash" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/d9/85/ce4f780c32f7e36d71257f1c27e8ba898ebe379cb54f211f5f2013f2c219/datasets-5.0.0.tar.gz", hash = "sha256:83dbbbdb07a33b82192b8c419deb18739b138ee2ce1a322d55ce6b100954ec1a", size = 631708, upload-time = "2026-06-05T13:18:26.124Z" }
@@ -904,7 +903,6 @@ dependencies = [
     { name = "httpx" },
     { name = "packaging" },
     { name = "pyyaml" },
-    { name = "tqdm" },
     { name = "typer" },
     { name = "typing-extensions" },
 ]
@@ -1430,7 +1428,6 @@ dependencies = [
     { name = "click" },
     { name = "joblib" },
     { name = "regex" },
-    { name = "tqdm" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/74/a1/b3b4adf15585a5bc4c357adde150c01ebeeb642173ded4d871e89468767c/nltk-3.9.4.tar.gz", hash = "sha256:ed03bc098a40481310320808b2db712d95d13ca65b27372f8a403949c8b523d0", size = 2946864, upload-time = "2026-03-24T06:13:40.641Z" }
 wheels = [
@@ -2827,7 +2824,6 @@ dependencies = [
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "torch" },
-    { name = "tqdm" },
     { name = "transformers" },
     { name = "typing-extensions" },
 ]
@@ -3034,18 +3030,6 @@ wheels = [
 ]
 
 [[package]]
-name = "tqdm"
-version = "4.68.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/85/05/0d5260f1f1ca784f4a4a0def9cbe6affe587f5b4025328d446c3d67765f4/tqdm-4.68.2.tar.gz", hash = "sha256:89c230e8dbc67c7615c142487111222f878c77427ea09549960f62389e258add", size = 171923, upload-time = "2026-06-09T13:26:42.539Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/eb/75/1a0392bcc21c44dcdf87b3cf2d137e7829be2c083a1e38d44efca3d57a16/tqdm-4.68.2-py3-none-any.whl", hash = "sha256:d4240441fb5353290b87d6a85968c9decc131a99b8c7faa28269d829de669ede", size = 78578, upload-time = "2026-06-09T13:26:40.731Z" },
-]
-
-[[package]]
 name = "transformers"
 version = "5.11.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3058,7 +3042,6 @@ dependencies = [
     { name = "regex" },
     { name = "safetensors" },
     { name = "tokenizers" },
-    { name = "tqdm" },
     { name = "typer" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/7d/4a/2ee05f9a06bb2dd34cac951548553738a826762fb7adfa7ce256daeaeac8/transformers-5.11.0.tar.gz", hash = "sha256:1dbecade5b8a09bdf3e9e8fdfc9d312cb9eccf5a201080dc894b373f0f3eb5f4", size = 8874363, upload-time = "2026-06-10T16:31:52.441Z" }

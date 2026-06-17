@@ -203,7 +203,7 @@ texts = [
     # ... more documents
 ]
 
-# Compute embeddings with Rich progress instead of SentenceTransformers' tqdm bar.
+# Compute embeddings with Rich progress instead of SentenceTransformers' built-in bar.
 embedding_batches = []
 encode_batch_size = 32
 with Progress(
