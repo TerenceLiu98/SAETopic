@@ -172,6 +172,8 @@ def run_embeddings(config: dict[str, Any]) -> tuple[int, int]:
         num_proc=dataset_cfg.get("num_proc", 16),
         max_samples=dataset_cfg.get("max_samples"),
         task=dataset_cfg.get("task", "clustering"),
+        encode_method=dataset_cfg.get("encode_method", "encode"),
+        sanitize_urls=bool(dataset_cfg.get("sanitize_urls", False)),
     )
 
     return compute_and_save_embeddings(

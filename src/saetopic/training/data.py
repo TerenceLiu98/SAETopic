@@ -19,6 +19,9 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 
+_TEXT_URL_PATTERN = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
+
+
 class EmbeddingDataset(Dataset):
     """
     PyTorch Dataset for pre-computed embeddings.
@@ -322,6 +325,14 @@ class StreamingEmbeddingDataset:
     task : str, default="clustering"
         Task type for Jina embeddings (e.g., "clustering", "retrieval")
         Passed to embedder.encode() as task parameter
+    encode_method : {"encode", "document", "query"}, default="encode"
+        SentenceTransformer method to use for text inputs. Use ``"document"``
+        with Jina v5 omni non-retrieval tasks so the model applies its
+        document prompt instead of treating bare text as off-distribution.
+    sanitize_urls : bool, default=False
+        Replace URLs in text chunks with ``"[URL]"`` before encoding. This is
+        useful for text-only corpora with Jina omni models because bare URLs
+        are valid media inputs and may be downloaded by the model.
 
     Examples
     --------
@@ -368,6 +379,8 @@ class StreamingEmbeddingDataset:
         max_samples: int | None = None,
         skip_samples: int = 0,
         task: str = "clustering",
+        encode_method: str = "encode",
+        sanitize_urls: bool = False,
     ):
         self.base_dataset = hf_dataset
         self.embedder = embedder
@@ -386,12 +399,16 @@ class StreamingEmbeddingDataset:
         self.skip_samples = skip_samples
         self.seed = seed
         self.task = task
+        self.encode_method = encode_method
+        self.sanitize_urls = sanitize_urls
         self.source_rows_seen = 0
         self.source_total = self._infer_source_total()
         self._encode_pool: dict[str, Any] | None = None
 
         if self.skip_samples < 0:
             raise ValueError("skip_samples must be non-negative")
+        if self.encode_method not in {"encode", "document", "query"}:
+            raise ValueError("encode_method must be 'encode', 'document', or 'query'")
         if self.text_split_strategy not in {"token", "paragraph"}:
             raise ValueError("text_split_strategy must be 'token' or 'paragraph'")
         if self.text_chunk_size is not None and self.text_chunk_size <= 0:
@@ -468,6 +485,8 @@ class StreamingEmbeddingDataset:
         text = text.strip()
         if not text:
             return []
+        if self.sanitize_urls:
+            text = _TEXT_URL_PATTERN.sub("[URL]", text)
 
         if self.text_split_strategy == "paragraph":
             return self._split_text_by_paragraphs(text)
@@ -544,7 +563,6 @@ class StreamingEmbeddingDataset:
         """Encode texts with the configured SentenceTransformers options."""
         encode_kwargs = {
             "batch_size": self.encode_batch_size,
-            "task": self.task,
             "show_progress_bar": False,
         }
         if self._encode_pool is not None:
@@ -554,6 +572,25 @@ class StreamingEmbeddingDataset:
         if self.encode_chunk_size is not None:
             encode_kwargs["chunk_size"] = self.encode_chunk_size
 
+        if self.encode_method == "document":
+            encode_document = getattr(self.embedder, "encode_document", None)
+            if callable(encode_document):
+                return cast(np.ndarray, encode_document(texts, **encode_kwargs))
+            return cast(
+                np.ndarray,
+                self.embedder.encode(texts, prompt_name="document", **encode_kwargs),
+            )
+
+        if self.encode_method == "query":
+            encode_query = getattr(self.embedder, "encode_query", None)
+            if callable(encode_query):
+                return cast(np.ndarray, encode_query(texts, **encode_kwargs))
+            return cast(
+                np.ndarray,
+                self.embedder.encode(texts, prompt_name="query", **encode_kwargs),
+            )
+
+        encode_kwargs["task"] = self.task
         return cast(np.ndarray, self.embedder.encode(texts, **encode_kwargs))
 
     def _embed_text_batch(self, texts: list[str]) -> Tensor:
@@ -663,6 +700,8 @@ def create_streaming_dataset(
     max_samples: int | None = None,
     skip_samples: int = 0,
     task: str = "clustering",
+    encode_method: str = "encode",
+    sanitize_urls: bool = False,
     **hf_kwargs,
 ) -> StreamingEmbeddingDataset:
     """
@@ -720,6 +759,10 @@ def create_streaming_dataset(
         Number of text chunks to skip before encoding
     task : str, default="clustering"
         Task type for Jina embeddings (e.g., "clustering", "retrieval")
+    encode_method : {"encode", "document", "query"}, default="encode"
+        SentenceTransformer method to use for text inputs.
+    sanitize_urls : bool, default=False
+        Replace URLs in text chunks with ``"[URL]"`` before encoding.
     **hf_kwargs
         Additional arguments for load_dataset
 
@@ -791,4 +834,6 @@ def create_streaming_dataset(
         max_samples=max_samples,
         skip_samples=skip_samples,
         task=task,
+        encode_method=encode_method,
+        sanitize_urls=sanitize_urls,
     )

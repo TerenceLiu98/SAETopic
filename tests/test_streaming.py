@@ -200,6 +200,40 @@ def test_streaming_dataset_passes_encode_device_and_task():
     assert embedder.calls[0]["task"] == "clustering"
 
 
+def test_streaming_dataset_document_encode_method_uses_encode_document():
+    """Test document mode uses encode_document without the legacy task kwarg."""
+    from saetopic.training.data import StreamingEmbeddingDataset
+
+    class MockEmbedder:
+        def __init__(self):
+            self.calls = []
+
+        def encode_document(self, texts, **kwargs):
+            import numpy as np
+
+            self.calls.append({"texts": list(texts), "kwargs": dict(kwargs)})
+            return np.ones((len(texts), 8), dtype=np.float32)
+
+    class MockDataset:
+        def __iter__(self):
+            yield {"text": "Document text"}
+
+    embedder = MockEmbedder()
+    dataset = StreamingEmbeddingDataset(
+        MockDataset(),
+        embedder,
+        buffer_size=10,
+        embedding_batch_size=10,
+        encode_method="document",
+        task="clustering",
+    )
+
+    list(dataset)
+
+    assert embedder.calls[0]["texts"] == ["Document text"]
+    assert "task" not in embedder.calls[0]["kwargs"]
+
+
 def test_streaming_dataset_reuses_encode_pool_for_multi_device_embedder():
     """Test multi-device SentenceTransformers-style encoding uses one pool."""
     from saetopic.training.data import StreamingEmbeddingDataset
@@ -389,6 +423,45 @@ def test_streaming_dataset_paragraph_chunking_filters_by_sentence_count():
     assert embedder.encoded_texts == [
         "One. Two. Three. Four. Five.",
         "Also enough! This is two. This is three. This is four. This is five.",
+    ]
+
+
+def test_streaming_dataset_sanitizes_urls_before_encoding():
+    """Test text URL cleanup prevents bare URLs from reaching text embedders."""
+    from saetopic.training.data import StreamingEmbeddingDataset
+
+    class MockEmbedder:
+        def __init__(self):
+            self.encoded_texts = []
+
+        def encode(self, texts, **kwargs):
+            import numpy as np
+
+            self.encoded_texts.extend(texts)
+            return np.ones((len(texts), 8), dtype=np.float32)
+
+    class MockDataset:
+        def __iter__(self):
+            yield {
+                "text": (
+                    "https://www.youtube.com/watch?v=TF0ABJzAw5A\n"
+                    "Do You Think You're Ready? - Album by V.I.P | Spotify"
+                )
+            }
+
+    embedder = MockEmbedder()
+    dataset = StreamingEmbeddingDataset(
+        MockDataset(),
+        embedder,
+        buffer_size=10,
+        embedding_batch_size=10,
+        sanitize_urls=True,
+    )
+
+    list(dataset)
+
+    assert embedder.encoded_texts == [
+        "[URL]\nDo You Think You're Ready? - Album by V.I.P | Spotify"
     ]
 
 

@@ -408,6 +408,31 @@ def main() -> None:
         help="Task argument passed to compatible embedding models such as Jina",
     )
     embed_parser.add_argument(
+        "--default-task",
+        type=str,
+        default=None,
+        help="Task selected when loading compatible models; use clustering for Jina omni clustering embeddings",
+    )
+    embed_parser.add_argument(
+        "--modality",
+        type=str,
+        default=None,
+        choices=["text", "vision", "audio", "omni"],
+        help="Subset of Jina omni towers to load; use text for FineWiki-only embedding",
+    )
+    embed_parser.add_argument(
+        "--encode-method",
+        type=str,
+        default="encode",
+        choices=["encode", "document", "query"],
+        help="SentenceTransformer text encode method; use document for Jina omni clustering/classification/text-matching",
+    )
+    embed_parser.add_argument(
+        "--sanitize-urls",
+        action="store_true",
+        help="Replace URLs in text chunks with [URL] before encoding",
+    )
+    embed_parser.add_argument(
         "--no-bf16",
         action="store_true",
         help="Do not request bfloat16 model weights on CUDA",
@@ -577,6 +602,10 @@ def compute_embeddings_from_args(args: argparse.Namespace) -> None:
     model_kwargs = {}
     if device.type == "cuda" and not args.no_bf16:
         model_kwargs["dtype"] = torch.bfloat16
+    if args.default_task is not None:
+        model_kwargs["default_task"] = args.default_task
+    if args.modality is not None:
+        model_kwargs["modality"] = args.modality
 
     sentence_transformer_kwargs = {
         "trust_remote_code": args.trust_remote_code,
@@ -609,6 +638,8 @@ def compute_embeddings_from_args(args: argparse.Namespace) -> None:
         seed=args.seed,
         max_samples=args.max_samples,
         task=args.task,
+        encode_method=args.encode_method,
+        sanitize_urls=args.sanitize_urls,
     )
 
     n_embeddings, embedding_dim = compute_and_save_embeddings(

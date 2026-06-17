@@ -967,6 +967,10 @@ def test_cli_embed_passes_streaming_and_sentence_transformer_args(monkeypatch):
         save_chunk_size=5000,
         no_normalize_embeddings=True,
         task="clustering",
+        default_task="clustering",
+        modality="text",
+        encode_method="document",
+        sanitize_urls=True,
         no_bf16=False,
         trust_remote_code=True,
     )
@@ -976,7 +980,11 @@ def test_cli_embed_passes_streaming_and_sentence_transformer_args(monkeypatch):
     assert captured_model["model_name"] == "jinaai/jina-embeddings-v5-text-small"
     assert captured_model["kwargs"]["trust_remote_code"] is True
     assert captured_model["kwargs"]["device"] == torch_module.device("cuda")
-    assert captured_model["kwargs"]["model_kwargs"] == {"dtype": torch_module.bfloat16}
+    assert captured_model["kwargs"]["model_kwargs"] == {
+        "dtype": torch_module.bfloat16,
+        "default_task": "clustering",
+        "modality": "text",
+    }
     assert captured_model["kwargs"]["truncate_dim"] == 512
 
     embedder = captured_streaming["embedder"]
@@ -990,6 +998,8 @@ def test_cli_embed_passes_streaming_and_sentence_transformer_args(monkeypatch):
     assert captured_streaming["seed"] == 123
     assert captured_streaming["max_samples"] == 1000
     assert captured_streaming["task"] == "clustering"
+    assert captured_streaming["encode_method"] == "document"
+    assert captured_streaming["sanitize_urls"] is True
 
     assert captured_save == {
         "dataset": "streaming-dataset",
