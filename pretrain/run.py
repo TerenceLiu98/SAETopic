@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import re
 import time
 from dataclasses import fields
@@ -114,6 +115,8 @@ def encode_device(setting: Any) -> str | list[str] | None:
 
 
 def build_embedder(config: dict[str, Any]):
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
     from sentence_transformers import SentenceTransformer
 
     model_cfg = config["embedding_model"]

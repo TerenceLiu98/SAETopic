@@ -8,12 +8,13 @@ for training sparse autoencoders.
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from queue import Full, Queue
-from threading import Event, Lock, Thread
+from threading import Event, RLock, Thread
 from typing import Any, Literal, cast
 
 import numpy as np
@@ -24,6 +25,7 @@ from torch.utils.data import Dataset
 
 
 _TEXT_URL_PATTERN = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
 class EmbeddingDataset(Dataset):
@@ -436,7 +438,7 @@ class StreamingEmbeddingDataset:
         }
         self.source_total = self._infer_source_total()
         self._encode_pool: dict[str, Any] | None = None
-        self._tokenizer_lock = Lock()
+        self._tokenizer_lock = RLock()
 
         if self.skip_samples < 0:
             raise ValueError("skip_samples must be non-negative")
@@ -624,24 +626,27 @@ class StreamingEmbeddingDataset:
 
         if self.encode_method == "document":
             encode_document = getattr(self.embedder, "encode_document", None)
-            if callable(encode_document):
-                return cast(np.ndarray, encode_document(texts, **encode_kwargs))
-            return cast(
-                np.ndarray,
-                self.embedder.encode(texts, prompt_name="document", **encode_kwargs),
-            )
+            with self._tokenizer_lock:
+                if callable(encode_document):
+                    return cast(np.ndarray, encode_document(texts, **encode_kwargs))
+                return cast(
+                    np.ndarray,
+                    self.embedder.encode(texts, prompt_name="document", **encode_kwargs),
+                )
 
         if self.encode_method == "query":
             encode_query = getattr(self.embedder, "encode_query", None)
-            if callable(encode_query):
-                return cast(np.ndarray, encode_query(texts, **encode_kwargs))
-            return cast(
-                np.ndarray,
-                self.embedder.encode(texts, prompt_name="query", **encode_kwargs),
-            )
+            with self._tokenizer_lock:
+                if callable(encode_query):
+                    return cast(np.ndarray, encode_query(texts, **encode_kwargs))
+                return cast(
+                    np.ndarray,
+                    self.embedder.encode(texts, prompt_name="query", **encode_kwargs),
+                )
 
         encode_kwargs["task"] = self.task
-        return cast(np.ndarray, self.embedder.encode(texts, **encode_kwargs))
+        with self._tokenizer_lock:
+            return cast(np.ndarray, self.embedder.encode(texts, **encode_kwargs))
 
     def _embed_text_batch(self, texts: list[str]) -> Tensor:
         """Encode a text batch and return normalized CPU float tensors."""

@@ -607,6 +607,10 @@ def train_sae_from_args(args: argparse.Namespace) -> None:
 
 def compute_embeddings_from_args(args: argparse.Namespace) -> None:
     """Compute embeddings from a HuggingFace dataset from CLI arguments."""
+    import os
+
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
     import torch
     from sentence_transformers import SentenceTransformer
 
