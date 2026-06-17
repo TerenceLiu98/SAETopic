@@ -718,6 +718,87 @@ def test_compute_and_save_embeddings_resumes_sharded_directory(tmp_path):
     assert shard_1[0, 0] == 2
 
 
+def test_compute_and_save_embeddings_resumes_from_source_cursor(tmp_path):
+    """Test sharded resume skips source rows recorded in the manifest cursor."""
+    import json
+
+    import numpy as np
+
+    from saetopic.training.data import StreamingEmbeddingDataset
+    from saetopic.training.train_sae import compute_and_save_embeddings
+
+    class MockEmbedder:
+        def __init__(self):
+            self.encoded_texts = []
+
+        def encode(self, texts, **kwargs):
+            self.encoded_texts.extend(texts)
+            values = [float(text.rsplit(" ", 1)[-1]) for text in texts]
+            return np.asarray([[value] * 4 for value in values], dtype=np.float32)
+
+    class FailingRows:
+        def __iter__(self):
+            yield {"text": "Document 0"}
+            yield {"text": "Document 1"}
+            raise RuntimeError("simulated failure")
+
+    class ResumableRows:
+        def __init__(self, rows):
+            self.rows = rows
+            self.selected_start = None
+
+        def __len__(self):
+            return len(self.rows)
+
+        def __iter__(self):
+            return iter(self.rows)
+
+        def select(self, indices):
+            self.selected_start = indices.start
+            return self.rows[indices.start : indices.stop]
+
+    output_dir = tmp_path / "embeddings"
+
+    first_embedder = MockEmbedder()
+    first_dataset = StreamingEmbeddingDataset(
+        FailingRows(),
+        first_embedder,
+        buffer_size=2,
+        embedding_batch_size=2,
+        max_samples=4,
+    )
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        compute_and_save_embeddings(first_dataset, output_dir, chunk_size=2)
+
+    partial_manifest = json.loads((output_dir / "manifest.partial.json").read_text())
+    assert partial_manifest["resume_cursor"] == {
+        "source_rows_seen": 2,
+        "chunks_seen": 2,
+    }
+
+    rows = [{"text": f"Document {index}"} for index in range(4)]
+    resumable_rows = ResumableRows(rows)
+    second_embedder = MockEmbedder()
+    second_dataset = StreamingEmbeddingDataset(
+        resumable_rows,
+        second_embedder,
+        buffer_size=2,
+        embedding_batch_size=2,
+        max_samples=4,
+    )
+
+    n_embeddings, embedding_dim = compute_and_save_embeddings(
+        second_dataset,
+        output_dir,
+        chunk_size=2,
+    )
+
+    assert resumable_rows.selected_start == 2
+    assert second_embedder.encoded_texts == ["Document 2", "Document 3"]
+    assert n_embeddings == 4
+    assert embedding_dim == 4
+
+
 def test_compute_and_save_embeddings_recovers_existing_shards_without_manifest(tmp_path):
     """Test sharded saving can resume old runs that only have shard files."""
     import json

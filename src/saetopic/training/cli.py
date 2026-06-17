@@ -379,6 +379,18 @@ def main() -> None:
         help="Tokenizer token overlap between adjacent text chunks",
     )
     embed_parser.add_argument(
+        "--num-chunk-workers",
+        type=int,
+        default=1,
+        help="Threads used to split source rows into text chunks before encoding",
+    )
+    embed_parser.add_argument(
+        "--chunk-worker-batch-size",
+        type=int,
+        default=1024,
+        help="Source rows dispatched per parallel text-chunking batch",
+    )
+    embed_parser.add_argument(
         "--max-seq-length",
         type=int,
         default=512,
@@ -634,6 +646,8 @@ def compute_embeddings_from_args(args: argparse.Namespace) -> None:
         encode_chunk_size=args.encode_chunk_size,
         text_chunk_size=text_chunk_size,
         text_chunk_overlap=args.text_chunk_overlap,
+        num_chunk_workers=args.num_chunk_workers,
+        chunk_worker_batch_size=args.chunk_worker_batch_size,
         normalize=not args.no_normalize_embeddings,
         seed=args.seed,
         max_samples=args.max_samples,

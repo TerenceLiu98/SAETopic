@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -325,6 +327,11 @@ class StreamingEmbeddingDataset:
     task : str, default="clustering"
         Task type for Jina embeddings (e.g., "clustering", "retrieval")
         Passed to embedder.encode() as task parameter
+    skip_source_rows : int, default=0
+        Number of raw source rows to skip before chunking. Used with sharded
+        embedding resume cursors to avoid re-scanning the entire source.
+    skip_chunk_offset : int, default=0
+        Number of text chunks known to exist before ``skip_source_rows``.
     encode_method : {"encode", "document", "query"}, default="encode"
         SentenceTransformer method to use for text inputs. Use ``"document"``
         with Jina v5 omni non-retrieval tasks so the model applies its
@@ -333,6 +340,10 @@ class StreamingEmbeddingDataset:
         Replace URLs in text chunks with ``"[URL]"`` before encoding. This is
         useful for text-only corpora with Jina omni models because bare URLs
         are valid media inputs and may be downloaded by the model.
+    num_chunk_workers : int, default=1
+        Number of threads used to split source rows into text chunks.
+    chunk_worker_batch_size : int, default=1024
+        Source rows collected before dispatching one parallel chunking batch.
 
     Examples
     --------
@@ -379,8 +390,12 @@ class StreamingEmbeddingDataset:
         max_samples: int | None = None,
         skip_samples: int = 0,
         task: str = "clustering",
+        skip_source_rows: int = 0,
+        skip_chunk_offset: int = 0,
         encode_method: str = "encode",
         sanitize_urls: bool = False,
+        num_chunk_workers: int = 1,
+        chunk_worker_batch_size: int = 1024,
     ):
         self.base_dataset = hf_dataset
         self.embedder = embedder
@@ -399,16 +414,32 @@ class StreamingEmbeddingDataset:
         self.skip_samples = skip_samples
         self.seed = seed
         self.task = task
+        self.skip_source_rows = skip_source_rows
+        self.skip_chunk_offset = skip_chunk_offset
         self.encode_method = encode_method
         self.sanitize_urls = sanitize_urls
+        self.num_chunk_workers = num_chunk_workers
+        self.chunk_worker_batch_size = chunk_worker_batch_size
         self.source_rows_seen = 0
+        self.safe_resume_cursor = {
+            "source_rows_seen": int(self.skip_source_rows),
+            "chunks_seen": int(self.skip_chunk_offset),
+        }
         self.source_total = self._infer_source_total()
         self._encode_pool: dict[str, Any] | None = None
 
         if self.skip_samples < 0:
             raise ValueError("skip_samples must be non-negative")
+        if self.skip_source_rows < 0:
+            raise ValueError("skip_source_rows must be non-negative")
+        if self.skip_chunk_offset < 0:
+            raise ValueError("skip_chunk_offset must be non-negative")
         if self.encode_method not in {"encode", "document", "query"}:
             raise ValueError("encode_method must be 'encode', 'document', or 'query'")
+        if self.num_chunk_workers <= 0:
+            raise ValueError("num_chunk_workers must be greater than 0")
+        if self.chunk_worker_batch_size <= 0:
+            raise ValueError("chunk_worker_batch_size must be greater than 0")
         if self.text_split_strategy not in {"token", "paragraph"}:
             raise ValueError("text_split_strategy must be 'token' or 'paragraph'")
         if self.text_chunk_size is not None and self.text_chunk_size <= 0:
@@ -469,7 +500,7 @@ class StreamingEmbeddingDataset:
 
     def _get_embedding_dim(self) -> int:
         """Get embedding dimension by encoding a sample."""
-        sample = next(iter(self.base_dataset))
+        sample = next(iter(self._iter_base_dataset_from_skip()))
         text = sample[self.text_column] if isinstance(sample, dict) else sample
         if isinstance(text, list):
             text = text[0] if text else "test"
@@ -603,6 +634,78 @@ class StreamingEmbeddingDataset:
 
         return embeddings
 
+    def _iter_base_dataset_from_skip(self) -> Iterator[Any]:
+        """Iterate source rows, using dataset-native skip/select when available."""
+        skip_rows = int(self.skip_source_rows)
+        if skip_rows <= 0:
+            return iter(self.base_dataset)
+
+        if hasattr(self.base_dataset, "skip"):
+            skipped_dataset = self.base_dataset.skip(skip_rows)
+            return iter(skipped_dataset)
+
+        if hasattr(self.base_dataset, "select"):
+            try:
+                source_total = len(self.base_dataset)
+            except (TypeError, NotImplementedError):
+                source_total = None
+            if source_total is not None:
+                selected_dataset = self.base_dataset.select(range(skip_rows, source_total))
+                return iter(selected_dataset)
+
+        def fallback_iter() -> Iterator[Any]:
+            for row_index, item in enumerate(self.base_dataset):
+                if row_index >= skip_rows:
+                    yield item
+
+        return fallback_iter()
+
+    def _iter_source_rows(self) -> Iterator[tuple[int, Any]]:
+        """Yield ``(absolute_source_rows_seen, item)`` pairs."""
+        self.source_rows_seen = int(self.skip_source_rows)
+        for item in self._iter_base_dataset_from_skip():
+            self.source_rows_seen += 1
+            yield self.source_rows_seen, item
+
+    def _row_text_chunks(self, row: tuple[int, Any]) -> tuple[int, list[str]]:
+        """Extract and split text for one source row."""
+        source_row_index, item = row
+        if isinstance(item, dict):
+            text = item.get(self.text_column, "")
+        else:
+            text = item
+
+        if not text or (isinstance(text, str) and len(text.strip()) == 0):
+            return source_row_index, []
+
+        return source_row_index, self._split_text(text)
+
+    def _iter_chunked_rows(self) -> Iterator[tuple[int, list[str]]]:
+        """Yield source-row-indexed chunk lists, optionally split in parallel."""
+        source_rows = self._iter_source_rows()
+
+        if self.num_chunk_workers == 1:
+            for row in source_rows:
+                yield self._row_text_chunks(row)
+            return
+
+        def flush_rows(
+            executor: ThreadPoolExecutor,
+            rows: list[tuple[int, Any]],
+        ) -> Iterator[tuple[int, list[str]]]:
+            yield from executor.map(self._row_text_chunks, rows)
+
+        with ThreadPoolExecutor(max_workers=self.num_chunk_workers) as executor:
+            pending_rows: list[tuple[int, Any]] = []
+            for row in source_rows:
+                pending_rows.append(row)
+                if len(pending_rows) >= self.chunk_worker_batch_size:
+                    yield from flush_rows(executor, pending_rows)
+                    pending_rows = []
+
+            if pending_rows:
+                yield from flush_rows(executor, pending_rows)
+
     @property
     def embedding_dim(self) -> int:
         """Get embedding dimension."""
@@ -615,42 +718,52 @@ class StreamingEmbeddingDataset:
         import random
 
         random.seed(self.seed)
-        texts_buffer = []
+        texts_buffer: list[str] = []
         n_samples_skipped = 0
         n_samples_yielded = 0
-        self.source_rows_seen = 0
+        self.source_rows_seen = int(self.skip_source_rows)
+        self.safe_resume_cursor = {
+            "source_rows_seen": int(self.skip_source_rows),
+            "chunks_seen": int(self.skip_chunk_offset),
+        }
+        buffer_safe_source_rows_seen = int(self.skip_source_rows)
+        buffer_safe_chunks_seen = int(self.skip_chunk_offset)
         self._start_encode_pool()
 
         try:
-            for item in self.base_dataset:
-                self.source_rows_seen += 1
-                # Check max_samples limit
-                if (
-                    self.max_samples is not None
-                    and n_samples_skipped + n_samples_yielded >= self.max_samples
-                ):
+            stop_after_buffer = False
+            for source_row_index, text_chunks in self._iter_chunked_rows():
+                chunks_seen = self.skip_chunk_offset + n_samples_skipped + n_samples_yielded
+
+                if self.max_samples is not None and chunks_seen >= self.max_samples:
                     break
 
-                # Extract text
-                if isinstance(item, dict):
-                    text = item.get(self.text_column, "")
-                else:
-                    text = item
+                for text_chunk in text_chunks:
+                    chunks_seen = (
+                        self.skip_chunk_offset
+                        + n_samples_skipped
+                        + n_samples_yielded
+                        + len(texts_buffer)
+                    )
 
-                # Skip empty texts
-                if not text or (isinstance(text, str) and len(text.strip()) == 0):
-                    continue
+                    if self.max_samples is not None and chunks_seen >= self.max_samples:
+                        stop_after_buffer = True
+                        break
 
-                for text_chunk in self._split_text(text):
                     if n_samples_skipped < self.skip_samples:
                         n_samples_skipped += 1
                         continue
-                    if self.max_samples is not None and (
-                        n_samples_skipped + n_samples_yielded + len(texts_buffer)
-                        >= self.max_samples
-                    ):
-                        break
+
                     texts_buffer.append(text_chunk)
+
+                if not stop_after_buffer:
+                    buffer_safe_source_rows_seen = source_row_index
+                    buffer_safe_chunks_seen = (
+                        self.skip_chunk_offset
+                        + n_samples_skipped
+                        + n_samples_yielded
+                        + len(texts_buffer)
+                    )
 
                 # When buffer is full, encode and yield
                 if len(texts_buffer) >= self.buffer_size:
@@ -662,18 +775,31 @@ class StreamingEmbeddingDataset:
                         batch_texts = texts_buffer[i : i + self.embedding_batch_size]
 
                         embeddings = self._embed_text_batch(batch_texts)
-                        yield embeddings
                         n_samples_yielded += embeddings.shape[0]
+                        if i + self.embedding_batch_size >= len(texts_buffer):
+                            self.safe_resume_cursor = {
+                                "source_rows_seen": int(buffer_safe_source_rows_seen),
+                                "chunks_seen": int(buffer_safe_chunks_seen),
+                            }
+                        yield embeddings
 
                     texts_buffer = []
+
+                if stop_after_buffer:
+                    break
 
             # Yield remaining items
             if texts_buffer:
                 for i in range(0, len(texts_buffer), self.embedding_batch_size):
                     batch_texts = texts_buffer[i : i + self.embedding_batch_size]
                     embeddings = self._embed_text_batch(batch_texts)
-                    yield embeddings
                     n_samples_yielded += embeddings.shape[0]
+                    if i + self.embedding_batch_size >= len(texts_buffer):
+                        self.safe_resume_cursor = {
+                            "source_rows_seen": int(buffer_safe_source_rows_seen),
+                            "chunks_seen": int(buffer_safe_chunks_seen),
+                        }
+                    yield embeddings
         finally:
             self._stop_encode_pool()
 
@@ -700,8 +826,12 @@ def create_streaming_dataset(
     max_samples: int | None = None,
     skip_samples: int = 0,
     task: str = "clustering",
+    skip_source_rows: int = 0,
+    skip_chunk_offset: int = 0,
     encode_method: str = "encode",
     sanitize_urls: bool = False,
+    num_chunk_workers: int = 1,
+    chunk_worker_batch_size: int = 1024,
     **hf_kwargs,
 ) -> StreamingEmbeddingDataset:
     """
@@ -759,10 +889,18 @@ def create_streaming_dataset(
         Number of text chunks to skip before encoding
     task : str, default="clustering"
         Task type for Jina embeddings (e.g., "clustering", "retrieval")
+    skip_source_rows : int, default=0
+        Number of raw source rows to skip before chunking.
+    skip_chunk_offset : int, default=0
+        Number of text chunks known before ``skip_source_rows``.
     encode_method : {"encode", "document", "query"}, default="encode"
         SentenceTransformer method to use for text inputs.
     sanitize_urls : bool, default=False
         Replace URLs in text chunks with ``"[URL]"`` before encoding.
+    num_chunk_workers : int, default=1
+        Number of threads used to split source rows into text chunks.
+    chunk_worker_batch_size : int, default=1024
+        Source rows collected before dispatching one parallel chunking batch.
     **hf_kwargs
         Additional arguments for load_dataset
 
@@ -834,6 +972,10 @@ def create_streaming_dataset(
         max_samples=max_samples,
         skip_samples=skip_samples,
         task=task,
+        skip_source_rows=skip_source_rows,
+        skip_chunk_offset=skip_chunk_offset,
         encode_method=encode_method,
         sanitize_urls=sanitize_urls,
+        num_chunk_workers=num_chunk_workers,
+        chunk_worker_batch_size=chunk_worker_batch_size,
     )

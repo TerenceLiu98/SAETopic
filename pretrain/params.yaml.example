@@ -35,6 +35,8 @@ dataset:
   encode_batch_size: 128
   encode_device: auto_multi_cuda
   encode_chunk_size: 128
+  num_chunk_workers: 8
+  chunk_worker_batch_size: 4096
   text_split_strategy: paragraph
   min_sentences_per_chunk: 5
   text_chunk_size: null

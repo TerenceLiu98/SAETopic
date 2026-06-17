@@ -174,6 +174,8 @@ def run_embeddings(config: dict[str, Any]) -> tuple[int, int]:
         task=dataset_cfg.get("task", "clustering"),
         encode_method=dataset_cfg.get("encode_method", "encode"),
         sanitize_urls=bool(dataset_cfg.get("sanitize_urls", False)),
+        num_chunk_workers=int(dataset_cfg.get("num_chunk_workers", 1)),
+        chunk_worker_batch_size=int(dataset_cfg.get("chunk_worker_batch_size", 1024)),
     )
 
     return compute_and_save_embeddings(

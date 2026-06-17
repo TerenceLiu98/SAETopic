@@ -1204,6 +1204,27 @@ def _embedding_progress_completed(
     return n_saved + n_pending
 
 
+def _valid_resume_cursor(dataset: Any, n_saved: int) -> dict[str, int] | None:
+    """Return the latest dataset cursor that is safe for a manifest."""
+    cursor = getattr(dataset, "safe_resume_cursor", None)
+    if not isinstance(cursor, dict):
+        return None
+
+    try:
+        source_rows_seen = int(cursor["source_rows_seen"])
+        chunks_seen = int(cursor["chunks_seen"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    if source_rows_seen < 0 or chunks_seen < 0 or chunks_seen > n_saved:
+        return None
+
+    return {
+        "source_rows_seen": source_rows_seen,
+        "chunks_seen": chunks_seen,
+    }
+
+
 def compute_and_save_embeddings(
     dataset: StreamingEmbeddingDataset,
     output_path: str | Path,
@@ -1535,10 +1556,16 @@ def _compute_and_save_sharded_embeddings(
     shards: list[dict[str, Any]] = []
     total_samples = getattr(dataset, "max_samples", None)
     skip_remaining = 0
+    resume_cursor: dict[str, int] | None = _valid_resume_cursor(dataset, 0)
 
     def write_manifest(path: Path, *, completed: bool) -> None:
+        nonlocal resume_cursor
         if dim is None:
             return
+
+        current_cursor = _valid_resume_cursor(dataset, n_total)
+        if current_cursor is not None:
+            resume_cursor = current_cursor
 
         manifest = {
             "format": "saetopic.sharded_embeddings.v1",
@@ -1548,6 +1575,8 @@ def _compute_and_save_sharded_embeddings(
             "completed": completed,
             "shards": shards,
         }
+        if resume_cursor is not None:
+            manifest["resume_cursor"] = resume_cursor
         temp_path = path.with_suffix(f"{path.suffix}.tmp")
         temp_path.write_text(json.dumps(manifest, indent=2))
         temp_path.replace(path)
@@ -1575,7 +1604,26 @@ def _compute_and_save_sharded_embeddings(
         n_total = int(shape[0])
         dim = int(shape[1])
         shard_index = len(shards)
-        skip_remaining = n_total
+        manifest_cursor = partial_manifest.get("resume_cursor")
+        if isinstance(manifest_cursor, dict):
+            cursor_source_rows = int(manifest_cursor.get("source_rows_seen", 0))
+            cursor_chunks = int(manifest_cursor.get("chunks_seen", 0))
+            if cursor_source_rows < 0 or cursor_chunks < 0 or cursor_chunks > n_total:
+                raise ValueError(
+                    f"Invalid resume_cursor in {partial_manifest_path}: "
+                    f"{manifest_cursor}"
+                )
+            resume_cursor = {
+                "source_rows_seen": cursor_source_rows,
+                "chunks_seen": cursor_chunks,
+            }
+            if hasattr(dataset, "skip_source_rows"):
+                setattr(dataset, "skip_source_rows", cursor_source_rows)
+            if hasattr(dataset, "skip_chunk_offset"):
+                setattr(dataset, "skip_chunk_offset", cursor_chunks)
+            skip_remaining = n_total - cursor_chunks
+        else:
+            skip_remaining = n_total
 
         for shard in shards:
             shard_path = output_dir / shard["file"]
@@ -1586,6 +1634,12 @@ def _compute_and_save_sharded_embeddings(
             f"Resuming sharded embeddings at {output_dir}: "
             f"{n_total:,} rows across {len(shards):,} shards"
         )
+        if resume_cursor is not None:
+            print(
+                "Resume cursor: "
+                f"source_rows_seen={resume_cursor['source_rows_seen']:,}, "
+                f"chunks_seen={resume_cursor['chunks_seen']:,}"
+            )
     elif output_dir.exists():
         existing_shards = sorted(output_dir.glob("shard_*.npy"))
         if existing_shards:
@@ -1639,9 +1693,15 @@ def _compute_and_save_sharded_embeddings(
     print("Note: This may take a while for large datasets...")
     if skip_remaining and hasattr(dataset, "skip_samples"):
         setattr(dataset, "skip_samples", skip_remaining)
-        print(
-            f"Skipping {skip_remaining:,} previously saved text chunks before encoding..."
-        )
+        if resume_cursor is not None:
+            print(
+                "Skipping "
+                f"{skip_remaining:,} saved text chunks after resume cursor before encoding..."
+            )
+        else:
+            print(
+                f"Skipping {skip_remaining:,} previously saved text chunks before encoding..."
+            )
         skip_remaining = 0
 
     def flush_shard() -> None:
