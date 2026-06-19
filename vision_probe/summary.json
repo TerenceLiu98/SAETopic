@@ -1,0 +1,13 @@
+{
+  "activation_mode": "dense",
+  "checkpoint_path": "/home/jovyan/helloworld-datavol-1/SAETopic/checkpoints/jina-v5-omni-small-sae/best",
+  "embedding_dim": 768,
+  "mean_reconstruction_cosine": 0.7771521806716919,
+  "mean_reconstruction_mse": 0.0005160764558240771,
+  "n_images": 1,
+  "outputs": {
+    "feature_summary": "/home/jovyan/srv/SAETopic/results/vision_probe/feature_summary.csv",
+    "samples": "/home/jovyan/srv/SAETopic/results/vision_probe/samples.jsonl"
+  },
+  "top_k": 10
+}

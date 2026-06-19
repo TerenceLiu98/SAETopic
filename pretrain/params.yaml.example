@@ -177,6 +177,15 @@ vision_probe:
   # PYTHONPATH=src python pretrain/run.py --config pretrain/params.yaml --stages vision_probe
   checkpoint_path: null
   out_dir: results/vision_probe
+  hf_dataset: null
+  hf_subset: null
+  hf_split: test
+  hf_cache_dir: null
+  hf_local_files_only: false
+  image_column: image
+  label_column: label
+  max_samples: null
+  max_per_label: 50
   input_file: null
   inputs: []
   # Inline examples:

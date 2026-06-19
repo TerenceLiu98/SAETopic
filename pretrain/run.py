@@ -515,8 +515,10 @@ def checkpoint_path(config: dict[str, Any]) -> Path:
 
 
 def load_vision_probe_inputs(probe_cfg: dict[str, Any]) -> list[dict[str, Any]]:
-    """Load image probe records from inline config, JSONL, CSV, or TXT."""
+    """Load image probe records from HF datasets, inline config, JSONL, CSV, or TXT."""
     records: list[dict[str, Any]] = []
+    records.extend(load_vision_probe_hf_inputs(probe_cfg))
+
     inline_inputs = probe_cfg.get("inputs") or []
     for idx, item in enumerate(inline_inputs):
         if isinstance(item, str):
@@ -562,6 +564,87 @@ def load_vision_probe_inputs(probe_cfg: dict[str, Any]) -> list[dict[str, Any]]:
     return records
 
 
+def load_vision_probe_hf_inputs(probe_cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Load image probe records directly from a Hugging Face dataset cache."""
+    dataset_id = probe_cfg.get("hf_dataset")
+    if not dataset_id:
+        return []
+
+    try:
+        from datasets import DownloadConfig, load_dataset
+    except ImportError as exc:
+        raise ImportError("datasets is required for vision_probe.hf_dataset") from exc
+
+    subset = probe_cfg.get("hf_subset")
+    split = str(probe_cfg.get("hf_split", "test"))
+    image_column = str(probe_cfg.get("image_column", "image"))
+    label_column = probe_cfg.get("label_column", "label")
+    max_samples = probe_cfg.get("max_samples")
+    max_samples = None if max_samples in {None, 0} else int(max_samples)
+    max_per_label = probe_cfg.get("max_per_label")
+    max_per_label = None if max_per_label in {None, 0} else int(max_per_label)
+
+    load_args = [dataset_id]
+    if subset is not None:
+        load_args.append(subset)
+    load_kwargs: dict[str, Any] = {"split": split}
+    if probe_cfg.get("hf_cache_dir") is not None:
+        load_kwargs["cache_dir"] = str(resolve_path(probe_cfg["hf_cache_dir"]))
+    if bool(probe_cfg.get("hf_local_files_only", False)):
+        load_kwargs["download_config"] = DownloadConfig(local_files_only=True)
+
+    dataset = load_dataset(*load_args, **load_kwargs)
+    label_names = None
+    if label_column and label_column in dataset.features:
+        label_names = getattr(dataset.features[label_column], "names", None)
+
+    counts_by_label: dict[str, int] = {}
+    records: list[dict[str, Any]] = []
+    for row_idx, row in enumerate(dataset):
+        if image_column not in row:
+            raise ValueError(
+                f"vision_probe.image_column={image_column!r} not found in {dataset_id}"
+            )
+
+        raw_label = row.get(label_column) if label_column else None
+        label_id = int(raw_label) if isinstance(raw_label, int) else raw_label
+        if label_names is not None and isinstance(label_id, int):
+            label = label_names[label_id]
+        elif raw_label is None:
+            label = None
+        else:
+            label = str(raw_label)
+
+        count_key = label if label is not None else "__none__"
+        if max_per_label is not None and counts_by_label.get(count_key, 0) >= max_per_label:
+            continue
+
+        image = row[image_column]
+        if hasattr(image, "convert"):
+            image = image.convert("RGB")
+
+        local_idx = counts_by_label.get(count_key, 0)
+        record_id = f"{label or 'sample'}_{local_idx:04d}"
+        records.append(
+            {
+                "id": record_id,
+                "image": f"hf://{dataset_id}/{split}/{row_idx}",
+                "_image": image,
+                "label": label,
+                "label_id": label_id,
+            }
+        )
+        counts_by_label[count_key] = local_idx + 1
+        if max_samples is not None and len(records) >= max_samples:
+            break
+
+    console.print(
+        f"Loaded {len(records):,} vision probe images from {dataset_id} "
+        f"split={split} via Hugging Face datasets cache"
+    )
+    return records
+
+
 def build_vision_probe_embedder(config: dict[str, Any]):
     """Build a Jina/SentenceTransformer embedder configured for vision probing."""
     probe_cfg = config.get("vision_probe", {})
@@ -583,11 +666,13 @@ def build_vision_probe_embedder(config: dict[str, Any]):
 
 
 def _vision_probe_payload(record: dict[str, Any]) -> Any:
-    image = record.get("image") or record.get("path") or record.get("url")
+    if "_image" in record:
+        image = record["_image"]
+    else:
+        image = record.get("image") or record.get("path") or record.get("url")
     text = record.get("text") or record.get("caption")
     if image is None:
         raise ValueError(f"Vision probe record is missing image/path/url: {record}")
-    image = str(image)
     if text:
         return (str(text), image)
     return image

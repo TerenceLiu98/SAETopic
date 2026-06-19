@@ -1,6 +1,8 @@
 """Tests for pretraining pipeline orchestration helpers."""
 
 import json
+import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -189,3 +191,59 @@ def test_run_vision_probe_writes_sample_and_feature_outputs(monkeypatch, tmp_pat
     assert feature_summary["feature"].tolist() == [0, 1, 3, 2]
     assert summary["n_images"] == 2
     assert summary["mean_reconstruction_cosine"] == 1.0
+
+
+def test_load_vision_probe_inputs_reads_hf_dataset_cache(monkeypatch):
+    calls = {}
+
+    class FakeImage:
+        def __init__(self, name):
+            self.name = name
+            self.converted = False
+
+        def convert(self, mode):
+            assert mode == "RGB"
+            self.converted = True
+            return self
+
+    class FakeDataset(list):
+        features = {"label": SimpleNamespace(names=["class_a", "class_b"])}
+
+    def fake_load_dataset(*args, **kwargs):
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+        return FakeDataset(
+            [
+                {"image": FakeImage("a0"), "label": 0},
+                {"image": FakeImage("a1"), "label": 0},
+                {"image": FakeImage("b0"), "label": 1},
+            ]
+        )
+
+    class FakeDownloadConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setitem(
+        sys.modules,
+        "datasets",
+        SimpleNamespace(load_dataset=fake_load_dataset, DownloadConfig=FakeDownloadConfig),
+    )
+
+    records = pretrain_run.load_vision_probe_inputs(
+        {
+            "hf_dataset": "timm/mini-imagenet",
+            "hf_split": "test",
+            "max_per_label": 1,
+            "hf_local_files_only": True,
+        }
+    )
+
+    assert calls["args"] == ("timm/mini-imagenet",)
+    assert calls["kwargs"]["split"] == "test"
+    assert calls["kwargs"]["download_config"].kwargs == {"local_files_only": True}
+    assert [record["label"] for record in records] == ["class_a", "class_b"]
+    assert [record["label_id"] for record in records] == [0, 1]
+    assert records[0]["image"] == "hf://timm/mini-imagenet/test/0"
+    assert records[0]["_image"].name == "a0"
+    assert records[0]["_image"].converted is True
