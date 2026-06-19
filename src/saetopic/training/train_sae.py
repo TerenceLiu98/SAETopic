@@ -662,14 +662,6 @@ class SAETrainer:
             if epoch % self.config.save_frequency == 0:
                 self.save_checkpoint(f"checkpoint_epoch_{epoch}")
 
-            # Update feature stats for BatchTopKSAE-compatible models
-            if hasattr(self.model, "update_feature_stats"):
-                with torch.no_grad():
-                    for batch in train_loader:
-                        batch = batch.to(self.device)
-                        _, _, topk_values, topk_indices = self.model.forward_sparse(batch)
-                        self.model.update_feature_stats_sparse(topk_values, topk_indices)
-
         # Save final checkpoint
         self.save_checkpoint("final")
 
