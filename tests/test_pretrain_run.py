@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import torch
+from scipy.sparse import load_npz
 
 import pretrain.run as pretrain_run
 
@@ -132,8 +133,8 @@ def test_run_vision_probe_writes_sample_and_feature_outputs(monkeypatch, tmp_pat
         def forward(self, x):
             h = torch.asarray(
                 [
-                    [0.5, 2.0, 0.1, 1.0],
-                    [3.0, 0.2, 0.4, 0.1],
+                    [0.5, 2.0, 0.0, 1.0],
+                    [3.0, 0.0, 0.0, 0.1],
                 ],
                 device=x.device,
                 dtype=torch.float32,
@@ -166,7 +167,7 @@ def test_run_vision_probe_writes_sample_and_feature_outputs(monkeypatch, tmp_pat
             ],
             "batch_size": 2,
             "activation_batch_size": 2,
-            "top_k": 2,
+            "top_k": 3,
             "truncate_dim": 3,
             "device": "cpu",
         },
@@ -180,17 +181,36 @@ def test_run_vision_probe_writes_sample_and_feature_outputs(monkeypatch, tmp_pat
         for line in (out_dir / "samples.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     feature_summary = pd.read_csv(out_dir / "feature_summary.csv")
+    class_summary = pd.read_csv(out_dir / "class_summary.csv")
+    class_distribution = pd.read_csv(out_dir / "class_feature_distribution.csv")
+    visual_bow = load_npz(out_dir / "visual_bow.npz")
+    visual_bow_meta = json.loads((out_dir / "visual_bow_meta.json").read_text(encoding="utf-8"))
     summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
 
     assert samples[0]["id"] == "a"
     assert samples[0]["top_features"] == [
         {"activation": 2.0, "feature": 1},
         {"activation": 1.0, "feature": 3},
+        {"activation": 0.5, "feature": 0},
     ]
     assert samples[1]["top_features"][0] == {"activation": 3.0, "feature": 0}
-    assert feature_summary["feature"].tolist() == [0, 1, 3, 2]
+    assert all(item["activation"] > 0 for sample in samples for item in sample["top_features"])
+    assert feature_summary["feature"].tolist() == [0, 3, 1]
+    assert visual_bow.shape == (2, 4)
+    assert visual_bow[0, 1] == 2.0
+    assert visual_bow[1, 0] == 3.0
+    assert visual_bow_meta["row_ids"] == ["a", "b"]
+    assert visual_bow_meta["labels"] == ["first", None]
+    assert set(class_summary["label"]) == {"first", "__unlabeled__"}
+    first_rows = class_distribution[class_distribution["label"] == "first"]
+    assert first_rows["feature"].tolist() == [1, 3, 0]
+    assert first_rows["image_fraction"].tolist() == [1.0, 1.0, 1.0]
     assert summary["n_images"] == 2
     assert summary["mean_reconstruction_cosine"] == 1.0
+    assert summary["outputs"]["visual_bow"].endswith("visual_bow.npz")
+    assert summary["outputs"]["class_feature_distribution"].endswith(
+        "class_feature_distribution.csv"
+    )
 
 
 def test_load_vision_probe_inputs_reads_hf_dataset_cache(monkeypatch):

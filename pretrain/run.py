@@ -34,7 +34,7 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-from scipy.sparse import save_npz
+from scipy.sparse import csr_matrix, save_npz
 from sklearn.datasets import fetch_20newsgroups
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 from torch.utils.data import random_split
@@ -705,13 +705,163 @@ def _encode_probe_payloads(
     return np.asarray(embeddings, dtype=np.float32)
 
 
+def _write_vision_probe_visual_bow(
+    out_dir: Path,
+    sample_results: list[dict[str, Any]],
+    n_features: int,
+) -> dict[str, str]:
+    """Write image-level and class-level visual-word artifacts from SAE activations."""
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+    row_ids: list[str] = []
+    row_labels: list[str | None] = []
+
+    class_image_counts: dict[str, int] = {}
+    class_occurrence_counts: dict[str, int] = {}
+    class_activation_sums: dict[str, float] = {}
+    class_feature_stats: dict[str, dict[int, dict[str, float]]] = {}
+
+    for row_idx, sample in enumerate(sample_results):
+        row_ids.append(str(sample.get("id", row_idx)))
+        label = sample.get("label")
+        label_key = str(label) if label is not None else "__unlabeled__"
+        row_labels.append(None if label is None else str(label))
+        class_image_counts[label_key] = class_image_counts.get(label_key, 0) + 1
+
+        for rank, item in enumerate(sample.get("top_features", []), start=1):
+            feature = int(item["feature"])
+            activation = float(item["activation"])
+            rows.append(row_idx)
+            cols.append(feature)
+            data.append(activation)
+
+            class_occurrence_counts[label_key] = class_occurrence_counts.get(label_key, 0) + 1
+            class_activation_sums[label_key] = (
+                class_activation_sums.get(label_key, 0.0) + activation
+            )
+            stats = class_feature_stats.setdefault(label_key, {}).setdefault(
+                feature,
+                {"image_count": 0.0, "activation_sum": 0.0, "best_rank": float(rank)},
+            )
+            stats["image_count"] += 1.0
+            stats["activation_sum"] += activation
+            stats["best_rank"] = min(stats["best_rank"], float(rank))
+
+    matrix_width = max(n_features, max(cols) + 1 if cols else 0)
+    visual_bow = csr_matrix(
+        (data, (rows, cols)),
+        shape=(len(sample_results), matrix_width),
+        dtype=np.float32,
+    )
+    visual_bow_path = out_dir / "visual_bow.npz"
+    save_npz(visual_bow_path, visual_bow)
+
+    visual_bow_meta = {
+        "matrix": str(visual_bow_path),
+        "n_images": len(sample_results),
+        "n_features": matrix_width,
+        "row_ids": row_ids,
+        "labels": row_labels,
+        "weighting": "sae_activation",
+        "source": "vision_probe.top_features",
+    }
+    visual_bow_meta_path = out_dir / "visual_bow_meta.json"
+    visual_bow_meta_path.write_text(
+        json.dumps(visual_bow_meta, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    class_summary_path = out_dir / "class_summary.csv"
+    with class_summary_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "label",
+                "n_images",
+                "unique_features",
+                "total_feature_occurrences",
+                "mean_active_features_per_image",
+                "activation_sum",
+            ],
+        )
+        writer.writeheader()
+        for label_key in sorted(class_image_counts):
+            n_images = class_image_counts[label_key]
+            total_occurrences = class_occurrence_counts.get(label_key, 0)
+            writer.writerow(
+                {
+                    "label": label_key,
+                    "n_images": n_images,
+                    "unique_features": len(class_feature_stats.get(label_key, {})),
+                    "total_feature_occurrences": total_occurrences,
+                    "mean_active_features_per_image": total_occurrences / max(n_images, 1),
+                    "activation_sum": class_activation_sums.get(label_key, 0.0),
+                }
+            )
+
+    class_distribution_path = out_dir / "class_feature_distribution.csv"
+    with class_distribution_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "label",
+                "n_images",
+                "feature",
+                "image_count",
+                "image_fraction",
+                "activation_sum",
+                "mean_activation",
+                "activation_share",
+                "best_rank",
+            ],
+        )
+        writer.writeheader()
+        for label_key in sorted(class_feature_stats):
+            n_images = class_image_counts[label_key]
+            total_activation = class_activation_sums.get(label_key, 0.0)
+            for feature, stats in sorted(
+                class_feature_stats[label_key].items(),
+                key=lambda item: (
+                    -item[1]["image_count"],
+                    -item[1]["activation_sum"],
+                    item[0],
+                ),
+            ):
+                image_count = int(stats["image_count"])
+                activation_sum = stats["activation_sum"]
+                writer.writerow(
+                    {
+                        "label": label_key,
+                        "n_images": n_images,
+                        "feature": feature,
+                        "image_count": image_count,
+                        "image_fraction": image_count / max(n_images, 1),
+                        "activation_sum": activation_sum,
+                        "mean_activation": activation_sum / max(image_count, 1),
+                        "activation_share": (
+                            activation_sum / total_activation if total_activation > 0 else 0.0
+                        ),
+                        "best_rank": int(stats["best_rank"]),
+                    }
+                )
+
+    return {
+        "visual_bow": str(visual_bow_path),
+        "visual_bow_meta": str(visual_bow_meta_path),
+        "class_summary": str(class_summary_path),
+        "class_feature_distribution": str(class_distribution_path),
+    }
+
+
 def run_vision_probe(config: dict[str, Any]) -> None:
     """Probe how image embeddings activate a trained text/omni SAE."""
     probe_cfg = config.get("vision_probe", {})
     records = load_vision_probe_inputs(probe_cfg)
     if not records:
         raise ValueError(
-            "vision_probe needs inputs. Set vision_probe.inputs or vision_probe.input_file."
+            "vision_probe needs inputs. Set vision_probe.hf_dataset, "
+            "vision_probe.inputs, or vision_probe.input_file."
         )
 
     out_dir = resolve_path(probe_cfg.get("out_dir", "results/vision_probe"))
@@ -764,6 +914,7 @@ def run_vision_probe(config: dict[str, Any]) -> None:
     feature_stats: dict[int, dict[str, float]] = {}
     recon_mse_values: list[float] = []
     recon_cosine_values: list[float] = []
+    n_features = int(getattr(sae, "n_features", 0) or 0)
 
     activation_batch_size = int(probe_cfg.get("activation_batch_size", 128))
     with torch.no_grad():
@@ -772,6 +923,7 @@ def run_vision_probe(config: dict[str, Any]) -> None:
             batch = torch.from_numpy(batch_np).to(dev, dtype=sae_dtype)
             x_recon, h, f, _ = sae(batch)
             feature_values = h.float() if activation_mode == "dense" else f.float()
+            n_features = max(n_features, int(feature_values.shape[1]))
             k = min(top_k, feature_values.shape[1])
             top_values, top_indices = torch.topk(feature_values, k=k, dim=1, sorted=True)
             mse = (batch.float() - x_recon.float()).pow(2).mean(dim=1)
@@ -784,9 +936,13 @@ def run_vision_probe(config: dict[str, Any]) -> None:
                 top_features = [
                     {"feature": feature, "activation": activation}
                     for feature, activation in zip(indices, values, strict=True)
+                    if activation > 0.0
                 ]
                 for rank, (feature, activation) in enumerate(
-                    zip(indices, values, strict=True),
+                    (
+                        (item["feature"], item["activation"])
+                        for item in top_features
+                    ),
                     start=1,
                 ):
                     stats = feature_stats.setdefault(
@@ -838,6 +994,8 @@ def run_vision_probe(config: dict[str, Any]) -> None:
                 }
             )
 
+    visual_bow_outputs = _write_vision_probe_visual_bow(out_dir, sample_results, n_features)
+
     summary = {
         "n_images": len(records),
         "embedding_dim": int(embeddings.shape[1]),
@@ -851,6 +1009,7 @@ def run_vision_probe(config: dict[str, Any]) -> None:
         "outputs": {
             "samples": str(out_dir / "samples.jsonl"),
             "feature_summary": str(out_dir / "feature_summary.csv"),
+            **visual_bow_outputs,
         },
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True))

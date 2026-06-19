@@ -176,8 +176,8 @@ vision_probe:
   # Run with:
   # PYTHONPATH=src python pretrain/run.py --config pretrain/params.yaml --stages vision_probe
   checkpoint_path: null
-  out_dir: results/vision_probe
-  hf_dataset: null
+  out_dir: vision_probe/mini_imagenet
+  hf_dataset: timm/mini-imagenet
   hf_subset: null
   hf_split: test
   hf_cache_dir: null
@@ -198,8 +198,9 @@ vision_probe:
   encode_method: document
   batch_size: 8
   activation_batch_size: 128
-  top_k: 10
-  activation_mode: dense
+  # For Bag-of-Visual-Words, use the SAE sparse activations as visual words.
+  top_k: 32
+  activation_mode: sparse
   normalize: true
   truncate_dim: 768
   device: auto
