@@ -62,15 +62,29 @@ def _build_and_load_sae(checkpoint_dir: Path, config: dict[str, Any]):
 
     from saetopic.sae.modules import create_sae
 
+    architecture = config.get("architecture", "batch_topk")
+    model_kwargs = {
+        "decoder_bias": config.get("decoder_bias", True),
+        "encoder_bias": config.get("encoder_bias", False),
+        "normalization": config.get("normalization"),
+    }
+    if architecture == "matryoshka_batch_topk":
+        model_kwargs.update(
+            {
+                "group_sizes": config.get("matryoshka_group_sizes"),
+                "group_fractions": config.get("matryoshka_group_fractions"),
+                "group_weights": config.get("matryoshka_group_weights"),
+                "active_groups": config.get("matryoshka_active_groups"),
+            }
+        )
+
     model = create_sae(
         input_dim=config["input_dim"],
-        architecture=config.get("architecture", "batch_topk"),
+        architecture=architecture,
         n_features=config.get("n_features"),
         expansion_factor=config.get("expansion_factor", 32),
         top_k=config.get("top_k", 32),
-        decoder_bias=config.get("decoder_bias", True),
-        encoder_bias=config.get("encoder_bias", False),
-        normalization=config.get("normalization"),
+        **model_kwargs,
     )
 
     safetensors_path = checkpoint_dir / "model.safetensors"

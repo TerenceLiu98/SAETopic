@@ -30,7 +30,13 @@ from torch.utils.data import DataLoader
 if TYPE_CHECKING:
     from torch import Tensor
 
-    from saetopic.sae.modules import BatchTopKSAE, JumpReLUSAE, StandardSAE, TopKSAE
+    from saetopic.sae.modules import (
+        BatchTopKSAE,
+        JumpReLUSAE,
+        MatryoshkaBatchTopKSAE,
+        StandardSAE,
+        TopKSAE,
+    )
     from saetopic.training.data import (
         EmbeddingDataset,
         ShardedEmbeddingDataset,
@@ -62,7 +68,8 @@ class TrainingConfig:
     device : str
         Device for training ("auto", "cpu", "cuda", "mps")
     architecture : str
-        SAE architecture ("standard", "jumprelu", "topk", "batch_topk")
+        SAE architecture ("standard", "jumprelu", "topk", "batch_topk",
+        "matryoshka_batch_topk")
     seed : int
         Random seed for reproducibility
     save_frequency : int
@@ -98,6 +105,10 @@ class TrainingConfig:
     aux_loss_weight: float = 1 / 32
     bandwidth: float = 0.001
     target_l0: float = 20.0
+    matryoshka_group_sizes: list[int] | None = None
+    matryoshka_group_fractions: list[float] | None = None
+    matryoshka_group_weights: list[float] | None = None
+    matryoshka_active_groups: int | None = None
     early_stopping: bool = False
     early_stopping_patience: int = 5
     early_stopping_min_delta: float = 1e-4
@@ -140,6 +151,10 @@ class TrainingConfig:
             "aux_loss_weight": self.aux_loss_weight,
             "bandwidth": self.bandwidth,
             "target_l0": self.target_l0,
+            "matryoshka_group_sizes": self.matryoshka_group_sizes,
+            "matryoshka_group_fractions": self.matryoshka_group_fractions,
+            "matryoshka_group_weights": self.matryoshka_group_weights,
+            "matryoshka_active_groups": self.matryoshka_active_groups,
             "early_stopping": self.early_stopping,
             "early_stopping_patience": self.early_stopping_patience,
             "early_stopping_min_delta": self.early_stopping_min_delta,
@@ -296,7 +311,7 @@ class SAETrainer:
 
     def __init__(
         self,
-        model: "TopKSAE | BatchTopKSAE | StandardSAE | JumpReLUSAE",
+        model: "TopKSAE | BatchTopKSAE | MatryoshkaBatchTopKSAE | StandardSAE | JumpReLUSAE",
         config: TrainingConfig,
         output_dir: str | None = None,
     ):
@@ -647,16 +662,13 @@ class SAETrainer:
             if epoch % self.config.save_frequency == 0:
                 self.save_checkpoint(f"checkpoint_epoch_{epoch}")
 
-            # Update feature stats for BatchTopKSAE
+            # Update feature stats for BatchTopKSAE-compatible models
             if hasattr(self.model, "update_feature_stats"):
-                from saetopic.sae.modules import BatchTopKSAE
-
                 with torch.no_grad():
                     for batch in train_loader:
                         batch = batch.to(self.device)
                         _, _, topk_values, topk_indices = self.model.forward_sparse(batch)
-                        if isinstance(self.model, BatchTopKSAE):
-                            self.model.update_feature_stats_sparse(topk_values, topk_indices)
+                        self.model.update_feature_stats_sparse(topk_values, topk_indices)
 
         # Save final checkpoint
         self.save_checkpoint("final")
@@ -980,6 +992,10 @@ Sparse Autoencoder trained for topic modeling. This model learns {n_features} sp
 - **Number of Features**: {n_features}
 - **Expansion Factor**: {self.config.expansion_factor}
 - **Top-K**: {self.config.top_k}
+- **Matryoshka Group Sizes**: {self.config.matryoshka_group_sizes or "n/a"}
+- **Matryoshka Group Fractions**: {self.config.matryoshka_group_fractions or "n/a"}
+- **Matryoshka Group Weights**: {self.config.matryoshka_group_weights or "n/a"}
+- **Matryoshka Active Groups**: {self.config.matryoshka_active_groups or "all"}
 
 ## Checkpoint Contents
 
@@ -1136,6 +1152,15 @@ def train_sae(
             {
                 "bandwidth": config.bandwidth,
                 "target_l0": config.target_l0,
+            }
+        )
+    elif config.architecture == "matryoshka_batch_topk":
+        model_kwargs.update(
+            {
+                "group_sizes": config.matryoshka_group_sizes,
+                "group_fractions": config.matryoshka_group_fractions,
+                "group_weights": config.matryoshka_group_weights,
+                "active_groups": config.matryoshka_active_groups,
             }
         )
 

@@ -7,6 +7,7 @@ learning reusable topic atoms.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import cast
 
 import torch
@@ -725,6 +726,294 @@ class BatchTopKSAE(TopKSAE):
         self.update_count.zero_()
 
 
+def _matryoshka_group_sizes(
+    n_features: int,
+    group_sizes: Sequence[int] | None = None,
+    group_fractions: Sequence[float] | None = None,
+) -> list[int]:
+    """Resolve and validate Matryoshka dictionary groups."""
+    if group_sizes is not None and group_fractions is not None:
+        raise ValueError("Pass only one of group_sizes or group_fractions")
+
+    if group_sizes is None:
+        if group_fractions is None:
+            if n_features < 8:
+                n_groups = min(4, n_features)
+                base = n_features // n_groups
+                remainder = n_features % n_groups
+                return [
+                    base + (1 if group_idx < remainder else 0)
+                    for group_idx in range(n_groups)
+                ]
+            group_fractions = (0.125, 0.125, 0.25, 0.5)
+        total_fraction = sum(group_fractions)
+        if abs(total_fraction - 1.0) > 1e-6:
+            raise ValueError("Matryoshka group_fractions must sum to 1.0")
+        group_sizes = [int(fraction * n_features) for fraction in group_fractions[:-1]]
+        group_sizes.append(n_features - sum(group_sizes))
+
+    resolved = [int(size) for size in group_sizes]
+    if not resolved:
+        raise ValueError("Matryoshka group_sizes must not be empty")
+    if any(size <= 0 for size in resolved):
+        raise ValueError("Matryoshka group_sizes must all be positive")
+    if sum(resolved) != n_features:
+        raise ValueError(
+            f"Matryoshka group_sizes must sum to n_features={n_features}; "
+            f"got {sum(resolved)}"
+        )
+    return resolved
+
+
+class MatryoshkaBatchTopKSAE(BatchTopKSAE):
+    """
+    BatchTopK SAE trained with nested Matryoshka dictionary reconstruction.
+
+    The latent dictionary is split into ordered groups. During training, the
+    loss averages reconstruction error after each prefix of groups, forcing
+    earlier groups to reconstruct without relying on later, more specific
+    features.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        n_features: int | None = None,
+        expansion_factor: int = 32,
+        top_k: int = 32,
+        decoder_bias: bool = True,
+        encoder_bias: bool = False,
+        normalization: str | None = None,
+        group_sizes: Sequence[int] | None = None,
+        group_fractions: Sequence[float] | None = None,
+        group_weights: Sequence[float] | None = None,
+        active_groups: int | None = None,
+    ):
+        super().__init__(
+            input_dim=input_dim,
+            n_features=n_features,
+            expansion_factor=expansion_factor,
+            top_k=top_k,
+            decoder_bias=decoder_bias,
+            encoder_bias=encoder_bias,
+            normalization=normalization,
+        )
+
+        resolved_group_sizes = _matryoshka_group_sizes(
+            self.n_features,
+            group_sizes=group_sizes,
+            group_fractions=group_fractions,
+        )
+        if group_weights is None:
+            resolved_group_weights = [1.0 / len(resolved_group_sizes)] * len(
+                resolved_group_sizes
+            )
+        else:
+            resolved_group_weights = [float(weight) for weight in group_weights]
+            if len(resolved_group_weights) != len(resolved_group_sizes):
+                raise ValueError("Matryoshka group_weights must match group_sizes length")
+            if any(weight < 0 for weight in resolved_group_weights):
+                raise ValueError("Matryoshka group_weights must be non-negative")
+            total_weight = sum(resolved_group_weights)
+            if total_weight <= 0:
+                raise ValueError("Matryoshka group_weights must sum to a positive value")
+            resolved_group_weights = [
+                weight / total_weight for weight in resolved_group_weights
+            ]
+
+        n_groups = len(resolved_group_sizes)
+        self.active_groups = active_groups if active_groups is not None else n_groups
+        if not 1 <= self.active_groups <= n_groups:
+            raise ValueError(
+                f"active_groups must be between 1 and {n_groups}; got {self.active_groups}"
+            )
+
+        self.group_sizes: Tensor
+        self.group_weights: Tensor
+        self.group_boundaries: Tensor
+        self.register_buffer(
+            "group_sizes",
+            torch.tensor(resolved_group_sizes, dtype=torch.long),
+        )
+        self.register_buffer(
+            "group_weights",
+            torch.tensor(resolved_group_weights, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "group_boundaries",
+            torch.tensor([0, *torch.tensor(resolved_group_sizes).cumsum(0).tolist()]),
+        )
+
+    @property
+    def active_feature_limit(self) -> int:
+        """Number of features included by the active Matryoshka prefix."""
+        return int(self.group_boundaries[self.active_groups].item())
+
+    def _mask_inactive_features(self, h: Tensor) -> Tensor:
+        """Prevent inactive groups from receiving top-k slots."""
+        active_limit = self.active_feature_limit
+        if active_limit >= self.n_features:
+            return h
+
+        masked = h.clone()
+        masked[:, active_limit:] = -torch.inf
+        return masked
+
+    def activate(
+        self,
+        h: Tensor,
+        use_threshold: bool = False,
+    ) -> tuple[Tensor, Tensor]:
+        """Apply global batch top-k over the active Matryoshka prefix."""
+        if use_threshold:
+            f = h * (h > self.threshold)
+            f[:, self.active_feature_limit :] = 0
+            active_indices = (f > 0).sum(dim=0) > 0
+            return f, active_indices.nonzero(as_tuple=False).flatten()
+
+        active_h = self._mask_inactive_features(h)
+        flat = active_h.flatten()
+        k_total = min(self.top_k * h.shape[0], self.active_feature_limit * h.shape[0])
+        topk_values, flat_indices = flat.topk(k_total, sorted=False)
+        finite = torch.isfinite(topk_values)
+        topk_values = topk_values[finite]
+        flat_indices = flat_indices[finite]
+        f = torch.zeros_like(flat)
+        f.scatter_(dim=0, index=flat_indices, src=topk_values)
+        return f.reshape_as(h), flat_indices
+
+    def forward_sparse(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Sparse forward pass with global batch top-k over active groups."""
+        h = self.encode(x)
+        active_h = self._mask_inactive_features(h)
+        flat = active_h.flatten()
+        k_total = min(self.top_k * x.shape[0], self.active_feature_limit * x.shape[0])
+        topk_values, flat_indices = flat.topk(k_total, sorted=False)
+        finite = torch.isfinite(topk_values)
+        topk_values = topk_values[finite]
+        flat_indices = flat_indices[finite]
+        x_recon = self._decode_sparse_prefix(topk_values, flat_indices, x.shape[0])
+        return x_recon, h, topk_values, flat_indices
+
+    def _decode_sparse_prefix(
+        self,
+        topk_values: Tensor,
+        topk_indices: Tensor,
+        batch_size: int,
+        end_feature: int | None = None,
+    ) -> Tensor:
+        """Decode sparse global top-k activations up to a feature prefix."""
+        decoder_weight = self.decoder.weight.t()
+        rows = topk_indices // self.n_features
+        cols = topk_indices % self.n_features
+        if end_feature is not None:
+            included = cols < end_feature
+            rows = rows[included]
+            cols = cols[included]
+            topk_values = topk_values[included]
+
+        x_recon = self.b_dec.unsqueeze(0).expand(batch_size, -1).clone()
+        if topk_values.numel() > 0:
+            contributions = topk_values.unsqueeze(-1) * decoder_weight[cols]
+            x_recon.index_add_(dim=0, index=rows, source=contributions)
+        return x_recon
+
+    def _prefix_reconstruction_losses(
+        self,
+        x: Tensor,
+        topk_values: Tensor,
+        topk_indices: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Return weighted mean, min, and max prefix reconstruction losses."""
+        prefix_losses = []
+        for group_idx in range(self.active_groups):
+            end_feature = int(self.group_boundaries[group_idx + 1].item())
+            prefix_recon = self._decode_sparse_prefix(
+                topk_values,
+                topk_indices,
+                x.shape[0],
+                end_feature=end_feature,
+            )
+            prefix_losses.append((x - prefix_recon).pow(2).sum(dim=-1).mean())
+
+        losses = torch.stack(prefix_losses)
+        weights = self.group_weights[: self.active_groups].to(
+            device=x.device,
+            dtype=losses.dtype,
+        )
+        weights = weights / weights.sum().clamp_min(torch.finfo(weights.dtype).eps)
+        weighted_loss = (losses * weights).sum()
+        return weighted_loss, losses.min(), losses.max()
+
+    def compute_loss_sparse(
+        self,
+        x: Tensor,
+        x_recon: Tensor,
+        h: Tensor,
+        topk_values: Tensor,
+        topk_indices: Tensor,
+        recon_loss_weight: float = 1.0,
+        sparsity_loss_weight: float = 1.0,
+        aux_loss_weight: float = 0.001,
+        update_stats: bool = True,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Compute Matryoshka prefix reconstruction loss from sparse activations."""
+        del sparsity_loss_weight
+
+        recon_loss, min_prefix_loss, max_prefix_loss = self._prefix_reconstruction_losses(
+            x,
+            topk_values,
+            topk_indices,
+        )
+        residual = x - x_recon
+        aux_loss = self._auxk_loss(residual.detach(), h, aux_loss_weight)
+        total_loss = recon_loss_weight * recon_loss + aux_loss_weight * aux_loss
+        if update_stats:
+            self._update_firing_stats(topk_indices, x.shape[0])
+
+        losses = {
+            "total": total_loss.detach(),
+            "reconstruction": recon_loss.detach(),
+            "sparsity": torch.tensor(0.0, device=x.device),
+            "auxiliary": aux_loss.detach(),
+            "r2": reconstruction_r2(x, x_recon).detach(),
+            "min_reconstruction": min_prefix_loss.detach(),
+            "max_reconstruction": max_prefix_loss.detach(),
+        }
+        return total_loss, losses
+
+    def compute_loss(
+        self,
+        x: Tensor,
+        x_recon: Tensor,
+        h: Tensor,
+        f: Tensor,
+        recon_loss_weight: float = 1.0,
+        sparsity_loss_weight: float = 1.0,
+        aux_loss_weight: float = 0.001,
+        update_stats: bool = True,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Dense API compatibility for Matryoshka loss."""
+        topk_indices = (f > 0).nonzero(as_tuple=False)
+        if topk_indices.numel() == 0:
+            flat_indices = topk_indices.new_empty((0,))
+            topk_values = f.new_empty((0,))
+        else:
+            flat_indices = topk_indices[:, 0] * self.n_features + topk_indices[:, 1]
+            topk_values = f[topk_indices[:, 0], topk_indices[:, 1]]
+        return self.compute_loss_sparse(
+            x,
+            x_recon,
+            h,
+            topk_values,
+            flat_indices,
+            recon_loss_weight=recon_loss_weight,
+            sparsity_loss_weight=sparsity_loss_weight,
+            aux_loss_weight=aux_loss_weight,
+            update_stats=update_stats,
+        )
+
+
 class StandardSAE(nn.Module):
     """
     Standard SAE matching SAE-TM's StandardTrainer AutoEncoder.
@@ -996,7 +1285,7 @@ def create_sae(
     expansion_factor: int = 32,
     top_k: int = 32,
     **kwargs,
-) -> TopKSAE | BatchTopKSAE | StandardSAE | JumpReLUSAE:
+) -> TopKSAE | BatchTopKSAE | MatryoshkaBatchTopKSAE | StandardSAE | JumpReLUSAE:
     """
     Factory function to create SAE models.
 
@@ -1005,7 +1294,8 @@ def create_sae(
     input_dim : int
         Dimension of input embeddings
     architecture : str, default="topk"
-        SAE architecture type ("standard", "jumprelu", "topk", "batch_topk")
+        SAE architecture type ("standard", "jumprelu", "topk", "batch_topk",
+        "matryoshka_batch_topk")
     n_features : int or None, default=None
         Number of SAE features
     expansion_factor : int, default=32
@@ -1017,7 +1307,7 @@ def create_sae(
 
     Returns
     -------
-    StandardSAE, JumpReLUSAE, TopKSAE, or BatchTopKSAE
+        StandardSAE, JumpReLUSAE, TopKSAE, BatchTopKSAE, or MatryoshkaBatchTopKSAE
         Initialized SAE model
     """
     if architecture == "standard":
@@ -1046,6 +1336,14 @@ def create_sae(
         )
     elif architecture == "batch_topk":
         return BatchTopKSAE(
+            input_dim=input_dim,
+            n_features=n_features,
+            expansion_factor=expansion_factor,
+            top_k=top_k,
+            **kwargs,
+        )
+    elif architecture == "matryoshka_batch_topk":
+        return MatryoshkaBatchTopKSAE(
             input_dim=input_dim,
             n_features=n_features,
             expansion_factor=expansion_factor,

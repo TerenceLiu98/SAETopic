@@ -79,6 +79,11 @@ sae:
     expansion_factor: 64
     top_k: 32
     architecture: batch_topk
+    # For nested multi-granularity dictionaries, use:
+    # architecture: matryoshka_batch_topk
+    # matryoshka_group_fractions: [0.125, 0.125, 0.25, 0.5]
+    # matryoshka_group_weights: null
+    # matryoshka_active_groups: null
     learning_rate: 0.001
     batch_size: 256
     n_epochs: 100

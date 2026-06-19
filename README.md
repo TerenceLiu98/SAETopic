@@ -217,8 +217,9 @@ Notes:
   `train --no-normalize-embeddings` for those files; if you use
   `embed --no-normalize-embeddings`, let `train` normalize them unless your
   embedder already returns the exact representation you want to train on.
-- SAE training uses a sparse top-k path internally, so it does not materialize
-  the dense `(batch_size, n_features)` activation tensor during training.
+- SAE training uses sparse top-k paths internally, including BatchTopK and
+  Matryoshka BatchTopK, so it does not materialize the dense
+  `(batch_size, n_features)` activation tensor during training.
 - The top-level `saetopic` inference CLI is planned. Current command-line
   training workflows use `saetopic-train` or `python -m saetopic.training.cli`.
 
@@ -248,7 +249,8 @@ This project is in early development (v0.1). The API is subject to change.
 
 **Current Milestone**: SAE training infrastructure. The training path supports
 FineWiki-style large text corpora with streaming embedding, chunked embedding
-storage, mmap loading, and memory-efficient sparse top-k SAE training.
+storage, mmap loading, and memory-efficient sparse top-k / Matryoshka SAE
+training.
 
 Pretrained Hub loading and the full topic inference API are still in progress.
 

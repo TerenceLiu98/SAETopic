@@ -88,8 +88,35 @@ def main() -> None:
         "--architecture",
         type=str,
         default="batch_topk",
-        choices=["standard", "jumprelu", "topk", "batch_topk"],
+        choices=["standard", "jumprelu", "topk", "batch_topk", "matryoshka_batch_topk"],
         help="SAE architecture type",
+    )
+    train_parser.add_argument(
+        "--matryoshka-group-sizes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Ordered Matryoshka latent group sizes; must sum to n_features",
+    )
+    train_parser.add_argument(
+        "--matryoshka-group-fractions",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Ordered Matryoshka group fractions; must sum to 1.0",
+    )
+    train_parser.add_argument(
+        "--matryoshka-group-weights",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Optional reconstruction-loss weights for Matryoshka prefixes",
+    )
+    train_parser.add_argument(
+        "--matryoshka-active-groups",
+        type=int,
+        default=None,
+        help="Number of Matryoshka prefix groups to activate",
     )
     train_parser.add_argument(
         "--decoder-bias",
@@ -552,6 +579,10 @@ def train_sae_from_args(args: argparse.Namespace) -> None:
         decoder_bias=args.decoder_bias,
         encoder_bias=args.encoder_bias,
         normalization=args.normalization,
+        matryoshka_group_sizes=getattr(args, "matryoshka_group_sizes", None),
+        matryoshka_group_fractions=getattr(args, "matryoshka_group_fractions", None),
+        matryoshka_group_weights=getattr(args, "matryoshka_group_weights", None),
+        matryoshka_active_groups=getattr(args, "matryoshka_active_groups", None),
         learning_rate=args.learning_rate,
         batch_size=args.batch_size,
         n_epochs=args.n_epochs,

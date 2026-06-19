@@ -7,11 +7,19 @@ and activation extraction.
 
 from saetopic.sae.activations import extract_activations
 from saetopic.sae.loaders import SAECheckpoint, load_sae_weights
-from saetopic.sae.modules import BatchTopKSAE, JumpReLUSAE, StandardSAE, TopKSAE, create_sae
+from saetopic.sae.modules import (
+    BatchTopKSAE,
+    JumpReLUSAE,
+    MatryoshkaBatchTopKSAE,
+    StandardSAE,
+    TopKSAE,
+    create_sae,
+)
 
 __all__ = [
     "BatchTopKSAE",
     "JumpReLUSAE",
+    "MatryoshkaBatchTopKSAE",
     "StandardSAE",
     "TopKSAE",
     "create_sae",

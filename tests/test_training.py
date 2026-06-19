@@ -9,7 +9,14 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
-from saetopic.sae.modules import BatchTopKSAE, JumpReLUSAE, StandardSAE, TopKSAE, create_sae
+from saetopic.sae.modules import (
+    BatchTopKSAE,
+    JumpReLUSAE,
+    MatryoshkaBatchTopKSAE,
+    StandardSAE,
+    TopKSAE,
+    create_sae,
+)
 from saetopic.training.data import EmbeddingDataset
 from saetopic.training.train_sae import SAEOptimizer, SAETrainer, TrainingConfig, train_sae
 
@@ -42,6 +49,25 @@ def test_create_sae_batch_topk():
     assert model.input_dim == 128
     assert model.n_features == 128 * 16
     assert model.top_k == 8
+
+
+def test_create_sae_matryoshka_batch_topk():
+    """Test creating a MatryoshkaBatchTopKSAE model."""
+    model = create_sae(
+        input_dim=128,
+        architecture="matryoshka_batch_topk",
+        n_features=256,
+        top_k=8,
+        group_sizes=[64, 64, 128],
+        group_weights=[0.2, 0.3, 0.5],
+    )
+
+    assert isinstance(model, MatryoshkaBatchTopKSAE)
+    assert model.input_dim == 128
+    assert model.n_features == 256
+    assert model.top_k == 8
+    assert model.group_sizes.tolist() == [64, 64, 128]
+    assert torch.allclose(model.group_weights, torch.tensor([0.2, 0.3, 0.5]))
 
 
 def test_create_sae_standard():
@@ -103,6 +129,33 @@ def test_batch_topk_sae_forward():
     assert f.shape == (4, 256)
     assert topk_indices.shape == (4 * 8,)
     assert (f > 0).sum().item() <= 4 * 8
+
+
+def test_matryoshka_batch_topk_forward_matches_sparse_final_reconstruction():
+    """Test Matryoshka dense and sparse forwards reconstruct with the full prefix."""
+    model = MatryoshkaBatchTopKSAE(
+        input_dim=32,
+        n_features=64,
+        top_k=4,
+        group_sizes=[16, 16, 32],
+    )
+    x = torch.randn(8, 32)
+
+    dense_x_recon, dense_h, dense_f, dense_indices = model(x)
+    sparse_x_recon, sparse_h, topk_values, sparse_indices = model.forward_sparse(x)
+
+    assert dense_x_recon.shape == (8, 32)
+    assert dense_h.shape == (8, 64)
+    assert dense_f.shape == (8, 64)
+    assert dense_indices.shape == (8 * 4,)
+    assert sparse_indices.shape == (8 * 4,)
+    assert torch.allclose(sparse_h, dense_h)
+    assert torch.equal(sparse_indices, dense_indices)
+    assert torch.allclose(sparse_x_recon, dense_x_recon, atol=1e-6)
+    assert torch.allclose(
+        topk_values,
+        dense_f.flatten().gather(dim=0, index=dense_indices),
+    )
 
 
 def test_sparse_forward_matches_dense_forward():
@@ -216,6 +269,42 @@ def test_sparse_loss_matches_dense_loss():
     assert torch.allclose(sparse_loss, dense_loss, atol=1e-6)
     for key in dense_losses:
         assert torch.allclose(sparse_losses[key], dense_losses[key], atol=1e-6)
+
+
+def test_matryoshka_loss_uses_prefix_reconstruction_errors():
+    """Test Matryoshka loss averages reconstruction errors over group prefixes."""
+    model = MatryoshkaBatchTopKSAE(
+        input_dim=2,
+        n_features=2,
+        top_k=2,
+        group_sizes=[1, 1],
+        group_weights=[0.5, 0.5],
+    )
+    with torch.no_grad():
+        model.b_dec.zero_()
+        model.decoder.weight.copy_(torch.eye(2))
+
+    x = torch.tensor([[1.0, 1.0]])
+    h = torch.zeros(1, 2)
+    topk_values = torch.tensor([1.0, 1.0])
+    topk_indices = torch.tensor([0, 1])
+    x_recon = model._decode_sparse_prefix(topk_values, topk_indices, batch_size=1)
+
+    loss, losses = model.compute_loss_sparse(
+        x,
+        x_recon,
+        h,
+        topk_values,
+        topk_indices,
+        aux_loss_weight=0.0,
+        update_stats=False,
+    )
+
+    assert torch.allclose(x_recon, x)
+    assert torch.allclose(losses["reconstruction"], torch.tensor(0.5))
+    assert torch.allclose(losses["min_reconstruction"], torch.tensor(0.0))
+    assert torch.allclose(losses["max_reconstruction"], torch.tensor(1.0))
+    assert torch.allclose(loss.detach(), losses["reconstruction"])
 
 
 def test_auxiliary_loss_zero_for_balanced_feature_usage():
@@ -349,6 +438,24 @@ def test_training_config():
     config_dict = config.to_dict()
     assert config_dict["input_dim"] == 128
     assert config_dict["n_features"] == 256
+
+
+def test_training_config_serializes_matryoshka_options():
+    """Test TrainingConfig includes Matryoshka architecture options."""
+    config = TrainingConfig(
+        input_dim=128,
+        n_features=256,
+        architecture="matryoshka_batch_topk",
+        matryoshka_group_sizes=[64, 64, 128],
+        matryoshka_group_weights=[0.2, 0.3, 0.5],
+        matryoshka_active_groups=2,
+    )
+
+    config_dict = config.to_dict()
+    assert config_dict["architecture"] == "matryoshka_batch_topk"
+    assert config_dict["matryoshka_group_sizes"] == [64, 64, 128]
+    assert config_dict["matryoshka_group_weights"] == [0.2, 0.3, 0.5]
+    assert config_dict["matryoshka_active_groups"] == 2
 
 
 def test_sae_optimizer():
@@ -718,6 +825,38 @@ def test_train_sae_from_embeddings_path_can_skip_normalize(tmp_path):
     assert torch.equal(dataset[0], torch.full((8,), 2.0))
 
 
+def test_train_sae_matryoshka_checkpoint_loads_with_group_config(tmp_path):
+    """Test Matryoshka checkpoints save and load architecture group metadata."""
+    embeddings = torch.randn(16, 8)
+    dataset = EmbeddingDataset(embeddings)
+
+    trainer = train_sae(
+        dataset=dataset,
+        input_dim=8,
+        n_features=16,
+        architecture="matryoshka_batch_topk",
+        matryoshka_group_sizes=[4, 4, 8],
+        matryoshka_group_weights=[0.2, 0.3, 0.5],
+        top_k=2,
+        steps=1,
+        batch_size=8,
+        output_dir=str(tmp_path / "matryoshka_checkpoint"),
+        save_frequency=100,
+    )
+
+    from saetopic.sae.loaders import SAECheckpoint
+
+    checkpoint_dir = tmp_path / "matryoshka_checkpoint" / "final"
+    config = json.loads((checkpoint_dir / "config.json").read_text())
+    checkpoint = SAECheckpoint.from_pretrained(checkpoint_dir)
+
+    assert trainer.state.global_step == 1
+    assert config["architecture"] == "matryoshka_batch_topk"
+    assert config["matryoshka_group_sizes"] == [4, 4, 8]
+    assert isinstance(checkpoint.get_model(), MatryoshkaBatchTopKSAE)
+    assert checkpoint.get_model().group_sizes.tolist() == [4, 4, 8]
+
+
 def test_cli_train_passes_mmap_and_normalize_flags(monkeypatch):
     """Test CLI train forwards mmap and normalize flags to EmbeddingDataset."""
     import argparse
@@ -900,6 +1039,85 @@ def test_cli_train_passes_validation_and_early_stopping_args(monkeypatch):
     assert captured_train["config"].early_stopping_patience == 3
     assert captured_train["config"].early_stopping_min_delta == 0.01
     assert captured_train["config"].early_stopping_metric == "val_reconstruction"
+
+
+def test_cli_train_passes_matryoshka_args(monkeypatch):
+    """Test CLI train forwards Matryoshka-specific architecture config."""
+    import argparse
+
+    import saetopic.training as training_package
+    import saetopic.training.cli as training_cli
+    import saetopic.training.data as data_module
+
+    class DummyDataset:
+        embedding_dim = 8
+
+    captured_train = {}
+
+    monkeypatch.setattr(
+        data_module.EmbeddingDataset,
+        "from_file",
+        lambda path, normalize=True, mmap_mode=None: DummyDataset(),
+    )
+
+    def fake_train_sae(*, dataset, config, val_dataset=None):
+        captured_train.update({"dataset": dataset, "config": config, "val_dataset": val_dataset})
+        return object()
+
+    monkeypatch.setattr(training_package, "train_sae", fake_train_sae)
+
+    args = argparse.Namespace(
+        embeddings="train.npy",
+        validation_embeddings=None,
+        no_mmap=False,
+        no_normalize_embeddings=True,
+        input_dim=None,
+        n_features=16,
+        expansion_factor=32,
+        top_k=4,
+        architecture="matryoshka_batch_topk",
+        matryoshka_group_sizes=[4, 4, 8],
+        matryoshka_group_fractions=None,
+        matryoshka_group_weights=[0.2, 0.3, 0.5],
+        matryoshka_active_groups=2,
+        decoder_bias=True,
+        encoder_bias=False,
+        normalization=None,
+        learning_rate=1e-3,
+        batch_size=32,
+        n_epochs=10,
+        steps=None,
+        warmup_ratio=0.1,
+        warmup_steps=None,
+        device="cpu",
+        seed=42,
+        save_frequency=100,
+        early_stopping=False,
+        early_stopping_patience=5,
+        early_stopping_min_delta=1e-4,
+        early_stopping_metric="reconstruction",
+        recon_loss_weight=1.0,
+        sparsity_loss_weight=1.0,
+        sparsity_warmup_steps=2000,
+        aux_loss_weight=1 / 32,
+        bandwidth=0.001,
+        target_l0=20.0,
+        output="checkpoints/test",
+        checkpoint_name="test",
+        dataset_name="dataset",
+        dataset_license="license",
+        upload_to_hf=None,
+        create_repo=False,
+        private=False,
+    )
+
+    training_cli.train_sae_from_args(args)
+
+    config = captured_train["config"]
+    assert config.architecture == "matryoshka_batch_topk"
+    assert config.matryoshka_group_sizes == [4, 4, 8]
+    assert config.matryoshka_group_weights == [0.2, 0.3, 0.5]
+    assert config.matryoshka_active_groups == 2
 
 
 def test_cli_embed_passes_streaming_and_sentence_transformer_args(monkeypatch):
