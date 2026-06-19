@@ -99,7 +99,7 @@ sae:
     warmup_ratio: 0.1
     aux_loss_weight: 0.03125
     early_stopping: true
-    early_stopping_patience: 5
+    early_stopping_patience: 2
     early_stopping_min_delta: 0.0001
     early_stopping_metric: val_reconstruction
     device: auto
