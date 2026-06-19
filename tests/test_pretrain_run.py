@@ -118,8 +118,8 @@ def test_run_vision_probe_writes_sample_and_feature_outputs(monkeypatch, tmp_pat
             assert payloads == ["image-a.jpg", ("caption", "image-b.jpg")]
             return np.asarray(
                 [
-                    [1.0, 0.0, 0.0],
-                    [0.0, 1.0, 0.0],
+                    [1.0, 0.0, 0.0, 9.0],
+                    [0.0, 1.0, 0.0, 9.0],
                 ],
                 dtype=np.float32,
             )
@@ -165,6 +165,7 @@ def test_run_vision_probe_writes_sample_and_feature_outputs(monkeypatch, tmp_pat
             "batch_size": 2,
             "activation_batch_size": 2,
             "top_k": 2,
+            "truncate_dim": 3,
             "device": "cpu",
         },
     }

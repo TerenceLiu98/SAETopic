@@ -644,13 +644,21 @@ def run_vision_probe(config: dict[str, Any]) -> None:
             probe_cfg.get("batch_size", config["embedding_model"].get("batch_size", 16))
         ),
     )
-    if bool(probe_cfg.get("normalize", True)):
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        embeddings = embeddings / np.where(norms == 0, 1.0, norms)
-
     checkpoint = resolve_path(probe_cfg.get("checkpoint_path")) or checkpoint_path(config)
     sae_checkpoint = SAECheckpoint.from_pretrained(checkpoint)
     sae = sae_checkpoint.get_model()
+    if embeddings.shape[1] > sae_checkpoint.embedding_dim:
+        original_dim = embeddings.shape[1]
+        truncate_dim = int(probe_cfg.get("truncate_dim", sae_checkpoint.embedding_dim))
+        if truncate_dim == sae_checkpoint.embedding_dim:
+            embeddings = embeddings[:, : sae_checkpoint.embedding_dim]
+            console.print(
+                "Truncated vision embeddings "
+                f"from {original_dim} to SAE input_dim={sae_checkpoint.embedding_dim}"
+            )
+    if bool(probe_cfg.get("normalize", True)):
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        embeddings = embeddings / np.where(norms == 0, 1.0, norms)
     if embeddings.shape[1] != sae_checkpoint.embedding_dim:
         raise ValueError(
             f"Vision embeddings have dimension {embeddings.shape[1]}, but SAE expects "
