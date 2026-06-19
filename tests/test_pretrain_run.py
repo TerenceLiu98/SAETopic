@@ -4,6 +4,7 @@ import json
 
 import numpy as np
 import pandas as pd
+import torch
 
 import pretrain.run as pretrain_run
 
@@ -108,3 +109,82 @@ def test_save_topic_outputs_orders_topics_by_cluster_size(tmp_path):
     assert clusters["cluster_id"].tolist() == [1, 2, 0]
     assert topic_info["Topic"].tolist() == [1, 2, 0]
     assert mapping == {"0": [0], "1": [1], "2": [2]}
+
+
+def test_run_vision_probe_writes_sample_and_feature_outputs(monkeypatch, tmp_path):
+    class FakeEmbedder:
+        def encode_document(self, payloads, **kwargs):
+            del kwargs
+            assert payloads == ["image-a.jpg", ("caption", "image-b.jpg")]
+            return np.asarray(
+                [
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                ],
+                dtype=np.float32,
+            )
+
+    class FakeSAE(torch.nn.Module):
+        n_features = 4
+
+        def forward(self, x):
+            h = torch.asarray(
+                [
+                    [0.5, 2.0, 0.1, 1.0],
+                    [3.0, 0.2, 0.4, 0.1],
+                ],
+                device=x.device,
+                dtype=torch.float32,
+            )
+            f = h
+            return x.float(), h, f, torch.empty((0, 2), device=x.device)
+
+    class FakeCheckpoint:
+        embedding_dim = 3
+
+        def get_model(self):
+            return FakeSAE()
+
+    monkeypatch.setattr(pretrain_run, "build_vision_probe_embedder", lambda config: FakeEmbedder())
+    monkeypatch.setattr(
+        pretrain_run.SAECheckpoint,
+        "from_pretrained",
+        classmethod(lambda cls, checkpoint: FakeCheckpoint()),
+    )
+    monkeypatch.setattr(pretrain_run, "checkpoint_path", lambda config: tmp_path / "checkpoint")
+
+    config = {
+        "embedding_model": {"batch_size": 2, "model_kwargs": {}},
+        "topics": {"device": "cpu"},
+        "vision_probe": {
+            "out_dir": str(tmp_path / "vision_probe"),
+            "inputs": [
+                {"id": "a", "image": "image-a.jpg", "label": "first"},
+                {"id": "b", "image": "image-b.jpg", "text": "caption"},
+            ],
+            "batch_size": 2,
+            "activation_batch_size": 2,
+            "top_k": 2,
+            "device": "cpu",
+        },
+    }
+
+    pretrain_run.run_vision_probe(config)
+
+    out_dir = tmp_path / "vision_probe"
+    samples = [
+        json.loads(line)
+        for line in (out_dir / "samples.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    feature_summary = pd.read_csv(out_dir / "feature_summary.csv")
+    summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+
+    assert samples[0]["id"] == "a"
+    assert samples[0]["top_features"] == [
+        {"activation": 2.0, "feature": 1},
+        {"activation": 1.0, "feature": 3},
+    ]
+    assert samples[1]["top_features"][0] == {"activation": 3.0, "feature": 0}
+    assert feature_summary["feature"].tolist() == [0, 1, 3, 2]
+    assert summary["n_images"] == 2
+    assert summary["mean_reconstruction_cosine"] == 1.0

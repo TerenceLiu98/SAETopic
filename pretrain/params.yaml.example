@@ -171,3 +171,26 @@ evaluation:
   n: 4
   r: 3
   seed: null
+
+vision_probe:
+  # Run with:
+  # PYTHONPATH=src python pretrain/run.py --config pretrain/params.yaml --stages vision_probe
+  checkpoint_path: null
+  out_dir: results/vision_probe
+  input_file: null
+  inputs: []
+  # Inline examples:
+  # inputs:
+  #   - id: car
+  #     image: https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/car.jpg
+  #     label: car
+  modality: vision
+  task: clustering
+  encode_method: document
+  batch_size: 8
+  activation_batch_size: 128
+  top_k: 10
+  activation_mode: dense
+  normalize: true
+  truncate_dim: 768
+  device: auto

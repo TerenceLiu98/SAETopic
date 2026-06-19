@@ -9,6 +9,7 @@ under ``pretrain/``.
 from __future__ import annotations
 
 import argparse
+import csv
 import gc
 import json
 import os
@@ -49,6 +50,7 @@ from saetopic.evaluation import (
     summarize_metric,
 )
 from saetopic.merging import preload_word_embedding_model
+from saetopic.sae.loaders import SAECheckpoint
 from saetopic.training import (
     StreamingEmbeddingDataset,
     compute_and_save_embeddings,
@@ -510,6 +512,256 @@ def checkpoint_path(config: dict[str, Any]) -> Path:
         raise ValueError("topics.checkpoint_path or sae.training.output_dir is required")
     best = train_output / "best"
     return best if best.exists() else train_output / "final"
+
+
+def load_vision_probe_inputs(probe_cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Load image probe records from inline config, JSONL, CSV, or TXT."""
+    records: list[dict[str, Any]] = []
+    inline_inputs = probe_cfg.get("inputs") or []
+    for idx, item in enumerate(inline_inputs):
+        if isinstance(item, str):
+            records.append({"id": str(idx), "image": item})
+        elif isinstance(item, dict):
+            record = dict(item)
+            record.setdefault("id", str(idx))
+            records.append(record)
+        else:
+            raise TypeError("vision_probe.inputs entries must be strings or mappings")
+
+    input_file = resolve_path(probe_cfg.get("input_file"))
+    if input_file is None:
+        return records
+    if not input_file.exists():
+        raise FileNotFoundError(f"vision_probe.input_file does not exist: {input_file}")
+
+    suffix = input_file.suffix.lower()
+    if suffix == ".jsonl":
+        with input_file.open("r", encoding="utf-8") as f:
+            for line_idx, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise ValueError(f"Expected JSON object on line {line_idx + 1} of {input_file}")
+                record.setdefault("id", str(len(records)))
+                records.append(record)
+    elif suffix == ".csv":
+        with input_file.open("r", encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                record = {key: value for key, value in row.items() if value not in {None, ""}}
+                record.setdefault("id", str(len(records)))
+                records.append(record)
+    else:
+        with input_file.open("r", encoding="utf-8") as f:
+            for line in f:
+                image = line.strip()
+                if image:
+                    records.append({"id": str(len(records)), "image": image})
+
+    return records
+
+
+def build_vision_probe_embedder(config: dict[str, Any]):
+    """Build a Jina/SentenceTransformer embedder configured for vision probing."""
+    probe_cfg = config.get("vision_probe", {})
+    vision_config = dict(config)
+    model_cfg = dict(config["embedding_model"])
+    model_kwargs = dict(model_cfg.get("model_kwargs") or {})
+    model_kwargs["modality"] = probe_cfg.get("modality", "vision")
+    model_kwargs["default_task"] = probe_cfg.get(
+        "task",
+        model_kwargs.get("default_task", model_cfg.get("task", "clustering")),
+    )
+    model_cfg["model_kwargs"] = model_kwargs
+    if probe_cfg.get("device") is not None:
+        model_cfg["device"] = probe_cfg["device"]
+    if probe_cfg.get("truncate_dim") is not None:
+        model_cfg["truncate_dim"] = int(probe_cfg["truncate_dim"])
+    vision_config["embedding_model"] = model_cfg
+    return build_embedder(vision_config)
+
+
+def _vision_probe_payload(record: dict[str, Any]) -> Any:
+    image = record.get("image") or record.get("path") or record.get("url")
+    text = record.get("text") or record.get("caption")
+    if image is None:
+        raise ValueError(f"Vision probe record is missing image/path/url: {record}")
+    image = str(image)
+    if text:
+        return (str(text), image)
+    return image
+
+
+def _encode_probe_payloads(
+    embedder,
+    payloads: list[Any],
+    *,
+    encode_method: str,
+    batch_size: int,
+) -> np.ndarray:
+    encode_kwargs = {"batch_size": batch_size, "show_progress_bar": True}
+    if encode_method == "document":
+        encode_document = getattr(embedder, "encode_document", None)
+        if callable(encode_document):
+            embeddings = encode_document(payloads, **encode_kwargs)
+        else:
+            embeddings = embedder.encode(payloads, prompt_name="document", **encode_kwargs)
+    elif encode_method == "query":
+        encode_query = getattr(embedder, "encode_query", None)
+        if callable(encode_query):
+            embeddings = encode_query(payloads, **encode_kwargs)
+        else:
+            embeddings = embedder.encode(payloads, prompt_name="query", **encode_kwargs)
+    elif encode_method == "encode":
+        embeddings = embedder.encode(payloads, **encode_kwargs)
+    else:
+        raise ValueError("vision_probe.encode_method must be 'document', 'query', or 'encode'")
+    return np.asarray(embeddings, dtype=np.float32)
+
+
+def run_vision_probe(config: dict[str, Any]) -> None:
+    """Probe how image embeddings activate a trained text/omni SAE."""
+    probe_cfg = config.get("vision_probe", {})
+    records = load_vision_probe_inputs(probe_cfg)
+    if not records:
+        raise ValueError(
+            "vision_probe needs inputs. Set vision_probe.inputs or vision_probe.input_file."
+        )
+
+    out_dir = resolve_path(probe_cfg.get("out_dir", "results/vision_probe"))
+    if out_dir is None:
+        raise ValueError("vision_probe.out_dir is required")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    embedder = build_vision_probe_embedder(config)
+    payloads = [_vision_probe_payload(record) for record in records]
+    embeddings = _encode_probe_payloads(
+        embedder,
+        payloads,
+        encode_method=str(probe_cfg.get("encode_method", "document")),
+        batch_size=int(
+            probe_cfg.get("batch_size", config["embedding_model"].get("batch_size", 16))
+        ),
+    )
+    if bool(probe_cfg.get("normalize", True)):
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        embeddings = embeddings / np.where(norms == 0, 1.0, norms)
+
+    checkpoint = resolve_path(probe_cfg.get("checkpoint_path")) or checkpoint_path(config)
+    sae_checkpoint = SAECheckpoint.from_pretrained(checkpoint)
+    sae = sae_checkpoint.get_model()
+    if embeddings.shape[1] != sae_checkpoint.embedding_dim:
+        raise ValueError(
+            f"Vision embeddings have dimension {embeddings.shape[1]}, but SAE expects "
+            f"{sae_checkpoint.embedding_dim}. Set embedding_model.truncate_dim or "
+            "vision_probe.truncate_dim to match the SAE input_dim."
+        )
+
+    device = model_device(probe_cfg.get("device", config.get("topics", {}).get("device", "auto")))
+    dev = torch.device(device)
+    sae = sae.to(dev).eval()
+    sae_dtype = torch.float32 if dev.type == "cpu" else torch.bfloat16
+    top_k = int(probe_cfg.get("top_k", 10))
+    activation_mode = str(probe_cfg.get("activation_mode", "dense"))
+    if activation_mode not in {"dense", "sparse"}:
+        raise ValueError("vision_probe.activation_mode must be 'dense' or 'sparse'")
+
+    sample_results: list[dict[str, Any]] = []
+    feature_stats: dict[int, dict[str, float]] = {}
+    recon_mse_values: list[float] = []
+    recon_cosine_values: list[float] = []
+
+    activation_batch_size = int(probe_cfg.get("activation_batch_size", 128))
+    with torch.no_grad():
+        for start in range(0, len(embeddings), activation_batch_size):
+            batch_np = embeddings[start : start + activation_batch_size]
+            batch = torch.from_numpy(batch_np).to(dev, dtype=sae_dtype)
+            x_recon, h, f, _ = sae(batch)
+            feature_values = h.float() if activation_mode == "dense" else f.float()
+            k = min(top_k, feature_values.shape[1])
+            top_values, top_indices = torch.topk(feature_values, k=k, dim=1, sorted=True)
+            mse = (batch.float() - x_recon.float()).pow(2).mean(dim=1)
+            cosine = torch.nn.functional.cosine_similarity(batch.float(), x_recon.float(), dim=1)
+
+            for local_idx in range(len(batch_np)):
+                record_idx = start + local_idx
+                indices = [int(value) for value in top_indices[local_idx].cpu().tolist()]
+                values = [float(value) for value in top_values[local_idx].cpu().tolist()]
+                top_features = [
+                    {"feature": feature, "activation": activation}
+                    for feature, activation in zip(indices, values, strict=True)
+                ]
+                for rank, (feature, activation) in enumerate(
+                    zip(indices, values, strict=True),
+                    start=1,
+                ):
+                    stats = feature_stats.setdefault(
+                        feature,
+                        {"count": 0.0, "activation_sum": 0.0, "best_rank": float(rank)},
+                    )
+                    stats["count"] += 1.0
+                    stats["activation_sum"] += activation
+                    stats["best_rank"] = min(stats["best_rank"], float(rank))
+
+                recon_mse = float(mse[local_idx].cpu())
+                recon_cosine = float(cosine[local_idx].cpu())
+                recon_mse_values.append(recon_mse)
+                recon_cosine_values.append(recon_cosine)
+
+                source = records[record_idx]
+                sample_results.append(
+                    {
+                        "id": source.get("id", str(record_idx)),
+                        "image": source.get("image") or source.get("path") or source.get("url"),
+                        "label": source.get("label"),
+                        "text": source.get("text") or source.get("caption"),
+                        "reconstruction_mse": recon_mse,
+                        "reconstruction_cosine": recon_cosine,
+                        "top_features": top_features,
+                    }
+                )
+
+    with (out_dir / "samples.jsonl").open("w", encoding="utf-8") as f:
+        for row in sample_results:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+
+    with (out_dir / "feature_summary.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["feature", "count", "mean_activation", "best_rank"],
+        )
+        writer.writeheader()
+        for feature, stats in sorted(
+            feature_stats.items(),
+            key=lambda item: (-item[1]["count"], -item[1]["activation_sum"], item[0]),
+        ):
+            writer.writerow(
+                {
+                    "feature": feature,
+                    "count": int(stats["count"]),
+                    "mean_activation": stats["activation_sum"] / max(stats["count"], 1.0),
+                    "best_rank": int(stats["best_rank"]),
+                }
+            )
+
+    summary = {
+        "n_images": len(records),
+        "embedding_dim": int(embeddings.shape[1]),
+        "checkpoint_path": str(checkpoint),
+        "activation_mode": activation_mode,
+        "top_k": top_k,
+        "mean_reconstruction_mse": float(np.mean(recon_mse_values)) if recon_mse_values else 0.0,
+        "mean_reconstruction_cosine": (
+            float(np.mean(recon_cosine_values)) if recon_cosine_values else 0.0
+        ),
+        "outputs": {
+            "samples": str(out_dir / "samples.jsonl"),
+            "feature_summary": str(out_dir / "feature_summary.csv"),
+        },
+    }
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True))
+    console.print(f"Wrote vision probe outputs to {out_dir}")
 
 
 def load_news20k(
@@ -1087,6 +1339,8 @@ def run_stage(stage: str, config: dict[str, Any]) -> None:
         run_topics(config)
     elif stage == "evaluate":
         run_evaluate(config)
+    elif stage == "vision_probe":
+        run_vision_probe(config)
     else:
         raise ValueError(f"Unknown pretrain stage: {stage}")
 
@@ -1098,7 +1352,10 @@ def main(default_stages: list[str] | None = None) -> None:
         "--stages",
         nargs="+",
         default=None,
-        help="Stages to run: chunks embeddings train_sae topics evaluate. Defaults to pipeline.stages.",
+        help=(
+            "Stages to run: chunks embeddings train_sae topics evaluate vision_probe. "
+            "Defaults to pipeline.stages."
+        ),
     )
     args = parser.parse_args()
 
