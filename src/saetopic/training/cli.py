@@ -140,8 +140,8 @@ def main() -> None:
     train_parser.add_argument(
         "--orthogonality-freq",
         type=int,
-        default=1,
-        help="Evaluate the OrtSAE penalty every Nth step, scaling gamma by N (1 = every step)",
+        default=10,
+        help="Evaluate the OrtSAE penalty every Nth step, scaling gamma by N",
     )
     train_parser.add_argument(
         "--decoder-bias",
@@ -621,7 +621,7 @@ def train_sae_from_args(args: argparse.Namespace) -> None:
         matryoshka_active_groups=getattr(args, "matryoshka_active_groups", None),
         orthogonality_weight=getattr(args, "orthogonality_weight", 0.25),
         orthogonality_chunk_size=getattr(args, "orthogonality_chunk_size", 8192),
-        orthogonality_freq=getattr(args, "orthogonality_freq", 1),
+        orthogonality_freq=getattr(args, "orthogonality_freq", 10),
         learning_rate=args.learning_rate,
         batch_size=args.batch_size,
         n_epochs=args.n_epochs,

@@ -33,7 +33,6 @@ if TYPE_CHECKING:
         BatchTopKSAE,
         JumpReLUSAE,
         MatryoshkaBatchTopKSAE,
-        OrtBatchTopKSAE,
         StandardSAE,
         TopKSAE,
     )
@@ -112,7 +111,7 @@ class TrainingConfig:
     # OrtSAE (ort_batch_topk) orthogonality penalty hyperparameters.
     orthogonality_weight: float = 0.25
     orthogonality_chunk_size: int = 8192
-    orthogonality_freq: int = 1
+    orthogonality_freq: int = 10
     early_stopping: bool = False
     early_stopping_patience: int = 5
     early_stopping_min_delta: float = 1e-4
@@ -444,9 +443,7 @@ class SAETrainer:
         """
         self.model.train()
 
-        epoch_losses = {
-            key: 0.0 for key in ["total", "reconstruction", "sparsity", "auxiliary", "r2"]
-        }
+        epoch_losses: dict[str, float] = {}
         n_batches = 0
 
         # Use rich.progress for better terminal output
@@ -469,7 +466,8 @@ class SAETrainer:
 
                 # Update statistics
                 n_batches += 1
-                for key in epoch_losses:
+                for key in losses:
+                    epoch_losses.setdefault(key, 0.0)
                     epoch_losses[key] += losses[key].item()
 
                 # Update progress bar
@@ -488,9 +486,7 @@ class SAETrainer:
         """Evaluate one validation epoch without updating SAE training statistics."""
         self.model.eval()
 
-        val_losses = {
-            key: 0.0 for key in ["total", "reconstruction", "sparsity", "auxiliary", "r2"]
-        }
+        val_losses: dict[str, float] = {}
         n_batches = 0
 
         sparsity_loss_weight = self.config.sparsity_loss_weight
@@ -518,7 +514,8 @@ class SAETrainer:
                 )
 
                 n_batches += 1
-                for key in val_losses:
+                for key in losses:
+                    val_losses.setdefault(key, 0.0)
                     val_losses[key] += losses[key].item()
 
         self.model.train()
@@ -752,9 +749,7 @@ class SAETrainer:
         assert self.config.steps is not None
         self.model.train()
 
-        running_losses = {
-            key: 0.0 for key in ["total", "reconstruction", "sparsity", "auxiliary", "r2"]
-        }
+        running_losses: dict[str, float] = {}
         n_batches = 0
 
         with Progress(
@@ -778,7 +773,8 @@ class SAETrainer:
 
                     losses = self._train_batch(batch)
                     n_batches += 1
-                    for key in running_losses:
+                    for key in losses:
+                        running_losses.setdefault(key, 0.0)
                         running_losses[key] += losses[key].item()
 
                     avg_loss = running_losses["total"] / n_batches
@@ -835,13 +831,7 @@ class SAETrainer:
         for epoch in range(start_epoch, self.config.n_epochs + 1):
             self.model.train()
 
-            epoch_losses = {
-                "total": 0.0,
-                "reconstruction": 0.0,
-                "sparsity": 0.0,
-                "auxiliary": 0.0,
-                "r2": 0.0,
-            }
+            epoch_losses: dict[str, float] = {}
             n_batches = 0
 
             # Create progress bar for streaming (no total length known)
@@ -867,7 +857,8 @@ class SAETrainer:
 
                         # Update statistics
                         n_batches += 1
-                        for key in epoch_losses:
+                        for key in losses:
+                            epoch_losses.setdefault(key, 0.0)
                             epoch_losses[key] += losses[key].item()
 
                         # Update progress bar
@@ -907,13 +898,7 @@ class SAETrainer:
         assert self.config.steps is not None
         self.model.train()
 
-        running_losses = {
-            "total": 0.0,
-            "reconstruction": 0.0,
-            "sparsity": 0.0,
-            "auxiliary": 0.0,
-            "r2": 0.0,
-        }
+        running_losses: dict[str, float] = {}
         n_batches = 0
 
         with Progress(
@@ -942,7 +927,8 @@ class SAETrainer:
                         made_progress = True
 
                         n_batches += 1
-                        for key in running_losses:
+                        for key in losses:
+                            running_losses.setdefault(key, 0.0)
                             running_losses[key] += losses[key].item()
 
                         avg_loss = running_losses["total"] / n_batches

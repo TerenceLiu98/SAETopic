@@ -27,11 +27,12 @@ def test_import_config():
 
 def test_import_sae_modules():
     """Test that SAE modules can be imported."""
-    from saetopic.sae import activations, loaders, modules
+    from saetopic.sae import OrtBatchTopKSAE, activations, loaders, modules
 
     assert modules is not None
     assert loaders is not None
     assert activations is not None
+    assert OrtBatchTopKSAE is not None
 
 
 def test_import_interpretation():

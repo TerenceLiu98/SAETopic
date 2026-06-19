@@ -95,7 +95,7 @@ def test_create_sae_ort_batch_topk():
 
 
 def test_ort_batch_topk_orthogonality_loss_penalizes_correlation():
-    """Orthogonality loss is ~1 for identical decoder columns, ~0 for orthogonal."""
+    """Orthogonality loss is ~1 for aligned/opposed columns, ~0 for orthogonal."""
     model = OrtBatchTopKSAE(input_dim=4, n_features=4, top_k=2, orthogonality_chunk_size=8192)
 
     with torch.no_grad():
@@ -109,6 +109,22 @@ def test_ort_batch_topk_orthogonality_loss_penalizes_correlation():
         model.decoder.weight.data = torch.eye(4)
     orthogonal_loss = model._orthogonality_loss().item()
     assert orthogonal_loss < 1e-5
+
+    with torch.no_grad():
+        opposed = torch.eye(4)
+        opposed[:, 1] = -opposed[:, 0]
+        model.decoder.weight.data = opposed
+    opposed_loss = model._orthogonality_loss().item()
+    assert opposed_loss > 0.45
+
+
+def test_ort_batch_topk_default_frequency_is_sparse():
+    """OrtSAE defaults to a sparse penalty schedule for large dictionaries."""
+    model = OrtBatchTopKSAE(input_dim=16, n_features=32, top_k=4)
+    config = TrainingConfig(input_dim=16)
+
+    assert model.orthogonality_freq == 10
+    assert config.orthogonality_freq == 10
 
 
 def test_ort_batch_topk_loss_backprop_and_key():
@@ -728,6 +744,29 @@ def test_train_sae_auto_resume_uses_latest_checkpoint(tmp_path):
     assert resumed.config.resume_from_checkpoint is not None
     assert Path(resumed.config.resume_from_checkpoint).parent == output_dir
     assert resumed.state.global_step == 5
+
+
+def test_train_sae_records_ort_batch_topk_orthogonality_loss(tmp_path):
+    """Test trainer epoch aggregation keeps OrtSAE-specific loss keys."""
+    embeddings = torch.randn(16, 8)
+    dataset = EmbeddingDataset(embeddings)
+
+    trainer = train_sae(
+        dataset=dataset,
+        input_dim=8,
+        n_features=16,
+        architecture="ort_batch_topk",
+        orthogonality_freq=1,
+        top_k=2,
+        n_epochs=1,
+        batch_size=8,
+        output_dir=str(tmp_path / "ort_loss_logging"),
+        save_frequency=100,
+    )
+
+    assert "orthogonality" in trainer.state.losses
+    assert len(trainer.state.losses["orthogonality"]) == 1
+    assert trainer.state.losses["orthogonality"][0] >= 0.0
 
 
 def test_decoder_columns_remain_unit_norm_after_training(tmp_path):

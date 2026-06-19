@@ -82,7 +82,7 @@ def _build_and_load_sae(checkpoint_dir: Path, config: dict[str, Any]):
             {
                 "orthogonality_weight": config.get("orthogonality_weight", 0.25),
                 "orthogonality_chunk_size": config.get("orthogonality_chunk_size", 8192),
-                "orthogonality_freq": config.get("orthogonality_freq", 1),
+                "orthogonality_freq": config.get("orthogonality_freq", 10),
             }
         )
 

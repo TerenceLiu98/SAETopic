@@ -758,7 +758,7 @@ class OrtBatchTopKSAE(BatchTopKSAE):
     orthogonality_chunk_size : int, default=8192
         Number of decoder features per chunk. Yields K = ceil(m / chunk_size)
         chunks, matching the paper's K = ceil(m / 8192).
-    orthogonality_freq : int, default=1
+    orthogonality_freq : int, default=10
         Evaluate the penalty every Nth training step and scale gamma by N,
         preserving the expected regularization strength while cutting the
         cost to ~1/N (OrtSAE Appendix C). 1 evaluates every step.
@@ -777,7 +777,7 @@ class OrtBatchTopKSAE(BatchTopKSAE):
         normalization: str | None = None,
         orthogonality_weight: float = 0.25,
         orthogonality_chunk_size: int = 8192,
-        orthogonality_freq: int = 1,
+        orthogonality_freq: int = 10,
         orthogonality_eps: float = 1e-8,
     ):
         super().__init__(
@@ -821,9 +821,9 @@ class OrtBatchTopKSAE(BatchTopKSAE):
                 continue
             sim = chunk @ chunk.t()  # (size, size) pairwise cosine similarities
             eye = torch.eye(size, device=sim.device, dtype=torch.bool)
-            sim = sim.masked_fill(eye, float("-inf"))  # exclude self-pairs
-            max_sim = sim.max(dim=1).values  # (size,) nearest neighbor per feature
-            chunk_losses.append((max_sim**2).mean())
+            sim_sq = sim.pow(2).masked_fill(eye, 0.0)  # exclude self-pairs
+            max_sim_sq = sim_sq.max(dim=1).values
+            chunk_losses.append(max_sim_sq.mean())
 
         if not chunk_losses:
             return torch.zeros((), device=features.device)
