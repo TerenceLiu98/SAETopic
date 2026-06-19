@@ -3,6 +3,7 @@ Tests for SAE training infrastructure.
 """
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -427,6 +428,8 @@ def test_training_config():
         n_features=256,
         top_k=8,
         batch_size=32,
+        resume=True,
+        resume_from_checkpoint="checkpoint_epoch_1",
     )
 
     assert config.input_dim == 128
@@ -438,6 +441,8 @@ def test_training_config():
     config_dict = config.to_dict()
     assert config_dict["input_dim"] == 128
     assert config_dict["n_features"] == 256
+    assert config_dict["resume"] is True
+    assert config_dict["resume_from_checkpoint"] == "checkpoint_epoch_1"
 
 
 def test_training_config_serializes_matryoshka_options():
@@ -540,6 +545,108 @@ def test_train_sae_steps_mode_runs_exact_steps(tmp_path):
 
     assert trainer.state.global_step == 5
     assert trainer.state.epoch == 2
+
+
+def test_train_sae_steps_mode_resumes_from_checkpoint(tmp_path):
+    """Test step-based SAE training restores model, optimizer, and state."""
+    embeddings = torch.randn(24, 16)
+    dataset = EmbeddingDataset(embeddings)
+    output_dir = tmp_path / "steps_resume"
+
+    first = train_sae(
+        dataset=dataset,
+        input_dim=16,
+        n_features=32,
+        top_k=4,
+        steps=2,
+        batch_size=8,
+        output_dir=str(output_dir),
+        save_frequency=1,
+    )
+
+    resumed = train_sae(
+        dataset=dataset,
+        input_dim=16,
+        n_features=32,
+        top_k=4,
+        steps=4,
+        batch_size=8,
+        output_dir=str(output_dir),
+        resume_from_checkpoint=str(output_dir / "checkpoint_step_2"),
+        save_frequency=100,
+    )
+
+    assert first.state.global_step == 2
+    assert resumed.state.global_step == 4
+    assert resumed.state.losses["total"]
+
+
+def test_train_sae_epoch_mode_resumes_from_checkpoint(tmp_path):
+    """Test epoch-based SAE training starts at the next saved epoch."""
+    embeddings = torch.randn(32, 16)
+    dataset = EmbeddingDataset(embeddings)
+    output_dir = tmp_path / "epoch_resume"
+
+    first = train_sae(
+        dataset=dataset,
+        input_dim=16,
+        n_features=32,
+        top_k=4,
+        n_epochs=1,
+        batch_size=8,
+        output_dir=str(output_dir),
+        save_frequency=1,
+    )
+
+    resumed = train_sae(
+        dataset=dataset,
+        input_dim=16,
+        n_features=32,
+        top_k=4,
+        n_epochs=2,
+        batch_size=8,
+        output_dir=str(output_dir),
+        resume_from_checkpoint=str(output_dir / "checkpoint_epoch_1"),
+        save_frequency=100,
+    )
+
+    assert first.state.epoch == 1
+    assert resumed.state.epoch == 2
+    assert resumed.state.global_step > first.state.global_step
+
+
+def test_train_sae_auto_resume_uses_latest_checkpoint(tmp_path):
+    """Test resume=True picks the checkpoint with the largest global step."""
+    embeddings = torch.randn(24, 16)
+    dataset = EmbeddingDataset(embeddings)
+    output_dir = tmp_path / "auto_resume"
+
+    train_sae(
+        dataset=dataset,
+        input_dim=16,
+        n_features=32,
+        top_k=4,
+        steps=3,
+        batch_size=8,
+        output_dir=str(output_dir),
+        save_frequency=1,
+    )
+
+    resumed = train_sae(
+        dataset=dataset,
+        input_dim=16,
+        n_features=32,
+        top_k=4,
+        steps=5,
+        batch_size=8,
+        output_dir=str(output_dir),
+        resume=True,
+        save_frequency=100,
+    )
+
+    assert resumed.config.resume_from_checkpoint is not None
+    assert Path(resumed.config.resume_from_checkpoint).parent == output_dir
+    assert resumed.state.global_step == 5
 
 
 def test_decoder_columns_remain_unit_norm_after_training(tmp_path):
@@ -921,6 +1028,8 @@ def test_cli_train_passes_mmap_and_normalize_flags(monkeypatch):
         device="cpu",
         seed=42,
         save_frequency=100,
+        resume=True,
+        resume_from_checkpoint="checkpoints/test/checkpoint_step_10",
         recon_loss_weight=1.0,
         sparsity_loss_weight=1.0,
         aux_loss_weight=0.001,
@@ -944,6 +1053,8 @@ def test_cli_train_passes_mmap_and_normalize_flags(monkeypatch):
     assert captured_train["val_dataset"] is None
     assert captured_train["config"].input_dim == 8
     assert captured_train["config"].top_k == 16
+    assert captured_train["config"].resume is True
+    assert captured_train["config"].resume_from_checkpoint == "checkpoints/test/checkpoint_step_10"
     assert captured_upload == {
         "checkpoint_dir": "checkpoints/test/final",
         "repo_id": "org/repo",

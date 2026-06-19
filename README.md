@@ -220,6 +220,8 @@ Notes:
 - SAE training uses sparse top-k paths internally, including BatchTopK and
   Matryoshka BatchTopK, so it does not materialize the dense
   `(batch_size, n_features)` activation tensor during training.
+- Interrupted SAE training can resume from saved training checkpoints with
+  `train --resume` or `train --resume-from-checkpoint path/to/checkpoint`.
 - The top-level `saetopic` inference CLI is planned. Current command-line
   training workflows use `saetopic-train` or `python -m saetopic.training.cli`.
 

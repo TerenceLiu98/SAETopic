@@ -88,6 +88,9 @@ sae:
     batch_size: 256
     n_epochs: 100
     save_frequency: 1
+    # Resume SAE training from an interrupted run.
+    resume: true
+    resume_from_checkpoint: null
     warmup_ratio: 0.1
     aux_loss_weight: 0.03125
     early_stopping: true

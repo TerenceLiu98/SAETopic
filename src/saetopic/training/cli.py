@@ -200,6 +200,17 @@ def main() -> None:
         help="Save checkpoint every N epochs",
     )
     train_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from the latest checkpoint in --output when available",
+    )
+    train_parser.add_argument(
+        "--resume-from-checkpoint",
+        type=str,
+        default=None,
+        help="Resume SAE training from a specific checkpoint directory",
+    )
+    train_parser.add_argument(
         "--early-stopping",
         action="store_true",
         help="Stop epoch-based training when validation metric stops improving",
@@ -592,6 +603,8 @@ def train_sae_from_args(args: argparse.Namespace) -> None:
         device=args.device,
         seed=args.seed,
         save_frequency=args.save_frequency,
+        resume=getattr(args, "resume", False),
+        resume_from_checkpoint=getattr(args, "resume_from_checkpoint", None),
         early_stopping=getattr(args, "early_stopping", False),
         early_stopping_patience=getattr(args, "early_stopping_patience", 5),
         early_stopping_min_delta=getattr(args, "early_stopping_min_delta", 1e-4),

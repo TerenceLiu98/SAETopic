@@ -87,6 +87,9 @@ Required behavior:
   explicitly overridden.
 - Checkpoints should include model weights, optimizer state, training state,
   config, model card, and checksums.
+- SAE training should resume from explicit checkpoint directories or the latest
+  checkpoint in the output directory, restoring model, optimizer, scheduler,
+  and training-state counters.
 - Generated model cards should describe the checkpoint as a training artifact
   until pretrained loading and inference APIs are implemented.
 - The train CLI may upload immediately after training, and the upload CLI should

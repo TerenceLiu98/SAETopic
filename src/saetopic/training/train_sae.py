@@ -25,11 +25,10 @@ from rich.progress import (
     TextColumn,
     TimeRemainingColumn,
 )
+from torch import Tensor
 from torch.utils.data import DataLoader
 
 if TYPE_CHECKING:
-    from torch import Tensor
-
     from saetopic.sae.modules import (
         BatchTopKSAE,
         JumpReLUSAE,
@@ -122,6 +121,8 @@ class TrainingConfig:
     # Output paths
     output_dir: str = "checkpoints/sae"
     checkpoint_name: str = "sae_checkpoint"
+    resume: bool = False
+    resume_from_checkpoint: str | None = None
 
     # Dataset info (for model card)
     dataset_name: str = ""
@@ -159,6 +160,8 @@ class TrainingConfig:
             "early_stopping_patience": self.early_stopping_patience,
             "early_stopping_min_delta": self.early_stopping_min_delta,
             "early_stopping_metric": self.early_stopping_metric,
+            "resume": self.resume,
+            "resume_from_checkpoint": self.resume_from_checkpoint,
         }
 
 
@@ -338,6 +341,41 @@ class SAETrainer:
         torch.manual_seed(config.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(config.seed)
+
+    def _load_resume_checkpoint(self) -> None:
+        """Restore model, optimizer, and training state from a checkpoint."""
+        if self.config.resume_from_checkpoint is None:
+            return
+        if self.optimizer is None:
+            raise RuntimeError("Optimizer must be created before loading a resume checkpoint")
+
+        checkpoint_dir = Path(self.config.resume_from_checkpoint)
+        if not checkpoint_dir.is_dir():
+            raise FileNotFoundError(f"Resume checkpoint directory not found: {checkpoint_dir}")
+
+        state_dict = _load_checkpoint_weights(checkpoint_dir, map_location="cpu")
+        self.model.load_state_dict(state_dict, strict=True)
+
+        optimizer_path = checkpoint_dir / "optimizer.pt"
+        if not optimizer_path.exists():
+            raise FileNotFoundError(f"optimizer.pt not found in {checkpoint_dir}")
+        optimizer_state = torch.load(optimizer_path, map_location=self.device)
+        self.optimizer.load_state_dict(optimizer_state)
+
+        training_state_path = checkpoint_dir / "training_state.pt"
+        if not training_state_path.exists():
+            raise FileNotFoundError(f"training_state.pt not found in {checkpoint_dir}")
+        raw_state = torch.load(training_state_path, map_location="cpu")
+        self.state = TrainingState(
+            epoch=int(raw_state.get("epoch", 0)),
+            global_step=int(raw_state.get("global_step", 0)),
+            best_loss=float(raw_state.get("best_loss", float("inf"))),
+            losses=dict(raw_state.get("losses", {})),
+        )
+        print(
+            "Resumed SAE training from "
+            f"{checkpoint_dir} (epoch={self.state.epoch}, step={self.state.global_step})"
+        )
 
     def _train_batch(self, batch: Tensor) -> dict[str, Tensor]:
         """Run one SAE-TM training step."""
@@ -562,6 +600,7 @@ class SAETrainer:
         """
         # Create optimizer with correct total_steps
         self._create_optimizer(dataset)
+        self._load_resume_checkpoint()
 
         # Check if dataset is a streaming iterator
         is_streaming = hasattr(dataset, "__iter__") and not hasattr(dataset, "__len__")
@@ -601,13 +640,13 @@ class SAETrainer:
         if self.config.early_stopping and val_loader is None:
             print("Warning: early_stopping=True requires val_dataset; disabling early stopping")
         early_stopping_enabled = self.config.early_stopping and val_loader is not None
-        best_metric = float("-inf") if self._metric_higher_is_better() else float("inf")
-        epochs_without_improvement = 0
+        best_metric, epochs_without_improvement = self._resume_early_stopping_state()
 
         if self.config.steps is not None:
             return self._fit_standard_steps(train_loader)
 
-        for epoch in range(1, self.config.n_epochs + 1):
+        start_epoch = min(self.state.epoch + 1, self.config.n_epochs + 1)
+        for epoch in range(start_epoch, self.config.n_epochs + 1):
             # Train epoch
             epoch_losses = self.train_epoch(train_loader, epoch)
 
@@ -669,6 +708,24 @@ class SAETrainer:
         self.save_metadata()
 
         return self.state
+
+    def _resume_early_stopping_state(self) -> tuple[float, int]:
+        """Recover early-stopping bookkeeping from saved validation history."""
+        default_best = float("-inf") if self._metric_higher_is_better() else float("inf")
+        metric_name = self.config.early_stopping_metric.removeprefix("val_")
+        history_key = f"val_{metric_name}"
+        history = self.state.losses.get(history_key, [])
+        if not history:
+            return default_best, 0
+
+        if self._metric_higher_is_better():
+            best_metric = max(history)
+            best_index = history.index(best_metric)
+        else:
+            best_metric = min(history)
+            best_index = history.index(best_metric)
+        epochs_without_improvement = max(0, len(history) - best_index - 1)
+        return float(best_metric), epochs_without_improvement
 
     def _metric_higher_is_better(self) -> bool:
         """Return whether the configured early stopping metric should increase."""
@@ -766,7 +823,8 @@ class SAETrainer:
         if self.config.steps is not None:
             return self._fit_streaming_steps(streaming_dataset)
 
-        for epoch in range(1, self.config.n_epochs + 1):
+        start_epoch = min(self.state.epoch + 1, self.config.n_epochs + 1)
+        for epoch in range(start_epoch, self.config.n_epochs + 1):
             self.model.train()
 
             epoch_losses = {
@@ -1050,6 +1108,113 @@ This is a clean-room implementation trained on permissively licensed data.
         checksum_path.write_text("\n".join(checksums))
 
 
+def _load_checkpoint_weights(
+    checkpoint_dir: Path,
+    map_location: str | torch.device = "cpu",
+) -> dict[str, Tensor]:
+    """Load model weights from a training checkpoint directory."""
+    safetensors_path = checkpoint_dir / "model.safetensors"
+    if safetensors_path.exists():
+        from safetensors.torch import load_file
+
+        return cast(dict[str, Tensor], load_file(str(safetensors_path), device=str(map_location)))
+
+    pt_path = checkpoint_dir / "model.pt"
+    if pt_path.exists():
+        return cast(dict[str, Tensor], torch.load(pt_path, map_location=map_location))
+
+    raise FileNotFoundError(
+        f"No model weights found in {checkpoint_dir} "
+        "(expected model.safetensors or model.pt)"
+    )
+
+
+def _checkpoint_global_step(checkpoint_dir: Path) -> int | None:
+    """Return the saved global step for a checkpoint directory."""
+    training_state_path = checkpoint_dir / "training_state.pt"
+    if not training_state_path.exists():
+        return None
+    try:
+        raw_state = torch.load(training_state_path, map_location="cpu")
+    except Exception:
+        return None
+    if not isinstance(raw_state, dict) or "global_step" not in raw_state:
+        return None
+    return int(raw_state["global_step"])
+
+
+def _latest_training_checkpoint(output_dir: Path) -> Path | None:
+    """Find the child checkpoint with the largest saved global_step."""
+    if not output_dir.exists():
+        return None
+
+    candidates: list[tuple[int, float, Path]] = []
+    for checkpoint_dir in output_dir.iterdir():
+        if not checkpoint_dir.is_dir():
+            continue
+        step = _checkpoint_global_step(checkpoint_dir)
+        if step is None:
+            continue
+        has_weights = (checkpoint_dir / "model.safetensors").exists() or (
+            checkpoint_dir / "model.pt"
+        ).exists()
+        if not has_weights or not (checkpoint_dir / "optimizer.pt").exists():
+            continue
+        candidates.append((step, checkpoint_dir.stat().st_mtime, checkpoint_dir))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[-1][2]
+
+
+def _resolve_resume_checkpoint(config: TrainingConfig) -> Path | None:
+    """Resolve explicit or automatic SAE training resume checkpoint."""
+    if config.resume_from_checkpoint is not None:
+        checkpoint_dir = Path(config.resume_from_checkpoint)
+        if not checkpoint_dir.is_dir():
+            raise FileNotFoundError(f"Resume checkpoint directory not found: {checkpoint_dir}")
+        return checkpoint_dir
+
+    if not config.resume:
+        return None
+
+    checkpoint_dir = _latest_training_checkpoint(Path(config.output_dir))
+    if checkpoint_dir is None:
+        print(f"No SAE checkpoint found in {config.output_dir}; starting from scratch")
+        return None
+    return checkpoint_dir
+
+
+def _apply_model_config_from_checkpoint(config: TrainingConfig, checkpoint_dir: Path) -> None:
+    """Use checkpoint model metadata for architecture-defining config fields."""
+    config_path = checkpoint_dir / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"config.json not found in {checkpoint_dir}")
+    with open(config_path) as f:
+        checkpoint_config = json.load(f)
+
+    model_fields = [
+        "input_dim",
+        "n_features",
+        "expansion_factor",
+        "top_k",
+        "architecture",
+        "decoder_bias",
+        "encoder_bias",
+        "normalization",
+        "bandwidth",
+        "target_l0",
+        "matryoshka_group_sizes",
+        "matryoshka_group_fractions",
+        "matryoshka_group_weights",
+        "matryoshka_active_groups",
+    ]
+    for field_name in model_fields:
+        if field_name in checkpoint_config:
+            setattr(config, field_name, checkpoint_config[field_name])
+
+
 def train_sae(
     embeddings_path: str | Path | None = None,
     dataset: "EmbeddingDataset | ShardedEmbeddingDataset | None" = None,
@@ -1130,6 +1295,16 @@ def train_sae(
             print(f"[yellow]Warning: config.input_dim={config.input_dim} but detected {actual_dim} from dataset. Using {actual_dim}.[/yellow]")
             config.input_dim = actual_dim
         print(f"Detected embedding dim: {config.input_dim}")
+
+    resume_checkpoint = _resolve_resume_checkpoint(config)
+    if resume_checkpoint is not None:
+        _apply_model_config_from_checkpoint(config, resume_checkpoint)
+        if hasattr(dataset, "embedding_dim") and int(config.input_dim) != int(dataset.embedding_dim):
+            raise ValueError(
+                f"Resume checkpoint input_dim={config.input_dim} does not match "
+                f"dataset embedding_dim={dataset.embedding_dim}"
+            )
+        config.resume_from_checkpoint = str(resume_checkpoint)
 
     # Create model
     from saetopic.sae.modules import create_sae
