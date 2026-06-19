@@ -1,7 +1,7 @@
 <div align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="demo/logit-dark.svg">
-    <img alt="SSAETopic" src="https://32cf906.webp.li/2026/06/SAETopic-removebg-preview.png" width="150">
+    <img alt="SSAETopic" src="https://32cf906.webp.li/2026/06/SAETopic-removebg-preview.png" width="240">
   </picture>
 
   <h1>SAETopic</h1>
