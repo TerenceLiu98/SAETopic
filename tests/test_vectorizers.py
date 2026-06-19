@@ -1,8 +1,53 @@
 """Tests for corpus vectorization utilities."""
 
+import re
+from types import SimpleNamespace
+
 from examples.build_news20k_topic_model import _strip_20newsgroups_metadata
 from saetopic import vectorizers
-from saetopic.vectorizers import CorpusVectorizer
+from saetopic.vectorizers import CorpusVectorizer, SAETMDocumentProcessor
+
+
+def test_saetm_processor_pos_tags_before_filtering():
+    """SAE-TM preprocessing POS-tags the full token sequence like the reference."""
+
+    processor = SAETMDocumentProcessor.__new__(SAETMDocumentProcessor)
+    observed = {}
+
+    class FakeNltk:
+        @staticmethod
+        def pos_tag(tokens):
+            observed["tokens"] = list(tokens)
+            return [
+                ("the", "DT"),
+                ("cars", "NNS"),
+                ("x1", "NN"),
+                ("running", "VBG"),
+            ]
+
+    class FakeLemmatizer:
+        @staticmethod
+        def lemmatize(token, pos):
+            return f"{token}:{pos}"
+
+    processor.nltk = FakeNltk()
+    processor.wordnet = SimpleNamespace(NOUN="n", ADJ="a", VERB="v", ADV="r")
+    processor.word_tokenize = lambda text: text.split()
+    processor.lemmatizer = FakeLemmatizer()
+    processor.stop_words = {"the"}
+    processor.wordnet_words = {"cars", "running"}
+    processor.ascii_pattern = re.compile(r"^[a-z]+$")
+    processor.tag_dict = {
+        "J": processor.wordnet.ADJ,
+        "N": processor.wordnet.NOUN,
+        "V": processor.wordnet.VERB,
+        "R": processor.wordnet.ADV,
+    }
+
+    lemmas = processor.process("the cars x1 running")
+
+    assert observed["tokens"] == ["the", "cars", "x1", "running"]
+    assert lemmas == ["cars:n", "running:v"]
 
 
 def test_saetm_preprocessing_uses_document_processor(monkeypatch):

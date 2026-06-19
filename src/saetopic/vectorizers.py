@@ -92,22 +92,17 @@ class SAETMDocumentProcessor:
 
     def process(self, text: str) -> list[str]:
         tokens = self.word_tokenize(text.lower())
-        filtered_tokens = [
-            token
-            for token in tokens
+        tagged_tokens = self.nltk.pos_tag(tokens)
+
+        lemmas = []
+        for token, tag in tagged_tokens:
             if (
                 len(token) > 2
                 and self.ascii_pattern.match(token)
                 and token not in self.stop_words
                 and token in self.wordnet_words
-            )
-        ]
-        if not filtered_tokens:
-            return []
-
-        lemmas = []
-        for token, tag in self.nltk.pos_tag(filtered_tokens):
-            lemmas.append(self.lemmatizer.lemmatize(token, self._get_pos(tag)))
+            ):
+                lemmas.append(self.lemmatizer.lemmatize(token, self._get_pos(tag)))
         return lemmas
 
 

@@ -139,6 +139,7 @@ topics:
   save_theta_topic: false
   corpus_adapter_epochs: 30
   corpus_adapter_batch_size: 512
+  idf_weighting: true
   activation_batch_size: 256
   embedding_batch_size: 64
   vocabulary_size: 5000

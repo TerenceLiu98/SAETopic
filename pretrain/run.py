@@ -47,7 +47,6 @@ from saetopic.evaluation import (
     load_saetm_word2vec_cache,
     load_top_words_file,
     summarize_metric,
-    write_top_words_file,
 )
 from saetopic.merging import preload_word_embedding_model
 from saetopic.training import (
@@ -743,6 +742,7 @@ def build_topic_model(config: dict[str, Any], n_topics: int) -> SAETopicModel:
         corpus_adapter_batch_size=int(topic_cfg.get("corpus_adapter_batch_size", 512)),
         activation_batch_size=int(topic_cfg.get("activation_batch_size", 256)),
         embedding_batch_size=int(topic_cfg.get("embedding_batch_size", 64)),
+        idf_weighting=bool(topic_cfg.get("idf_weighting", True)),
         vocabulary_size=vocabulary_size,
         min_df=int(topic_cfg.get("min_df", 5)),
         max_df=float(topic_cfg.get("max_df", 1.0)),
@@ -768,15 +768,39 @@ def save_topic_outputs(
     topic_words = model.get_topics(top_n=20)
     artifact_topic_words = model.get_topics(top_n=50)
 
+    cluster_info = model.get_cluster_info()
+    if not cluster_info.empty:
+        cluster_info = cluster_info.sort_values(
+            ["cluster_size", "cluster_id"],
+            ascending=[False, True],
+            kind="mergesort",
+        ).reset_index(drop=True)
+        ordered_topic_ids = [int(topic_id) for topic_id in cluster_info["cluster_id"]]
+    else:
+        ordered_topic_ids = sorted(artifact_topic_words)
+
     info = model.get_topic_info()
     info["Top_Words_20"] = [
         ", ".join(word for word, _ in topic_words[topic_id])
         for topic_id in info["Topic"]
     ]
+    if ordered_topic_ids:
+        info_by_topic = info.set_index("Topic", drop=False)
+        available_topic_ids = [
+            topic_id
+            for topic_id in ordered_topic_ids
+            if topic_id in info_by_topic.index
+        ]
+        if available_topic_ids:
+            info = info_by_topic.loc[available_topic_ids].reset_index(drop=True)
     info.to_csv(output_dir / "topic_info.csv", index=False)
-    write_top_words_file(artifact_topic_words, output_dir / "top_words.txt", top_n=50)
+    with (output_dir / "top_words.txt").open("w", encoding="utf-8") as f:
+        for topic_id in ordered_topic_ids:
+            words = [word for word, _ in artifact_topic_words.get(topic_id, [])[:50]]
+            if words:
+                f.write(", ".join(words) + "\n")
 
-    model.get_cluster_info().to_csv(output_dir / "clusters.csv", index=False)
+    cluster_info.to_csv(output_dir / "clusters.csv", index=False)
     (output_dir / "cluster_to_feature_indices.json").write_text(
         json.dumps(model.get_cluster_to_feature_indices(), indent=2, sort_keys=True),
         encoding="utf-8",
