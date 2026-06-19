@@ -14,6 +14,7 @@ from saetopic.sae.modules import (
     BatchTopKSAE,
     JumpReLUSAE,
     MatryoshkaBatchTopKSAE,
+    OrtBatchTopKSAE,
     StandardSAE,
     TopKSAE,
     create_sae,
@@ -69,6 +70,86 @@ def test_create_sae_matryoshka_batch_topk():
     assert model.top_k == 8
     assert model.group_sizes.tolist() == [64, 64, 128]
     assert torch.allclose(model.group_weights, torch.tensor([0.2, 0.3, 0.5]))
+
+
+def test_create_sae_ort_batch_topk():
+    """Test creating an OrtBatchTopKSAE model."""
+    model = create_sae(
+        input_dim=128,
+        architecture="ort_batch_topk",
+        n_features=256,
+        top_k=8,
+        orthogonality_weight=0.3,
+        orthogonality_chunk_size=64,
+        orthogonality_freq=5,
+    )
+
+    assert isinstance(model, OrtBatchTopKSAE)
+    assert isinstance(model, BatchTopKSAE)
+    assert model.input_dim == 128
+    assert model.n_features == 256
+    assert model.top_k == 8
+    assert model.orthogonality_weight == 0.3
+    assert model.orthogonality_chunk_size == 64
+    assert model.orthogonality_freq == 5
+
+
+def test_ort_batch_topk_orthogonality_loss_penalizes_correlation():
+    """Orthogonality loss is ~1 for identical decoder columns, ~0 for orthogonal."""
+    model = OrtBatchTopKSAE(input_dim=4, n_features=4, top_k=2, orthogonality_chunk_size=8192)
+
+    with torch.no_grad():
+        identical = torch.tensor([1.0, 0.0, 0.0, 0.0]).unsqueeze(1).repeat(1, 4)
+        model.decoder.weight.data = identical.clone()
+    model.train()
+    correlated_loss = model._orthogonality_loss().item()
+    assert correlated_loss > 0.9  # max cosine similarity ~ 1 -> squared ~ 1
+
+    with torch.no_grad():
+        model.decoder.weight.data = torch.eye(4)
+    orthogonal_loss = model._orthogonality_loss().item()
+    assert orthogonal_loss < 1e-5
+
+
+def test_ort_batch_topk_loss_backprop_and_key():
+    """compute_loss_sparse adds an orthogonality term that backprops to the decoder."""
+    model = OrtBatchTopKSAE(
+        input_dim=16,
+        n_features=32,
+        top_k=4,
+        orthogonality_weight=0.25,
+    )
+    model.train()
+    x = torch.randn(8, 16)
+
+    x_recon, h, topk_values, topk_indices = model.forward_sparse(x)
+    loss, losses = model.compute_loss_sparse(x, x_recon, h, topk_values, topk_indices)
+
+    assert "orthogonality" in losses
+    assert losses["orthogonality"].item() >= 0.0
+    # total = recon + aux_weight * aux + orthogonality (scaled term)
+    assert torch.allclose(
+        losses["total"],
+        losses["reconstruction"] + 0.001 * losses["auxiliary"] + losses["orthogonality"],
+        atol=1e-5,
+    )
+    loss.backward()
+    assert model.decoder.weight.grad is not None
+
+
+def test_ort_batch_topk_eval_skips_orthogonality():
+    """The orthogonality term is gated off in eval mode."""
+    model = OrtBatchTopKSAE(input_dim=16, n_features=32, top_k=4, orthogonality_weight=0.5)
+    x = torch.randn(8, 16)
+    x_recon, h, topk_values, topk_indices = model.forward_sparse(x)
+
+    model.eval()
+    _, losses_eval = model.compute_loss_sparse(x, x_recon, h, topk_values, topk_indices)
+    assert losses_eval["orthogonality"].item() == 0.0
+
+    model.train()
+    _, losses_train = model.compute_loss_sparse(x, x_recon, h, topk_values, topk_indices)
+    assert losses_train["orthogonality"].item() >= 0.0
 
 
 def test_create_sae_standard():

@@ -88,7 +88,14 @@ def main() -> None:
         "--architecture",
         type=str,
         default="batch_topk",
-        choices=["standard", "jumprelu", "topk", "batch_topk", "matryoshka_batch_topk"],
+        choices=[
+            "standard",
+            "jumprelu",
+            "topk",
+            "batch_topk",
+            "matryoshka_batch_topk",
+            "ort_batch_topk",
+        ],
         help="SAE architecture type",
     )
     train_parser.add_argument(
@@ -117,6 +124,24 @@ def main() -> None:
         type=int,
         default=None,
         help="Number of Matryoshka prefix groups to activate",
+    )
+    train_parser.add_argument(
+        "--orthogonality-weight",
+        type=float,
+        default=0.25,
+        help="OrtSAE (ort_batch_topk) orthogonality penalty coefficient gamma",
+    )
+    train_parser.add_argument(
+        "--orthogonality-chunk-size",
+        type=int,
+        default=8192,
+        help="OrtSAE decoder features per chunk (K = ceil(m / chunk_size))",
+    )
+    train_parser.add_argument(
+        "--orthogonality-freq",
+        type=int,
+        default=1,
+        help="Evaluate the OrtSAE penalty every Nth step, scaling gamma by N (1 = every step)",
     )
     train_parser.add_argument(
         "--decoder-bias",
@@ -594,6 +619,9 @@ def train_sae_from_args(args: argparse.Namespace) -> None:
         matryoshka_group_fractions=getattr(args, "matryoshka_group_fractions", None),
         matryoshka_group_weights=getattr(args, "matryoshka_group_weights", None),
         matryoshka_active_groups=getattr(args, "matryoshka_active_groups", None),
+        orthogonality_weight=getattr(args, "orthogonality_weight", 0.25),
+        orthogonality_chunk_size=getattr(args, "orthogonality_chunk_size", 8192),
+        orthogonality_freq=getattr(args, "orthogonality_freq", 1),
         learning_rate=args.learning_rate,
         batch_size=args.batch_size,
         n_epochs=args.n_epochs,

@@ -140,7 +140,7 @@ class StepFunction(autograd.Function):
 
 class TopKSAE(nn.Module):
     """
-    Top-K Sparse Autoencoder for topic atom learning.
+    Top-K Sparse Autoencoder for topic atom learning. (check: https://arxiv.org/abs/1312.5663)
 
     This architecture learns a set of sparse features that can be
     interpreted as topic atoms. Features are activated competitively
@@ -521,7 +521,7 @@ class TopKSAE(nn.Module):
 
 class BatchTopKSAE(TopKSAE):
     """
-    Batch Top-K Sparse Autoencoder with efficient training utilities.
+    Batch Top-K Sparse Autoencoder with efficient training utilities. (check: https://arxiv.org/abs/2412.06410)
 
     Extends TopKSAE with additional methods for training:
     - Helper for loss computation
@@ -726,6 +726,188 @@ class BatchTopKSAE(TopKSAE):
         self.update_count.zero_()
 
 
+class OrtBatchTopKSAE(BatchTopKSAE):
+    """
+    Orthogonal BatchTopK SAE (OrtSAE) check: https://arxiv.org/abs/2509.22033.
+
+    Extends :class:`BatchTopKSAE` with an orthogonality penalty that
+    discourages high pairwise cosine similarities between decoder feature
+    vectors, mitigating feature absorption and feature composition without
+    any architectural change (Korznikov et al., 2025,
+    "Orthogonal Sparse Autoencoders Uncover Atomic Features").
+
+    The architecture and forward pass are identical to
+    :class:`BatchTopKSAE`; only the training loss gains one extra term:
+
+        L = L_MSE + alpha * L_aux + gamma * L_orthogonal
+
+    ``L_orthogonal`` (OrtSAE Eq. 4) randomly partitions the decoder feature
+    vectors into chunks of ``orthogonality_chunk_size`` features, computes the
+    maximum within-chunk cosine similarity for each feature, squares it (to
+    penalize highly correlated features more heavily), averages within each
+    chunk, and then averages across chunks. Computing similarities only within
+    chunks reduces the cost from O(m^2) to O(m) in the number of features.
+
+    The penalty is evaluated only while ``self.training`` is True, so it never
+    contaminates validation metrics or the early-stopping signal.
+
+    Parameters
+    ----------
+    orthogonality_weight : float, default=0.25
+        Coefficient ``gamma`` controlling the penalty strength.
+    orthogonality_chunk_size : int, default=8192
+        Number of decoder features per chunk. Yields K = ceil(m / chunk_size)
+        chunks, matching the paper's K = ceil(m / 8192).
+    orthogonality_freq : int, default=1
+        Evaluate the penalty every Nth training step and scale gamma by N,
+        preserving the expected regularization strength while cutting the
+        cost to ~1/N (OrtSAE Appendix C). 1 evaluates every step.
+    orthogonality_eps : float, default=1e-8
+        Small constant ``delta`` in the cosine denominator (OrtSAE Eq. 3).
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        n_features: int | None = None,
+        expansion_factor: int = 32,
+        top_k: int = 32,
+        decoder_bias: bool = True,
+        encoder_bias: bool = False,
+        normalization: str | None = None,
+        orthogonality_weight: float = 0.25,
+        orthogonality_chunk_size: int = 8192,
+        orthogonality_freq: int = 1,
+        orthogonality_eps: float = 1e-8,
+    ):
+        super().__init__(
+            input_dim=input_dim,
+            n_features=n_features,
+            expansion_factor=expansion_factor,
+            top_k=top_k,
+            decoder_bias=decoder_bias,
+            encoder_bias=encoder_bias,
+            normalization=normalization,
+        )
+        self.orthogonality_weight = float(orthogonality_weight)
+        self.orthogonality_chunk_size = int(orthogonality_chunk_size)
+        self.orthogonality_freq = int(orthogonality_freq)
+        if self.orthogonality_freq < 1:
+            raise ValueError("orthogonality_freq must be >= 1")
+        self.orthogonality_eps = float(orthogonality_eps)
+        self._orth_step: Tensor
+        self.register_buffer("_orth_step", torch.tensor(0, dtype=torch.long))
+
+    def _orthogonality_loss(self) -> Tensor:
+        """Chunk-wise max-cosine-similarity orthogonality penalty (OrtSAE Eq. 4)."""
+        # self.decoder.weight has shape (input_dim, n_features); each column is a
+        # feature vector. Transpose so rows are features, and upcast to float32
+        # for stable cosine computation under mixed precision.
+        features = self.decoder.weight.t().float()  # (n_features, input_dim)
+        normalized = features / features.norm(dim=1, keepdim=True).clamp_min(
+            self.orthogonality_eps
+        )
+
+        n_features = normalized.shape[0]
+        perm = torch.randperm(n_features, device=normalized.device)
+        normalized = normalized[perm]
+
+        chunk_size = max(self.orthogonality_chunk_size, 1)
+        chunk_losses: list[Tensor] = []
+        for start in range(0, n_features, chunk_size):
+            chunk = normalized[start : start + chunk_size]
+            size = chunk.shape[0]
+            if size < 2:
+                continue
+            sim = chunk @ chunk.t()  # (size, size) pairwise cosine similarities
+            eye = torch.eye(size, device=sim.device, dtype=torch.bool)
+            sim = sim.masked_fill(eye, float("-inf"))  # exclude self-pairs
+            max_sim = sim.max(dim=1).values  # (size,) nearest neighbor per feature
+            chunk_losses.append((max_sim**2).mean())
+
+        if not chunk_losses:
+            return torch.zeros((), device=features.device)
+        return cast(Tensor, torch.stack(chunk_losses).mean())
+
+    def _orthogonality_term(self) -> Tensor:
+        """Return the (frequency-scaled) orthogonality loss, or 0 when skipped.
+
+        Skipped during eval (keeps validation/early-stopping metrics clean) and,
+        when ``orthogonality_freq > 1``, on all but every Nth training step.
+        """
+        device = self.decoder.weight.device
+        if self.orthogonality_weight <= 0 or not self.training:
+            return torch.zeros((), device=device)
+
+        self._orth_step += 1
+        if (
+            self.orthogonality_freq > 1
+            and int(self._orth_step) % self.orthogonality_freq != 0
+        ):
+            return torch.zeros((), device=device)
+
+        scale = self.orthogonality_weight * self.orthogonality_freq
+        return scale * self._orthogonality_loss()
+
+    def compute_loss(
+        self,
+        x: Tensor,
+        x_recon: Tensor,
+        h: Tensor,
+        f: Tensor,
+        recon_loss_weight: float = 1.0,
+        sparsity_loss_weight: float = 1.0,
+        aux_loss_weight: float = 0.001,
+        update_stats: bool = True,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """BatchTopK loss plus the OrtSAE orthogonality penalty."""
+        total_loss, losses = super().compute_loss(
+            x,
+            x_recon,
+            h,
+            f,
+            recon_loss_weight=recon_loss_weight,
+            sparsity_loss_weight=sparsity_loss_weight,
+            aux_loss_weight=aux_loss_weight,
+            update_stats=update_stats,
+        )
+        orth = self._orthogonality_term()
+        total_loss = total_loss + orth
+        losses["total"] = total_loss.detach()
+        losses["orthogonality"] = orth.detach()
+        return total_loss, losses
+
+    def compute_loss_sparse(
+        self,
+        x: Tensor,
+        x_recon: Tensor,
+        h: Tensor,
+        topk_values: Tensor,
+        topk_indices: Tensor,
+        recon_loss_weight: float = 1.0,
+        sparsity_loss_weight: float = 1.0,
+        aux_loss_weight: float = 0.001,
+        update_stats: bool = True,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Sparse BatchTopK loss plus the OrtSAE orthogonality penalty."""
+        total_loss, losses = super().compute_loss_sparse(
+            x,
+            x_recon,
+            h,
+            topk_values,
+            topk_indices,
+            recon_loss_weight=recon_loss_weight,
+            sparsity_loss_weight=sparsity_loss_weight,
+            aux_loss_weight=aux_loss_weight,
+            update_stats=update_stats,
+        )
+        orth = self._orthogonality_term()
+        total_loss = total_loss + orth
+        losses["total"] = total_loss.detach()
+        losses["orthogonality"] = orth.detach()
+        return total_loss, losses
+
+
 def _matryoshka_group_sizes(
     n_features: int,
     group_sizes: Sequence[int] | None = None,
@@ -767,7 +949,7 @@ def _matryoshka_group_sizes(
 
 class MatryoshkaBatchTopKSAE(BatchTopKSAE):
     """
-    BatchTopK SAE trained with nested Matryoshka dictionary reconstruction.
+    BatchTopK SAE trained with nested Matryoshka dictionary reconstruction. (check: https://arxiv.org/abs/2503.17547)
 
     The latent dictionary is split into ordered groups. During training, the
     loss averages reconstruction error after each prefix of groups, forcing
@@ -1016,7 +1198,7 @@ class MatryoshkaBatchTopKSAE(BatchTopKSAE):
 
 class StandardSAE(nn.Module):
     """
-    Standard SAE matching SAE-TM's StandardTrainer AutoEncoder.
+    Standard SAE matching SAE-TM's StandardTrainer AutoEncoder. (check https://www.alignmentforum.org/posts/z6QQJbtpkEAX3Aojj/interim-research-report-taking-features-out-of-superposition)
 
     This architecture uses all ReLU encoder activations and is trained with
     reconstruction loss plus L1 sparsity, usually with sparsity warmup.
@@ -1135,7 +1317,7 @@ class StandardSAE(nn.Module):
 
 class JumpReLUSAE(nn.Module):
     """
-    JumpReLU SAE matching SAE-TM's JumpReluTrainer AutoEncoder.
+    JumpReLU SAE matching SAE-TM's JumpReluTrainer AutoEncoder. (check:https://arxiv.org/abs/2407.14435)
 
     This architecture learns per-feature thresholds and optimizes a target-L0
     penalty rather than top-k selection.
@@ -1285,7 +1467,7 @@ def create_sae(
     expansion_factor: int = 32,
     top_k: int = 32,
     **kwargs,
-) -> TopKSAE | BatchTopKSAE | MatryoshkaBatchTopKSAE | StandardSAE | JumpReLUSAE:
+) -> TopKSAE | BatchTopKSAE | MatryoshkaBatchTopKSAE | OrtBatchTopKSAE | StandardSAE | JumpReLUSAE:
     """
     Factory function to create SAE models.
 
@@ -1295,7 +1477,7 @@ def create_sae(
         Dimension of input embeddings
     architecture : str, default="topk"
         SAE architecture type ("standard", "jumprelu", "topk", "batch_topk",
-        "matryoshka_batch_topk")
+        "matryoshka_batch_topk", "ort_batch_topk")
     n_features : int or None, default=None
         Number of SAE features
     expansion_factor : int, default=32
@@ -1307,7 +1489,8 @@ def create_sae(
 
     Returns
     -------
-        StandardSAE, JumpReLUSAE, TopKSAE, BatchTopKSAE, or MatryoshkaBatchTopKSAE
+        StandardSAE, JumpReLUSAE, TopKSAE, BatchTopKSAE,
+        MatryoshkaBatchTopKSAE, or OrtBatchTopKSAE
         Initialized SAE model
     """
     if architecture == "standard":
@@ -1344,6 +1527,14 @@ def create_sae(
         )
     elif architecture == "matryoshka_batch_topk":
         return MatryoshkaBatchTopKSAE(
+            input_dim=input_dim,
+            n_features=n_features,
+            expansion_factor=expansion_factor,
+            top_k=top_k,
+            **kwargs,
+        )
+    elif architecture == "ort_batch_topk":
+        return OrtBatchTopKSAE(
             input_dim=input_dim,
             n_features=n_features,
             expansion_factor=expansion_factor,

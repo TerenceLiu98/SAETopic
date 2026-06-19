@@ -33,6 +33,7 @@ if TYPE_CHECKING:
         BatchTopKSAE,
         JumpReLUSAE,
         MatryoshkaBatchTopKSAE,
+        OrtBatchTopKSAE,
         StandardSAE,
         TopKSAE,
     )
@@ -68,7 +69,7 @@ class TrainingConfig:
         Device for training ("auto", "cpu", "cuda", "mps")
     architecture : str
         SAE architecture ("standard", "jumprelu", "topk", "batch_topk",
-        "matryoshka_batch_topk")
+        "matryoshka_batch_topk", "ort_batch_topk")
     seed : int
         Random seed for reproducibility
     save_frequency : int
@@ -108,6 +109,10 @@ class TrainingConfig:
     matryoshka_group_fractions: list[float] | None = None
     matryoshka_group_weights: list[float] | None = None
     matryoshka_active_groups: int | None = None
+    # OrtSAE (ort_batch_topk) orthogonality penalty hyperparameters.
+    orthogonality_weight: float = 0.25
+    orthogonality_chunk_size: int = 8192
+    orthogonality_freq: int = 1
     early_stopping: bool = False
     early_stopping_patience: int = 5
     early_stopping_min_delta: float = 1e-4
@@ -156,6 +161,9 @@ class TrainingConfig:
             "matryoshka_group_fractions": self.matryoshka_group_fractions,
             "matryoshka_group_weights": self.matryoshka_group_weights,
             "matryoshka_active_groups": self.matryoshka_active_groups,
+            "orthogonality_weight": self.orthogonality_weight,
+            "orthogonality_chunk_size": self.orthogonality_chunk_size,
+            "orthogonality_freq": self.orthogonality_freq,
             "early_stopping": self.early_stopping,
             "early_stopping_patience": self.early_stopping_patience,
             "early_stopping_min_delta": self.early_stopping_min_delta,
@@ -1046,6 +1054,9 @@ Sparse Autoencoder trained for topic modeling. This model learns {n_features} sp
 - **Matryoshka Group Fractions**: {self.config.matryoshka_group_fractions or "n/a"}
 - **Matryoshka Group Weights**: {self.config.matryoshka_group_weights or "n/a"}
 - **Matryoshka Active Groups**: {self.config.matryoshka_active_groups or "all"}
+- **OrtSAE Orthogonality Weight**: {self.config.orthogonality_weight if self.config.architecture == "ort_batch_topk" else "n/a"}
+- **OrtSAE Orthogonality Chunk Size**: {self.config.orthogonality_chunk_size if self.config.architecture == "ort_batch_topk" else "n/a"}
+- **OrtSAE Orthogonality Frequency**: {self.config.orthogonality_freq if self.config.architecture == "ort_batch_topk" else "n/a"}
 
 ## Checkpoint Contents
 
@@ -1209,6 +1220,9 @@ def _apply_model_config_from_checkpoint(config: TrainingConfig, checkpoint_dir: 
         "matryoshka_group_fractions",
         "matryoshka_group_weights",
         "matryoshka_active_groups",
+        "orthogonality_weight",
+        "orthogonality_chunk_size",
+        "orthogonality_freq",
     ]
     for field_name in model_fields:
         if field_name in checkpoint_config:
@@ -1328,6 +1342,14 @@ def train_sae(
                 "group_fractions": config.matryoshka_group_fractions,
                 "group_weights": config.matryoshka_group_weights,
                 "active_groups": config.matryoshka_active_groups,
+            }
+        )
+    elif config.architecture == "ort_batch_topk":
+        model_kwargs.update(
+            {
+                "orthogonality_weight": config.orthogonality_weight,
+                "orthogonality_chunk_size": config.orthogonality_chunk_size,
+                "orthogonality_freq": config.orthogonality_freq,
             }
         )
 
