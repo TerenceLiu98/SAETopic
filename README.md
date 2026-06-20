@@ -78,6 +78,31 @@ model.retopic(n_topics=3)
 See [examples/quickstart_text.py](examples/quickstart_text.py) for a runnable
 script template.
 
+## Command Line Usage
+
+The top-level `saetopic` command handles fitted topic models:
+
+```bash
+saetopic fit \
+  --input docs.csv \
+  --text-column text \
+  --model path/to/sae-checkpoint \
+  --output models/my-saetopic \
+  --n-topics 50
+
+saetopic topics \
+  --model models/my-saetopic \
+  --output topics.csv
+
+saetopic retopic \
+  --model models/my-saetopic \
+  --n-topics 100 \
+  --output models/my-saetopic-100
+```
+
+`saetopic-train` remains the advanced command for embedding datasets, training
+SAEs, and uploading checkpoints.
+
 ## Training Topic Atoms
 
 For large text corpora such as FineWiki, pre-compute embeddings once and train
@@ -243,8 +268,8 @@ Notes:
   `(batch_size, n_features)` activation tensor during training.
 - Interrupted SAE training can resume from saved training checkpoints with
   `train --resume` or `train --resume-from-checkpoint path/to/checkpoint`.
-- The top-level `saetopic` inference CLI is planned. Current command-line
-  training workflows use `saetopic-train` or `python -m saetopic.training.cli`.
+- The top-level `saetopic` CLI is for fitted topic models. Training workflows
+  use `saetopic-train` or `python -m saetopic.training.cli`.
 
 ## Development
 

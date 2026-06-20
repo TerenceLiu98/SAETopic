@@ -68,18 +68,16 @@ def test_import_other_modules():
     assert config is not None
 
 
-def test_main_cli_planned_commands_fail_clearly(monkeypatch):
-    """Test planned inference CLI commands do not silently succeed."""
+def test_main_cli_planned_visualize_fails_clearly(monkeypatch):
+    """Test planned visualization CLI command does not silently succeed."""
     from saetopic.cli import main
 
     monkeypatch.setattr(
         "sys.argv",
         [
             "saetopic",
-            "fit",
-            "--input",
-            "docs.csv",
-            "--output",
+            "visualize",
+            "--model",
             "model",
         ],
     )
@@ -89,6 +87,5 @@ def test_main_cli_planned_commands_fail_clearly(monkeypatch):
     except SystemExit as exc:
         assert exc.code != 0
         assert "not implemented yet" in str(exc)
-        assert "saetopic-train" in str(exc)
     else:
-        raise AssertionError("saetopic fit should fail until implemented")
+        raise AssertionError("saetopic visualize should fail until implemented")
