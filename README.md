@@ -137,10 +137,10 @@ Implemented:
 - `get_document_info(...)`, `get_representative_docs(...)`
 - `find_topics(...)`
 - `get_cluster_info()`, `get_cluster_to_feature_indices()`, `get_theta_topic_matrix(...)`
+- `save(...)` / `load(...)`
 
 Planned:
 
-- `save(...)` / `load(...)`
 - interactive visualizations such as `visualize_topics()` and `visualize_documents()`
 - built-in model evaluation wrappers
 - first-party pretrained checkpoint releases
@@ -161,6 +161,10 @@ model.retopic(n_topics=100)
 
 # Search
 model.find_topics("machine learning")
+
+# Save/Load
+model.save("my_model")
+loaded = SAETopicModel.load("my_model")
 ```
 
 ## Default Embedding Model
@@ -272,8 +276,8 @@ SAE-TM-style topic artifacts. The training path supports FineWiki-style large
 text corpora with streaming embedding, chunked embedding storage, mmap loading,
 and memory-efficient sparse top-k / Matryoshka SAE training.
 
-Serialization, interactive visualizations, and first-party pretrained
-checkpoint releases are still in progress.
+Interactive visualizations, built-in evaluation wrappers, and first-party
+pretrained checkpoint releases are still in progress.
 
 See [docs/PRD.md](docs/PRD.md) for current requirements and planning.
 

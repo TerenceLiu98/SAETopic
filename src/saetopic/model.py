@@ -877,7 +877,7 @@ class SAETopicModel:
             raise RuntimeError("Model must be fitted before this operation")
 
     # ------------------------------------------------------------------
-    # Not yet implemented (Week 4 / Week 5 scope)
+    # Visualization / evaluation helpers
     # ------------------------------------------------------------------
     def visualize_topics(self):
         raise NotImplementedError("visualize_topics is not implemented yet")
@@ -898,8 +898,12 @@ class SAETopicModel:
         raise NotImplementedError("evaluate is not implemented yet")
 
     def save(self, path: str, serialization: str = "safetensors") -> None:
-        raise NotImplementedError("save is not implemented yet")
+        from saetopic.serialization import save_model
+
+        save_model(self, path, serialization=serialization)
 
     @classmethod
     def load(cls, path: str) -> "SAETopicModel":
-        raise NotImplementedError("load is not implemented yet")
+        from saetopic.serialization import load_model
+
+        return load_model(path)

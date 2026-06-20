@@ -2,10 +2,10 @@
 Tests for SAETopicModel.
 
 The implemented API (from_pretrained / fit / fit_transform / retopic /
-transform / get_topic*) is exercised with a tiny in-memory SAE and a fake
-embedding callable, so the full pipeline can be tested without a GPU,
-network, or a real checkpoint. Visualization / save / load remain unimplemented
-and are still asserted to raise NotImplementedError.
+transform / save / load / get_topic*) is exercised with a tiny in-memory SAE
+and a fake embedding callable, so the full pipeline can be tested without a
+GPU, network, or a real checkpoint. Visualization helpers remain
+unimplemented and are still asserted to raise NotImplementedError.
 """
 
 import numpy as np
@@ -337,7 +337,7 @@ def test_transform_new_docs():
 
 
 # --------------------------------------------------------------------------
-# Still unimplemented (Week 4 / Week 5 scope)
+# Serialization and still-unimplemented visualization helpers
 # --------------------------------------------------------------------------
 def test_visualize_topics_not_implemented():
     """Test that visualize_topics raises NotImplementedError."""
@@ -346,14 +346,41 @@ def test_visualize_topics_not_implemented():
         model.visualize_topics()
 
 
-def test_save_not_implemented():
-    """Test that save raises NotImplementedError."""
+def test_save_requires_fit(tmp_path):
+    """save rejects unfitted models."""
     model = SAETopicModel()
-    with pytest.raises(NotImplementedError, match="save is not implemented yet"):
-        model.save("/tmp/model")
+    with pytest.raises(RuntimeError, match="fitted"):
+        model.save(tmp_path / "model")
 
 
-def test_load_not_implemented():
-    """Test that load raises NotImplementedError."""
-    with pytest.raises(NotImplementedError, match="load is not implemented yet"):
-        SAETopicModel.load("/tmp/model")
+def test_save_load_roundtrip(tmp_path):
+    """A saved fitted model can be loaded for inspection, transform, and retopic."""
+    model = _make_model(n_topics=5)
+    docs = _docs()
+    model.fit(docs)
+
+    path = tmp_path / "saetopic_model"
+    model.save(path)
+
+    loaded = SAETopicModel.load(path)
+
+    assert loaded.n_topics == model.n_topics
+    assert loaded.vocab_ == model.vocab_
+    assert loaded.sae_input_dim_ == model.sae_input_dim_
+    assert loaded.sae_n_features_ == model.sae_n_features_
+    assert np.allclose(loaded.topic_word_matrix_, model.topic_word_matrix_)
+    assert np.allclose(loaded.document_topic_matrix_, model.document_topic_matrix_)
+    assert loaded.get_topic_info().equals(model.get_topic_info())
+    assert loaded.get_topic(0, top_n=5) == model.get_topic(0, top_n=5)
+
+    new_embeddings = _fake_embedder_factory()(["fresh document one", "fresh document two"])
+    topics, probs = loaded.transform(
+        ["fresh document one", "fresh document two"],
+        embeddings=new_embeddings,
+    )
+    assert len(topics) == 2
+    assert probs.shape == (2, 5)
+
+    loaded.retopic(n_topics=3)
+    assert loaded.n_topics == 3
+    assert loaded.get_topic_info().shape[0] == 3
