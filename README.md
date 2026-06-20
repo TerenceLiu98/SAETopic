@@ -11,21 +11,22 @@
 </div>
 
 
-> **Sparse Autoencoder topic-atom training and planned topic inference**
+> **Sparse Autoencoder topic atoms for text and vision topic modeling**
 
 SAETopic is a Python package for training sparse autoencoder (SAE) topic atoms, an **unofficial** implementation of [Sparse Autoencoders are Topic Models](https://arxiv.org/abs/2511.16309) with its official [GitHub repo](https://github.com/ExplainableML/SAE-TM/tree/main). 
-The current implementation focuses on memory-aware SAE training; the
-inference interface and rapid topic granularity exploration are planned.
+The package provides a BERTopic-style interface for fitting topics from
+pretrained SAE atoms, changing topic granularity without retraining the SAE,
+and running memory-aware SAE pretraining pipelines.
 
 ## Core Features
 
 - **SAE Training Pipeline** — Stream HF text datasets, pre-compute embeddings, and train sparse topic atoms
 - **Memory-Aware Large-Corpus Training** — Long-text chunking, multi-GPU embedding, chunked `.npy` writes, mmap training, and sparse top-k SAE training
-- **Pretrained Topic Atoms** — Planned downloadable SAE weights for no-training usage
-- **Retopic Without Retraining** — Planned topic granularity changes (`retopic(n_topics=...)`) without retraining SAE or corpus adaptation
-- **Topic Inference API** — Planned `fit_transform`, `get_topic_info`, `visualize_topics` interface
-- **Interpretable Topics** — Planned corpus-specific word interpretation for each topic atom
-- **Fast Exploration** — Planned exploration of 20, 50, 100, 200 topics on the same fitted model
+- **Pretrained Topic Atoms** — Load SAE checkpoints from local paths or the Hugging Face Hub
+- **Retopic Without Retraining** — Change topic granularity with `retopic(n_topics=...)` without retraining the SAE or corpus adapter
+- **Topic Inference API** — `fit`, `fit_transform`, `transform`, `get_topic_info`, `get_topic`, and `get_document_info`
+- **Interpretable Topics** — Learn corpus-specific word emissions for each SAE topic atom
+- **Text and Vision Research Pipelines** — Text BoW and vision BoVW experiments through the pretrain config pipeline
 
 ## Installation
 
@@ -42,9 +43,47 @@ pip install "saetopic[dev]"   # Development tools
 pip install "saetopic[all]"   # All extras
 ```
 
-## Quickstart
+## Quickstart: Topic Modeling
 
-Current training workflow:
+Use a pretrained SAE checkpoint or a local checkpoint produced by
+`saetopic-train`:
+
+```python
+from saetopic import SAETopicModel
+
+docs = [
+    "The rover collected images from the surface of Mars.",
+    "The satellite entered orbit after a successful launch.",
+    "The team won after scoring in the final minute.",
+    "The coach changed tactics before the championship game.",
+]
+
+model = SAETopicModel.from_pretrained(
+    "path/to/sae-checkpoint-or-hf-repo",
+    n_topics=2,
+    idf_weighting=True,
+    stop_words="english",
+)
+
+topics, probs = model.fit_transform(docs)
+
+print(model.get_topic_info())
+print(model.get_topic(0))
+print(model.get_document_info())
+
+# Recluster the same fitted topic atoms at a different granularity.
+model.retopic(n_topics=3)
+```
+
+See [examples/quickstart_text.py](examples/quickstart_text.py) for a runnable
+script template.
+
+## Training Topic Atoms
+
+For large text corpora such as FineWiki, pre-compute embeddings once and train
+SAEs from the saved sharded embedding directory. This avoids keeping the
+embedding model in GPU memory during SAE training, avoids a final single-file
+merge step, and makes hyperparameter sweeps much faster.
 
 ```bash
 pip install "saetopic[train]"
@@ -70,30 +109,6 @@ saetopic-train train \
   --output checkpoints/jina-v5-sae-small
 ```
 
-Planned pretrained-model workflow:
-
-```python
-from saetopic import SAETopicModel
-
-# Load pretrained model (Jina v5 embeddings with task="clustering")
-model = SAETopicModel.from_pretrained("saetopic/jina-v5-sae-small")
-
-# Fit and get topics
-docs = ["Your documents here...", "More documents..."]
-topics, probs = model.fit_transform(docs, n_topics=50)
-
-# Explore topics
-model.get_topic_info()  # DataFrame with topic details
-model.get_topic(0)      # Top words for topic
-model.visualize_topics()
-
-# Change granularity without retraining
-model.retopic(n_topics=30)
-
-# Search topics by query
-model.find_topics("climate policy", top_n=5)
-```
-
 ## Key Concepts
 
 **Topic Atoms (SAE Features)** — Learned from large corpora, these sparse features capture reusable semantic concepts that can be adapted to any downstream corpus.
@@ -111,7 +126,24 @@ model.find_topics("climate policy", top_n=5)
 | word emission matrix | corpus-specific word interpretation |
 | SAE-to-topic clustering | retopic / topic merging |
 
-## Planned API
+## API Status
+
+Implemented:
+
+- `SAETopicModel.from_pretrained(...)`
+- `fit(...)`, `fit_transform(...)`, `transform(...)`
+- `retopic(...)` / `reduce_topics(...)`
+- `get_topic_info()`, `get_topic(...)`, `get_topics(...)`
+- `get_document_info(...)`, `get_representative_docs(...)`
+- `find_topics(...)`
+- `get_cluster_info()`, `get_cluster_to_feature_indices()`, `get_theta_topic_matrix(...)`
+
+Planned:
+
+- `save(...)` / `load(...)`
+- interactive visualizations such as `visualize_topics()` and `visualize_documents()`
+- built-in model evaluation wrappers
+- first-party pretrained checkpoint releases
 
 ```python
 from saetopic import SAETopicModel
@@ -129,14 +161,6 @@ model.retopic(n_topics=100)
 
 # Search
 model.find_topics("machine learning")
-
-# Visualize
-model.visualize_topics()
-model.visualize_documents()
-
-# Save/Load
-model.save("my_model")
-loaded = SAETopicModel.load("my_model")
 ```
 
 ## Default Embedding Model
@@ -152,14 +176,7 @@ loaded = SAETopicModel.load("my_model")
 ## Pretraining Datasets
 
 - **Text**: [HuggingFaceFW/finewiki](https://huggingface.co/datasets/HuggingFaceFW/finewiki) (with CC-BY-SA 4.0)
-- **Vision** (planned): [ILSVRC/imagenet-1k](https://huggingface.co/datasets/ILSVRC/imagenet-1k) (with [LICENSE](https://huggingface.co/datasets/ILSVRC/imagenet-1k#licensing-information))
-
-## Training Topic Atoms
-
-For large text corpora such as FineWiki, pre-compute embeddings once and train
-SAEs from the saved sharded embedding directory. This avoids keeping the
-embedding model in GPU memory during SAE training, avoids a final single-file
-merge step, and makes hyperparameter sweeps much faster.
+- **Vision**: DINOv2 patch-token BoVW experiments support Hugging Face image datasets such as `timm/mini-imagenet` and `clip-benchmark/wds_flickr8k`
 
 ```bash
 # Step 1: stream FineWiki, split long articles, and save normalized embeddings.
@@ -249,12 +266,14 @@ python -m build
 
 This project is in early development (v0.1). The API is subject to change.
 
-**Current Milestone**: SAE training infrastructure. The training path supports
-FineWiki-style large text corpora with streaming embedding, chunked embedding
-storage, mmap loading, and memory-efficient sparse top-k / Matryoshka SAE
-training.
+**Current Milestone**: Package surface stabilization. The model API supports
+fitting topics, transforming documents, retopic granularity changes, and
+SAE-TM-style topic artifacts. The training path supports FineWiki-style large
+text corpora with streaming embedding, chunked embedding storage, mmap loading,
+and memory-efficient sparse top-k / Matryoshka SAE training.
 
-Pretrained Hub loading and the full topic inference API are still in progress.
+Serialization, interactive visualizations, and first-party pretrained
+checkpoint releases are still in progress.
 
 See [docs/PRD.md](docs/PRD.md) for current requirements and planning.
 
