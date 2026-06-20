@@ -34,7 +34,7 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-from scipy.sparse import csr_matrix, save_npz
+from scipy.sparse import csr_matrix, load_npz, save_npz
 from sklearn.datasets import fetch_20newsgroups
 from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 from torch.utils.data import random_split
@@ -854,6 +854,714 @@ def _write_vision_probe_visual_bow(
     }
 
 
+def vision_config(config: dict[str, Any]) -> dict[str, Any]:
+    cfg = config.get("vision")
+    if not isinstance(cfg, dict):
+        raise ValueError("vision config is required for vision_vocab, vision_bow, and vision_emission")
+    return cfg
+
+
+def vision_out_dir(config: dict[str, Any]) -> Path:
+    cfg = vision_config(config)
+    out_dir = resolve_path(cfg.get("out_dir", "results/vision_topics"))
+    if out_dir is None:
+        raise ValueError("vision.out_dir is required")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def vision_checkpoint_path(config: dict[str, Any]) -> Path:
+    cfg = vision_config(config)
+    explicit = resolve_path(cfg.get("checkpoint_path"))
+    if explicit is not None:
+        return explicit
+    return checkpoint_path(config)
+
+
+def build_vision_embedder(config: dict[str, Any]):
+    """Build the image embedding model used for SAE theta in vision topic stages."""
+    cfg = vision_config(config)
+    probe_config = dict(config)
+    probe_config["vision_probe"] = {
+        "modality": cfg.get("modality", "vision"),
+        "task": cfg.get("task", "clustering"),
+        "device": cfg.get("device"),
+        "truncate_dim": cfg.get("truncate_dim"),
+    }
+    return build_vision_probe_embedder(probe_config)
+
+
+def _image_from_vision_record(record: dict[str, Any]):
+    if "_image" in record:
+        image = record["_image"]
+        return image.convert("RGB") if hasattr(image, "convert") else image
+
+    image_ref = record.get("image") or record.get("path") or record.get("url")
+    if image_ref is None:
+        raise ValueError(f"Vision record is missing image/path/url: {record}")
+    image_ref = str(image_ref)
+    if image_ref.startswith("hf://"):
+        raise ValueError(
+            f"{image_ref} cannot be reloaded without the HF image object. "
+            "Load inputs from vision.hf_dataset in the same stage."
+        )
+
+    from PIL import Image
+
+    if image_ref.startswith(("http://", "https://")):
+        from urllib.request import urlopen
+
+        with urlopen(image_ref) as response:  # noqa: S310 - user-provided image URL
+            return Image.open(response).convert("RGB")
+    return Image.open(resolve_path(image_ref) or image_ref).convert("RGB")
+
+
+def _iter_dinov2_patch_batches(
+    records: list[dict[str, Any]],
+    tokenizer_cfg: dict[str, Any],
+):
+    """Yield normalized DINOv2 patch embeddings as ``(start_idx, batch_patches)``."""
+    from transformers import AutoImageProcessor, AutoModel
+
+    model_name = str(tokenizer_cfg.get("model", "facebook/dinov2-base"))
+    device = torch.device(model_device(tokenizer_cfg.get("device", "auto")))
+    dtype = torch_dtype(tokenizer_cfg.get("dtype"))
+    model_dtype = dtype if dtype is not None and device.type == "cuda" else torch.float32
+    local_files_only = bool(tokenizer_cfg.get("local_files_only", False))
+    trust_remote_code = bool(tokenizer_cfg.get("trust_remote_code", False))
+    image_batch_size = int(tokenizer_cfg.get("image_batch_size", 16))
+
+    processor = AutoImageProcessor.from_pretrained(
+        model_name,
+        local_files_only=local_files_only,
+        trust_remote_code=trust_remote_code,
+    )
+    model = AutoModel.from_pretrained(
+        model_name,
+        local_files_only=local_files_only,
+        trust_remote_code=trust_remote_code,
+    )
+    model = model.to(device=device, dtype=model_dtype).eval()
+
+    with torch.no_grad():
+        for start in range(0, len(records), image_batch_size):
+            batch_records = records[start : start + image_batch_size]
+            images = [_image_from_vision_record(record) for record in batch_records]
+            inputs = processor(images=images, return_tensors="pt")
+            inputs = {
+                key: value.to(device=device)
+                for key, value in inputs.items()
+                if isinstance(value, torch.Tensor)
+            }
+            if "pixel_values" in inputs:
+                inputs["pixel_values"] = inputs["pixel_values"].to(dtype=model_dtype)
+            outputs = model(**inputs)
+            hidden = outputs.last_hidden_state
+            patches = hidden[:, 1:, :].float()
+            patches = torch.nn.functional.normalize(patches, p=2, dim=-1)
+            yield start, patches.cpu().numpy().astype(np.float32)
+
+
+def _sample_patch_rows(
+    patches: np.ndarray,
+    *,
+    max_rows: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    flat = patches.reshape(-1, patches.shape[-1])
+    if max_rows <= 0 or flat.shape[0] <= max_rows:
+        return flat
+    indices = rng.choice(flat.shape[0], size=max_rows, replace=False)
+    return flat[indices]
+
+
+def run_vision_vocab(config: dict[str, Any]) -> None:
+    """Build a DINOv2 patch-token KMeans visual vocabulary."""
+    cfg = vision_config(config)
+    tokenizer_cfg = dict(cfg.get("visual_tokenizer") or {})
+    out_dir = vision_out_dir(config)
+    records = load_vision_probe_inputs(cfg)
+    if not records:
+        raise ValueError("vision_vocab needs inputs. Set vision.hf_dataset, inputs, or input_file.")
+
+    from sklearn.cluster import MiniBatchKMeans
+
+    seed = int(tokenizer_cfg.get("seed", get_seed(config)))
+    rng = np.random.default_rng(seed)
+    n_clusters = int(tokenizer_cfg.get("codebook_size", 4096))
+    max_patch_samples = tokenizer_cfg.get("max_patch_samples", 1_000_000)
+    max_patch_samples = None if max_patch_samples in {None, 0} else int(max_patch_samples)
+    kmeans_batch_size = int(tokenizer_cfg.get("kmeans_batch_size", 8192))
+    per_image_patch_sample = int(tokenizer_cfg.get("patches_per_image_sample", 0))
+
+    kmeans = MiniBatchKMeans(
+        n_clusters=n_clusters,
+        batch_size=kmeans_batch_size,
+        random_state=seed,
+        n_init=3,
+        reassignment_ratio=0.01,
+    )
+    initialized = False
+    pending: list[np.ndarray] = []
+    pending_rows = 0
+    seen_patch_samples = 0
+    patch_dim: int | None = None
+
+    for _, patches in _iter_dinov2_patch_batches(records, tokenizer_cfg):
+        patch_dim = int(patches.shape[-1])
+        max_rows = per_image_patch_sample * patches.shape[0] if per_image_patch_sample > 0 else 0
+        sampled = _sample_patch_rows(patches, max_rows=max_rows, rng=rng)
+        if max_patch_samples is not None:
+            remaining = max_patch_samples - seen_patch_samples
+            if remaining <= 0:
+                break
+            if sampled.shape[0] > remaining:
+                sampled = sampled[:remaining]
+        seen_patch_samples += int(sampled.shape[0])
+
+        if not initialized:
+            pending.append(sampled)
+            pending_rows += int(sampled.shape[0])
+            if pending_rows < n_clusters:
+                continue
+            init_batch = np.concatenate(pending, axis=0)
+            kmeans.partial_fit(init_batch)
+            initialized = True
+            pending.clear()
+            pending_rows = 0
+        else:
+            kmeans.partial_fit(sampled)
+
+    if not initialized:
+        if not pending:
+            raise ValueError("No DINOv2 patch embeddings were produced for vision vocabulary.")
+        init_batch = np.concatenate(pending, axis=0)
+        if init_batch.shape[0] < n_clusters:
+            raise ValueError(
+                f"vision.visual_tokenizer.codebook_size={n_clusters} exceeds sampled "
+                f"patches={init_batch.shape[0]}. Lower codebook_size or use more images."
+            )
+        kmeans.partial_fit(init_batch)
+        patch_dim = int(init_batch.shape[-1])
+
+    centroids = np.asarray(kmeans.cluster_centers_, dtype=np.float32)
+    centroids_path = out_dir / "visual_vocab_centroids.npy"
+    np.save(centroids_path, centroids)
+
+    meta = {
+        "model": str(tokenizer_cfg.get("model", "facebook/dinov2-base")),
+        "n_visual_words": int(centroids.shape[0]),
+        "patch_dim": int(patch_dim or centroids.shape[1]),
+        "n_images": len(records),
+        "sampled_patches": seen_patch_samples,
+        "assignment": "hard_nearest_centroid",
+        "centroids": str(centroids_path),
+        "seed": seed,
+    }
+    (out_dir / "visual_vocab_meta.json").write_text(
+        json.dumps(meta, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    console.print(f"Wrote visual vocabulary to {centroids_path}")
+
+
+def _load_visual_centroids(out_dir: Path, cfg: dict[str, Any]) -> np.ndarray:
+    explicit = resolve_path((cfg.get("visual_tokenizer") or {}).get("centroids_path"))
+    path = explicit or out_dir / "visual_vocab_centroids.npy"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Visual vocabulary not found: {path}. Run --stages vision_vocab first."
+        )
+    return np.load(path).astype(np.float32)
+
+
+def _write_class_visual_ctfidf(
+    out_dir: Path,
+    visual_bow: csr_matrix,
+    labels: list[str | None],
+) -> Path:
+    df = np.asarray((visual_bow > 0).sum(axis=0)).ravel().astype(np.float32)
+    idf = np.log((1.0 + visual_bow.shape[0]) / (1.0 + np.clip(df, 1.0, None))) + 1.0
+    labels_normalized = [label if label is not None else "__unlabeled__" for label in labels]
+    rows: list[dict[str, Any]] = []
+    for label in sorted(set(labels_normalized)):
+        image_indices = [idx for idx, value in enumerate(labels_normalized) if value == label]
+        class_bow = visual_bow[image_indices]
+        tf = np.asarray(class_bow.sum(axis=0)).ravel().astype(np.float32)
+        total = float(tf.sum())
+        if total <= 0:
+            continue
+        tf = tf / total
+        score = tf * idf
+        image_count = np.asarray((class_bow > 0).sum(axis=0)).ravel()
+        top_features = np.flatnonzero(score)
+        top_features = top_features[np.argsort(score[top_features])[-50:][::-1]]
+        for rank, feature in enumerate(top_features, start=1):
+            global_fraction = float(df[feature] / max(visual_bow.shape[0], 1))
+            class_fraction = float(image_count[feature] / max(len(image_indices), 1))
+            rows.append(
+                {
+                    "label": label,
+                    "rank": rank,
+                    "visual_word": int(feature),
+                    "ctfidf_score": float(score[feature]),
+                    "class_image_count": int(image_count[feature]),
+                    "class_image_fraction": class_fraction,
+                    "global_image_count": int(df[feature]),
+                    "global_image_fraction": global_fraction,
+                    "image_fraction_lift": (
+                        class_fraction / global_fraction if global_fraction > 0 else 0.0
+                    ),
+                }
+            )
+
+    out_path = out_dir / "class_visual_ctfidf.csv"
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        fieldnames = [
+            "label",
+            "rank",
+            "visual_word",
+            "ctfidf_score",
+            "class_image_count",
+            "class_image_fraction",
+            "global_image_count",
+            "global_image_fraction",
+            "image_fraction_lift",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return out_path
+
+
+def run_vision_bow(config: dict[str, Any]) -> None:
+    """Encode images as a Bag-of-Visual-Words over the learned DINOv2 codebook."""
+    cfg = vision_config(config)
+    tokenizer_cfg = dict(cfg.get("visual_tokenizer") or {})
+    out_dir = vision_out_dir(config)
+    records = load_vision_probe_inputs(cfg)
+    if not records:
+        raise ValueError("vision_bow needs inputs. Set vision.hf_dataset, inputs, or input_file.")
+
+    from sklearn.metrics import pairwise_distances_argmin
+
+    centroids = _load_visual_centroids(out_dir, cfg)
+    n_visual_words = int(centroids.shape[0])
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+    row_ids: list[str] = []
+    labels: list[str | None] = []
+
+    for start, patches in _iter_dinov2_patch_batches(records, tokenizer_cfg):
+        batch_size, patches_per_image, dim = patches.shape
+        flat = patches.reshape(batch_size * patches_per_image, dim)
+        assignments = pairwise_distances_argmin(flat, centroids, metric="euclidean")
+        assignments = assignments.reshape(batch_size, patches_per_image)
+        for local_idx in range(batch_size):
+            row_idx = start + local_idx
+            counts = np.bincount(assignments[local_idx], minlength=n_visual_words)
+            nz = np.flatnonzero(counts)
+            rows.extend([row_idx] * len(nz))
+            cols.extend(int(value) for value in nz)
+            data.extend(float(counts[value]) for value in nz)
+            record = records[row_idx]
+            row_ids.append(str(record.get("id", row_idx)))
+            label = record.get("label")
+            labels.append(None if label is None else str(label))
+
+    visual_bow = csr_matrix(
+        (data, (rows, cols)),
+        shape=(len(records), n_visual_words),
+        dtype=np.float32,
+    )
+    visual_bow_path = out_dir / "visual_bow.npz"
+    save_npz(visual_bow_path, visual_bow)
+
+    df = np.asarray((visual_bow > 0).sum(axis=0)).ravel().astype(np.float32)
+    np.save(out_dir / "visual_word_df.npy", df)
+    idf = np.log(visual_bow.shape[0] / np.clip(df, 1.0, None))
+    if idf.max() > 0:
+        idf = idf / idf.max()
+    np.save(out_dir / "visual_word_idf.npy", idf.astype(np.float32))
+
+    meta = {
+        "matrix": str(visual_bow_path),
+        "n_images": len(records),
+        "n_visual_words": n_visual_words,
+        "row_ids": row_ids,
+        "labels": labels,
+        "weighting": "patch_count",
+        "visual_vocabulary": str(out_dir / "visual_vocab_centroids.npy"),
+        "source": "dinov2_patch_kmeans",
+    }
+    (out_dir / "visual_bow_meta.json").write_text(
+        json.dumps(meta, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    class_ctfidf_path = _write_class_visual_ctfidf(out_dir, visual_bow, labels)
+    summary = {
+        "n_images": len(records),
+        "n_visual_words": n_visual_words,
+        "nnz": int(visual_bow.nnz),
+        "mean_visual_words_per_image": float(np.diff(visual_bow.indptr).mean()),
+        "outputs": {
+            "visual_bow": str(visual_bow_path),
+            "visual_bow_meta": str(out_dir / "visual_bow_meta.json"),
+            "visual_word_df": str(out_dir / "visual_word_df.npy"),
+            "visual_word_idf": str(out_dir / "visual_word_idf.npy"),
+            "class_visual_ctfidf": str(class_ctfidf_path),
+        },
+    }
+    (out_dir / "vision_bow_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    console.print(f"Wrote visual BoW to {visual_bow_path}")
+
+
+def _prepare_vision_embeddings_for_sae(
+    config: dict[str, Any],
+    records: list[dict[str, Any]],
+    sae_checkpoint: SAECheckpoint,
+) -> np.ndarray:
+    cfg = vision_config(config)
+    embedder = build_vision_embedder(config)
+    payloads = [_vision_probe_payload(record) for record in records]
+    embeddings = _encode_probe_payloads(
+        embedder,
+        payloads,
+        encode_method=str(cfg.get("encode_method", "document")),
+        batch_size=int(cfg.get("batch_size", config["embedding_model"].get("batch_size", 16))),
+    )
+    if embeddings.shape[1] > sae_checkpoint.embedding_dim:
+        truncate_dim = int(cfg.get("truncate_dim", sae_checkpoint.embedding_dim))
+        if truncate_dim == sae_checkpoint.embedding_dim:
+            embeddings = embeddings[:, : sae_checkpoint.embedding_dim]
+    if bool(cfg.get("normalize", True)):
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        embeddings = embeddings / np.where(norms == 0, 1.0, norms)
+    if embeddings.shape[1] != sae_checkpoint.embedding_dim:
+        raise ValueError(
+            f"Vision embeddings have dimension {embeddings.shape[1]}, but SAE expects "
+            f"{sae_checkpoint.embedding_dim}. Set embedding_model.truncate_dim or "
+            "vision.truncate_dim to match the SAE input_dim."
+        )
+    return embeddings.astype(np.float32)
+
+
+def _save_sae_theta_csr(
+    embeddings: np.ndarray,
+    sae,
+    out_path: Path,
+    *,
+    batch_size: int,
+    device: str,
+    theta_mode: str,
+    top_k: int,
+) -> None:
+    dev = torch.device(device)
+    sae_dtype = torch.float32 if dev.type == "cpu" else torch.bfloat16
+    sae = sae.to(dev, dtype=sae_dtype).eval()
+    n_features = int(getattr(sae, "n_features", 0) or 0)
+    data_chunks: list[np.ndarray] = []
+    index_chunks: list[np.ndarray] = []
+    indptr = [0]
+
+    with torch.no_grad():
+        for start in range(0, len(embeddings), batch_size):
+            batch_np = embeddings[start : start + batch_size]
+            batch = torch.from_numpy(batch_np).to(dev, dtype=sae_dtype)
+            if theta_mode == "sparse_topk" and hasattr(sae, "activate"):
+                h = sae.encode(batch)
+                theta, _ = sae.activate(h)
+            else:
+                theta = sae.encode(batch)
+            theta = theta.float().clamp_min(0)
+            n_features = max(n_features, int(theta.shape[1]))
+            row_sums = theta.sum(dim=1).clamp_min(1e-8)
+            k = min(top_k, theta.shape[1]) if top_k > 0 else theta.shape[1]
+            values, indices = torch.topk(theta, k=k, dim=1, sorted=True)
+            mask = values > 0
+            row_idx = mask.nonzero(as_tuple=False)[:, 0] if mask.any() else torch.empty(0, dtype=torch.long, device=dev)
+            if row_idx.numel() > 0:
+                selected_values = values[mask] / row_sums.index_select(0, row_idx)
+                selected_indices = indices[mask]
+                data_chunks.append(selected_values.cpu().numpy().astype(np.float32, copy=False))
+                index_chunks.append(selected_indices.cpu().numpy().astype(np.int32, copy=False))
+                counts = torch.bincount(row_idx, minlength=len(batch_np)).cpu().numpy()
+            else:
+                counts = np.zeros(len(batch_np), dtype=np.int64)
+            base = indptr[-1]
+            indptr.extend((base + np.cumsum(counts, dtype=np.int64)).tolist())
+
+    data = np.concatenate(data_chunks) if data_chunks else np.array([], dtype=np.float32)
+    indices = np.concatenate(index_chunks) if index_chunks else np.array([], dtype=np.int32)
+    theta_csr = csr_matrix(
+        (data, indices, np.asarray(indptr, dtype=np.int64)),
+        shape=(len(embeddings), n_features),
+    )
+    save_npz(out_path, theta_csr)
+
+
+def run_vision_emission(config: dict[str, Any]) -> None:
+    """Learn B_vis: SAE feature -> visual-word emission probabilities."""
+    cfg = vision_config(config)
+    emission_cfg = dict(cfg.get("emission") or {})
+    out_dir = vision_out_dir(config)
+    visual_bow_path = resolve_path(cfg.get("visual_bow_path")) or out_dir / "visual_bow.npz"
+    if not visual_bow_path.exists():
+        raise FileNotFoundError(f"Visual BoW not found: {visual_bow_path}. Run vision_bow first.")
+    visual_bow = load_npz(visual_bow_path).tocsr().astype(np.float32)
+
+    records = load_vision_probe_inputs(cfg)
+    if not records:
+        raise ValueError("vision_emission needs inputs. Set vision.hf_dataset, inputs, or input_file.")
+    if len(records) != visual_bow.shape[0]:
+        raise ValueError(
+            f"Loaded {len(records)} images, but visual_bow has {visual_bow.shape[0]} rows. "
+            "Use the same vision input config used for vision_bow."
+        )
+
+    checkpoint = resolve_path(cfg.get("checkpoint_path")) or vision_checkpoint_path(config)
+    sae_checkpoint = SAECheckpoint.from_pretrained(checkpoint)
+    sae = sae_checkpoint.get_model()
+    embeddings = _prepare_vision_embeddings_for_sae(config, records, sae_checkpoint)
+
+    from saetopic.interpretation import CorpusAdapter
+
+    device = model_device(cfg.get("device", config.get("topics", {}).get("device", "auto")))
+    adapter = CorpusAdapter(
+        vocab_size=visual_bow.shape[1],
+        n_features=int(getattr(sae, "n_features", 0) or 0),
+        idf_weighting=bool(emission_cfg.get("idf_weighting", cfg.get("idf_weighting", True))),
+        device=device,
+        use_sparse_activation=(emission_cfg.get("theta_mode", cfg.get("theta_mode", "dense")) == "sparse_topk"),
+        random_state=get_seed(config),
+    )
+    adapter.fit(
+        embeddings=torch.from_numpy(embeddings),
+        bow=visual_bow,
+        sae=sae,
+        n_epochs=int(emission_cfg.get("corpus_adapter_epochs", 30)),
+        batch_size=int(emission_cfg.get("corpus_adapter_batch_size", 512)),
+        num_workers=int(emission_cfg.get("num_workers", 0)),
+        verbose=bool(emission_cfg.get("verbose", True)),
+    )
+
+    emission_path = out_dir / "visual_emission_probabilities.pt"
+    torch.save(
+        {
+            "B": torch.from_numpy(adapter.feature_word_matrix_),
+            "background_distribution": torch.from_numpy(adapter.background_distribution_),
+            "pi": adapter.pi_,
+            "vocab_type": "dinov2_kmeans_visual_words",
+            "n_visual_words": visual_bow.shape[1],
+        },
+        emission_path,
+    )
+    feature_prob_path = out_dir / "visual_feature_probabilities.pt"
+    torch.save({"theta_avg": torch.from_numpy(adapter.theta_avg_)}, feature_prob_path)
+
+    theta_path = out_dir / "theta_sae_csr.npz"
+    _save_sae_theta_csr(
+        embeddings,
+        sae,
+        theta_path,
+        batch_size=int(emission_cfg.get("theta_batch_size", cfg.get("activation_batch_size", 256))),
+        device=device,
+        theta_mode=str(emission_cfg.get("theta_mode", cfg.get("theta_mode", "dense"))),
+        top_k=int(emission_cfg.get("theta_top_k", 32)),
+    )
+
+    top_words_path = out_dir / "feature_top_visual_words.csv"
+    with top_words_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["feature", "rank", "visual_word", "probability"])
+        writer.writeheader()
+        top_n = int(emission_cfg.get("top_visual_words", 20))
+        for feature_idx, row in enumerate(adapter.feature_word_matrix_):
+            top_indices = np.argsort(row)[-top_n:][::-1]
+            for rank, visual_word in enumerate(top_indices, start=1):
+                writer.writerow(
+                    {
+                        "feature": feature_idx,
+                        "rank": rank,
+                        "visual_word": int(visual_word),
+                        "probability": float(row[visual_word]),
+                    }
+                )
+
+    summary = {
+        "n_images": len(records),
+        "n_visual_words": int(visual_bow.shape[1]),
+        "checkpoint_path": str(checkpoint),
+        "idf_weighting": adapter.idf_weighting,
+        "outputs": {
+            "visual_emission_probabilities": str(emission_path),
+            "visual_feature_probabilities": str(feature_prob_path),
+            "theta_sae_csr": str(theta_path),
+            "feature_top_visual_words": str(top_words_path),
+        },
+    }
+    (out_dir / "vision_emission_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    console.print(f"Wrote visual emission matrix to {emission_path}")
+
+
+def _sparsify_and_renormalize_rows(matrix: np.ndarray, tau: float) -> np.ndarray:
+    """Keep each row's largest probabilities up to cumulative mass ``tau``."""
+    if tau <= 0 or tau >= 1:
+        row_sums = matrix.sum(axis=1, keepdims=True)
+        return matrix / np.clip(row_sums, 1e-12, None)
+
+    sparse = np.zeros_like(matrix, dtype=np.float32)
+    for row_idx, row in enumerate(matrix):
+        order = np.argsort(row)[::-1]
+        sorted_values = row[order]
+        total = float(sorted_values.sum())
+        if total <= 0:
+            continue
+        cumsum = np.cumsum(sorted_values) / total
+        keep_count = int(np.searchsorted(cumsum, tau, side="left")) + 1
+        keep = order[:keep_count]
+        sparse[row_idx, keep] = row[keep]
+    row_sums = sparse.sum(axis=1, keepdims=True)
+    return sparse / np.clip(row_sums, 1e-12, None)
+
+
+def run_vision_topics(config: dict[str, Any]) -> None:
+    """Merge SAE visual atoms into final visual topics using B_vis and visual centroids."""
+    cfg = vision_config(config)
+    out_dir = vision_out_dir(config)
+    emission_path = resolve_path(cfg.get("visual_emission_path")) or (
+        out_dir / "visual_emission_probabilities.pt"
+    )
+    feature_prob_path = resolve_path(cfg.get("visual_feature_probabilities_path")) or (
+        out_dir / "visual_feature_probabilities.pt"
+    )
+    theta_path = resolve_path(cfg.get("theta_sae_path")) or out_dir / "theta_sae_csr.npz"
+    if not emission_path.exists():
+        raise FileNotFoundError(f"Visual emission file not found: {emission_path}")
+    if not feature_prob_path.exists():
+        raise FileNotFoundError(f"Visual feature probabilities not found: {feature_prob_path}")
+    if not theta_path.exists():
+        raise FileNotFoundError(f"SAE theta CSR not found: {theta_path}")
+
+    from sklearn.cluster import KMeans
+
+    emission = torch.load(emission_path, map_location="cpu")
+    feature_probabilities = torch.load(feature_prob_path, map_location="cpu")
+    b_matrix = emission["B"].float().cpu().numpy()
+    theta_avg = feature_probabilities["theta_avg"].float().cpu().numpy()
+    theta = load_npz(theta_path).tocsr().astype(np.float32)
+    centroids = _load_visual_centroids(out_dir, cfg)
+
+    valid_mask = theta_avg > 0
+    valid_feature_idx = np.flatnonzero(valid_mask)
+    if len(valid_feature_idx) == 0:
+        raise ValueError("No active SAE features found in visual_feature_probabilities.pt")
+
+    tau = float(cfg.get("topic_embedding_sparsity", 0.9))
+    b_valid = b_matrix[valid_feature_idx]
+    feature_embeddings = _sparsify_and_renormalize_rows(b_valid, tau=tau) @ centroids
+    norms = np.linalg.norm(feature_embeddings, axis=1, keepdims=True)
+    feature_embeddings = feature_embeddings / np.clip(norms, 1e-12, None)
+    weights = theta_avg[valid_feature_idx]
+
+    n_topics_cfg = cfg.get("n_topics", [100])
+    topic_counts = [int(n_topics_cfg)] if isinstance(n_topics_cfg, int) else [int(n) for n in n_topics_cfg]
+    top_n = int(cfg.get("top_visual_words", 50))
+    seed = get_seed(config)
+
+    for n_topics in topic_counts:
+        if n_topics > len(valid_feature_idx):
+            raise ValueError(
+                f"vision.n_topics={n_topics} exceeds active SAE features={len(valid_feature_idx)}"
+            )
+        topic_dir = out_dir / f"topics_{n_topics}"
+        topic_dir.mkdir(parents=True, exist_ok=True)
+        kmeans = KMeans(n_clusters=n_topics, random_state=seed, n_init=10)
+        kmeans.fit(feature_embeddings, sample_weight=weights)
+        labels = kmeans.labels_
+
+        mapping = csr_matrix(
+            (
+                np.ones_like(labels, dtype=np.float32),
+                (valid_feature_idx, labels),
+            ),
+            shape=(b_matrix.shape[0], n_topics),
+        )
+        theta_topic = theta.dot(mapping)
+        save_npz(topic_dir / "theta_topic_csr.npz", theta_topic)
+        cluster_counts = np.asarray((theta_topic > 0).sum(axis=0)).ravel()
+
+        cluster_to_features: dict[int, list[int]] = {idx: [] for idx in range(n_topics)}
+        for local_idx, label in enumerate(labels):
+            cluster_to_features[int(label)].append(int(valid_feature_idx[local_idx]))
+
+        records = []
+        top_words_lines: list[str] = []
+        for cluster_id, features in cluster_to_features.items():
+            feature_weights = theta_avg[features]
+            cluster_b = b_matrix[features]
+            avg_probs = (cluster_b * feature_weights[:, None]).sum(axis=0)
+            avg_probs = avg_probs / max(float(feature_weights.sum()), 1e-12)
+            top_visual_words = np.argsort(avg_probs)[-top_n:][::-1]
+            top_words_text = ", ".join(str(int(word)) for word in top_visual_words)
+            top_words_lines.append(top_words_text)
+            records.append(
+                {
+                    "cluster_id": cluster_id,
+                    "cluster_size": len(features),
+                    "cluster_prob": float(feature_weights.sum()),
+                    "cluster_ratio": float(cluster_counts[cluster_id] / max(theta.shape[0], 1)),
+                    "top_visual_words": top_words_text,
+                }
+            )
+
+        records = sorted(records, key=lambda row: (-row["cluster_size"], row["cluster_id"]))
+        with (topic_dir / "clusters.csv").open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "cluster_id",
+                    "cluster_size",
+                    "cluster_prob",
+                    "cluster_ratio",
+                    "top_visual_words",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(records)
+        (topic_dir / "top_visual_words.txt").write_text(
+            "\n".join(top_words_lines) + "\n",
+            encoding="utf-8",
+        )
+        (topic_dir / "cluster_to_feature_indices.json").write_text(
+            json.dumps({str(k): v for k, v in cluster_to_features.items()}, sort_keys=True),
+            encoding="utf-8",
+        )
+        summary = {
+            "n_topics": n_topics,
+            "n_active_features": int(len(valid_feature_idx)),
+            "topic_embedding_sparsity": tau,
+            "outputs": {
+                "clusters": str(topic_dir / "clusters.csv"),
+                "top_visual_words": str(topic_dir / "top_visual_words.txt"),
+                "cluster_to_feature_indices": str(topic_dir / "cluster_to_feature_indices.json"),
+                "theta_topic_csr": str(topic_dir / "theta_topic_csr.npz"),
+            },
+        }
+        (topic_dir / "vision_topics_summary.json").write_text(
+            json.dumps(summary, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    console.print(f"Wrote visual topics to {out_dir}")
+
+
 def run_vision_probe(config: dict[str, Any]) -> None:
     """Probe how image embeddings activate a trained text/omni SAE."""
     probe_cfg = config.get("vision_probe", {})
@@ -1591,6 +2299,14 @@ def run_stage(stage: str, config: dict[str, Any]) -> None:
         run_topics(config)
     elif stage == "evaluate":
         run_evaluate(config)
+    elif stage == "vision_vocab":
+        run_vision_vocab(config)
+    elif stage == "vision_bow":
+        run_vision_bow(config)
+    elif stage == "vision_emission":
+        run_vision_emission(config)
+    elif stage == "vision_topics":
+        run_vision_topics(config)
     elif stage == "vision_probe":
         run_vision_probe(config)
     else:
@@ -1605,7 +2321,8 @@ def main(default_stages: list[str] | None = None) -> None:
         nargs="+",
         default=None,
         help=(
-            "Stages to run: chunks embeddings train_sae topics evaluate vision_probe. "
+            "Stages to run: chunks embeddings train_sae topics evaluate "
+            "vision_vocab vision_bow vision_emission vision_topics vision_probe. "
             "Defaults to pipeline.stages."
         ),
     )

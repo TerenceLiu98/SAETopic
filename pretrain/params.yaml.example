@@ -172,6 +172,63 @@ evaluation:
   r: 3
   seed: null
 
+vision:
+  # SAE-TM-style vision pipeline:
+  # image -> DINOv2 patch KMeans BoVW, image -> SAE theta, then learn B_vis.
+  # Run with:
+  # PYTHONPATH=src python pretrain/run.py --config pretrain/params.yaml --stages vision_vocab vision_bow vision_emission vision_topics
+  checkpoint_path: null
+  out_dir: results/vision_topics/mini_imagenet
+  hf_dataset: timm/mini-imagenet
+  hf_subset: null
+  hf_split: test
+  hf_cache_dir: null
+  hf_local_files_only: false
+  image_column: image
+  label_column: label
+  max_samples: null
+  max_per_label: 50
+  input_file: null
+  inputs: []
+  modality: vision
+  task: clustering
+  encode_method: document
+  batch_size: 8
+  activation_batch_size: 256
+  normalize: true
+  truncate_dim: 768
+  theta_mode: dense
+  idf_weighting: true
+  n_topics: [50, 100, 200]
+  topic_embedding_sparsity: 0.9
+  top_visual_words: 50
+  device: auto
+  visual_tokenizer:
+    model: facebook/dinov2-base
+    # Set true when the model is already present in the HF cache and network is unavailable.
+    local_files_only: false
+    trust_remote_code: false
+    device: auto
+    dtype: float16
+    image_batch_size: 16
+    codebook_size: 4096
+    max_patch_samples: 1000000
+    # 0 means use all DINOv2 patches from each sampled image.
+    patches_per_image_sample: 0
+    kmeans_batch_size: 8192
+    seed: 42
+    centroids_path: null
+  emission:
+    corpus_adapter_epochs: 30
+    corpus_adapter_batch_size: 512
+    idf_weighting: true
+    theta_mode: dense
+    theta_top_k: 32
+    theta_batch_size: 256
+    top_visual_words: 20
+    num_workers: 0
+    verbose: true
+
 vision_probe:
   # Run with:
   # PYTHONPATH=src python pretrain/run.py --config pretrain/params.yaml --stages vision_probe
@@ -198,7 +255,7 @@ vision_probe:
   encode_method: document
   batch_size: 8
   activation_batch_size: 128
-  # For Bag-of-Visual-Words, use the SAE sparse activations as visual words.
+  # Legacy probe: this writes image x SAE-feature activations, not the BoVW used by vision_emission.
   top_k: 32
   activation_mode: sparse
   normalize: true

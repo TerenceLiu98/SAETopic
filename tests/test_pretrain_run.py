@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import torch
-from scipy.sparse import load_npz
+from scipy.sparse import csr_matrix, load_npz, save_npz
 
 import pretrain.run as pretrain_run
 
@@ -267,3 +267,214 @@ def test_load_vision_probe_inputs_reads_hf_dataset_cache(monkeypatch):
     assert records[0]["image"] == "hf://timm/mini-imagenet/test/0"
     assert records[0]["_image"].name == "a0"
     assert records[0]["_image"].converted is True
+
+
+def test_vision_vocab_and_bow_use_dinov2_patch_clusters(monkeypatch, tmp_path):
+    records = [
+        {"id": "a", "image": "a.jpg", "label": "alpha"},
+        {"id": "b", "image": "b.jpg", "label": "beta"},
+        {"id": "c", "image": "c.jpg", "label": "alpha"},
+    ]
+
+    def fake_patch_batches(records_arg, tokenizer_cfg):
+        del tokenizer_cfg
+        assert records_arg == records
+        yield 0, np.asarray(
+            [
+                [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]],
+                [[1.0, 0.0], [0.8, 0.2], [1.0, 0.0], [0.2, 0.8]],
+            ],
+            dtype=np.float32,
+        )
+        yield 2, np.asarray(
+            [
+                [[0.0, 1.0], [0.1, 0.9], [0.0, 1.0], [0.9, 0.1]],
+            ],
+            dtype=np.float32,
+        )
+
+    monkeypatch.setattr(pretrain_run, "load_vision_probe_inputs", lambda cfg: records)
+    monkeypatch.setattr(pretrain_run, "_iter_dinov2_patch_batches", fake_patch_batches)
+
+    config = {
+        "project": {"seed": 7},
+        "vision": {
+            "out_dir": str(tmp_path / "vision"),
+            "visual_tokenizer": {
+                "codebook_size": 2,
+                "kmeans_batch_size": 4,
+                "max_patch_samples": 12,
+                "seed": 7,
+            },
+        },
+    }
+
+    pretrain_run.run_vision_vocab(config)
+    pretrain_run.run_vision_bow(config)
+
+    out_dir = tmp_path / "vision"
+    centroids = np.load(out_dir / "visual_vocab_centroids.npy")
+    visual_bow = load_npz(out_dir / "visual_bow.npz")
+    meta = json.loads((out_dir / "visual_bow_meta.json").read_text(encoding="utf-8"))
+    ctfidf = pd.read_csv(out_dir / "class_visual_ctfidf.csv")
+
+    assert centroids.shape == (2, 2)
+    assert visual_bow.shape == (3, 2)
+    assert visual_bow.sum(axis=1).A1.tolist() == [4.0, 4.0, 4.0]
+    assert meta["source"] == "dinov2_patch_kmeans"
+    assert meta["row_ids"] == ["a", "b", "c"]
+    assert set(ctfidf["label"]) == {"alpha", "beta"}
+
+
+def test_vision_emission_writes_b_vis_artifacts(monkeypatch, tmp_path):
+    records = [
+        {"id": "a", "image": "image-a.jpg", "label": "alpha"},
+        {"id": "b", "image": "image-b.jpg", "label": "beta"},
+    ]
+    out_dir = tmp_path / "vision"
+    out_dir.mkdir()
+    save_npz(
+        out_dir / "visual_bow.npz",
+        csr_matrix(np.asarray([[2.0, 0.0, 1.0], [0.0, 3.0, 1.0]], dtype=np.float32)),
+    )
+
+    class FakeEmbedder:
+        def encode_document(self, payloads, **kwargs):
+            del kwargs
+            assert payloads == ["image-a.jpg", "image-b.jpg"]
+            return np.asarray([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+
+    class FakeSAE(torch.nn.Module):
+        n_features = 4
+
+        def encode(self, x):
+            return torch.asarray(
+                [
+                    [1.0, 0.0, 0.5, 0.0],
+                    [0.0, 1.0, 0.0, 0.5],
+                ],
+                device=x.device,
+                dtype=torch.float32,
+            )[: x.shape[0]]
+
+    class FakeCheckpoint:
+        embedding_dim = 3
+
+        def get_model(self):
+            return FakeSAE()
+
+    monkeypatch.setattr(pretrain_run, "load_vision_probe_inputs", lambda cfg: records)
+    monkeypatch.setattr(pretrain_run, "build_vision_embedder", lambda config: FakeEmbedder())
+    monkeypatch.setattr(
+        pretrain_run.SAECheckpoint,
+        "from_pretrained",
+        classmethod(lambda cls, checkpoint: FakeCheckpoint()),
+    )
+    monkeypatch.setattr(pretrain_run, "checkpoint_path", lambda config: tmp_path / "checkpoint")
+
+    config = {
+        "project": {"seed": 7},
+        "embedding_model": {"batch_size": 2, "model_kwargs": {}},
+        "topics": {"device": "cpu"},
+        "sae": {"training": {"output_dir": str(tmp_path / "checkpoint")}},
+        "vision": {
+            "out_dir": str(out_dir),
+            "device": "cpu",
+            "batch_size": 2,
+            "normalize": False,
+            "emission": {
+                "corpus_adapter_epochs": 1,
+                "corpus_adapter_batch_size": 2,
+                "idf_weighting": True,
+                "theta_batch_size": 2,
+                "theta_top_k": 2,
+                "verbose": False,
+            },
+        },
+    }
+
+    pretrain_run.run_vision_emission(config)
+
+    emission = torch.load(out_dir / "visual_emission_probabilities.pt", map_location="cpu")
+    feature_probs = torch.load(out_dir / "visual_feature_probabilities.pt", map_location="cpu")
+    theta = load_npz(out_dir / "theta_sae_csr.npz")
+    top_visual_words = pd.read_csv(out_dir / "feature_top_visual_words.csv")
+    summary = json.loads((out_dir / "vision_emission_summary.json").read_text(encoding="utf-8"))
+
+    assert emission["B"].shape == (4, 3)
+    assert emission["vocab_type"] == "dinov2_kmeans_visual_words"
+    assert feature_probs["theta_avg"].shape == (4,)
+    assert theta.shape == (2, 4)
+    assert top_visual_words["visual_word"].max() < 3
+    assert summary["outputs"]["visual_emission_probabilities"].endswith(
+        "visual_emission_probabilities.pt"
+    )
+
+
+def test_vision_topics_merges_visual_sae_atoms(tmp_path):
+    out_dir = tmp_path / "vision"
+    out_dir.mkdir()
+    np.save(
+        out_dir / "visual_vocab_centroids.npy",
+        np.asarray(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [0.8, 0.2],
+            ],
+            dtype=np.float32,
+        ),
+    )
+    torch.save(
+        {
+            "B": torch.asarray(
+                [
+                    [0.7, 0.1, 0.2],
+                    [0.6, 0.2, 0.2],
+                    [0.1, 0.7, 0.2],
+                    [0.2, 0.6, 0.2],
+                ],
+                dtype=torch.float32,
+            )
+        },
+        out_dir / "visual_emission_probabilities.pt",
+    )
+    torch.save(
+        {"theta_avg": torch.asarray([0.4, 0.3, 0.2, 0.1], dtype=torch.float32)},
+        out_dir / "visual_feature_probabilities.pt",
+    )
+    save_npz(
+        out_dir / "theta_sae_csr.npz",
+        csr_matrix(
+            np.asarray(
+                [
+                    [0.8, 0.2, 0.0, 0.0],
+                    [0.0, 0.0, 0.6, 0.4],
+                ],
+                dtype=np.float32,
+            )
+        ),
+    )
+
+    config = {
+        "project": {"seed": 7},
+        "vision": {
+            "out_dir": str(out_dir),
+            "n_topics": [2],
+            "topic_embedding_sparsity": 1.0,
+            "top_visual_words": 2,
+        },
+    }
+
+    pretrain_run.run_vision_topics(config)
+
+    topic_dir = out_dir / "topics_2"
+    clusters = pd.read_csv(topic_dir / "clusters.csv")
+    theta_topic = load_npz(topic_dir / "theta_topic_csr.npz")
+    summary = json.loads((topic_dir / "vision_topics_summary.json").read_text(encoding="utf-8"))
+
+    assert len(clusters) == 2
+    assert sorted(clusters["cluster_size"].tolist()) == [2, 2]
+    assert theta_topic.shape == (2, 2)
+    assert summary["n_topics"] == 2
+    assert summary["outputs"]["clusters"].endswith("clusters.csv")
