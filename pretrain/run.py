@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import html
 import json
 import os
 import re
@@ -1458,10 +1459,30 @@ def run_vision_topics(config: dict[str, Any]) -> None:
     theta = load_npz(theta_path).tocsr().astype(np.float32)
     centroids = _load_visual_centroids(out_dir, cfg)
 
+    max_topic_features_cfg = cfg.get("max_topic_features", 2000)
+    max_topic_features = (
+        None if max_topic_features_cfg in {None, 0} else int(max_topic_features_cfg)
+    )
+    min_theta_avg = float(cfg.get("min_theta_avg", 0.0))
+    min_emission_entropy_gap = float(cfg.get("min_emission_entropy_gap", 0.5))
+    emission_entropy = -(b_matrix * np.log(np.clip(b_matrix, 1e-12, None))).sum(axis=1)
+    uniform_entropy = float(np.log(b_matrix.shape[1]))
+    emission_entropy_gap = uniform_entropy - emission_entropy
+
     valid_mask = theta_avg > 0
+    if min_theta_avg > 0:
+        valid_mask &= theta_avg >= min_theta_avg
+    if min_emission_entropy_gap > 0:
+        valid_mask &= emission_entropy_gap >= min_emission_entropy_gap
     valid_feature_idx = np.flatnonzero(valid_mask)
     if len(valid_feature_idx) == 0:
-        raise ValueError("No active SAE features found in visual_feature_probabilities.pt")
+        raise ValueError(
+            "No SAE features passed vision topic filtering. Lower "
+            "vision.min_theta_avg or vision.min_emission_entropy_gap."
+        )
+    if max_topic_features is not None and len(valid_feature_idx) > max_topic_features:
+        order = np.argsort(theta_avg[valid_feature_idx])[-max_topic_features:][::-1]
+        valid_feature_idx = valid_feature_idx[order]
 
     tau = float(cfg.get("topic_embedding_sparsity", 0.9))
     b_valid = b_matrix[valid_feature_idx]
@@ -1545,7 +1566,17 @@ def run_vision_topics(config: dict[str, Any]) -> None:
         )
         summary = {
             "n_topics": n_topics,
-            "n_active_features": int(len(valid_feature_idx)),
+            "n_active_features": int((theta_avg > 0).sum()),
+            "n_topic_features": int(len(valid_feature_idx)),
+            "feature_filtering": {
+                "max_topic_features": max_topic_features,
+                "min_theta_avg": min_theta_avg,
+                "min_emission_entropy_gap": min_emission_entropy_gap,
+                "uniform_entropy": uniform_entropy,
+                "selected_theta_mass": float(theta_avg[valid_feature_idx].sum()),
+                "selected_entropy_gap_mean": float(emission_entropy_gap[valid_feature_idx].mean()),
+                "selected_entropy_gap_min": float(emission_entropy_gap[valid_feature_idx].min()),
+            },
             "topic_embedding_sparsity": tau,
             "outputs": {
                 "clusters": str(topic_dir / "clusters.csv"),
@@ -1560,6 +1591,313 @@ def run_vision_topics(config: dict[str, Any]) -> None:
         )
 
     console.print(f"Wrote visual topics to {out_dir}")
+
+
+def _parse_visual_word_ids(value: Any, limit: int | None = None) -> list[int]:
+    words = [
+        int(part.strip())
+        for part in str(value).split(",")
+        if part.strip()
+    ]
+    return words if limit is None else words[:limit]
+
+
+def _make_contact_sheet(
+    cells: list[tuple[Any, str]],
+    *,
+    thumb_size: int,
+    columns: int,
+    title: str,
+):
+    from PIL import Image, ImageDraw
+
+    if not cells:
+        cells = [(Image.new("RGB", (thumb_size, thumb_size), "white"), "no examples")]
+    label_height = 34
+    title_height = 34
+    rows = int(np.ceil(len(cells) / columns))
+    width = columns * thumb_size
+    height = title_height + rows * (thumb_size + label_height)
+    sheet = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(sheet)
+    draw.text((8, 8), title[:160], fill="black")
+    for idx, (image, label) in enumerate(cells):
+        col = idx % columns
+        row = idx // columns
+        x = col * thumb_size
+        y = title_height + row * (thumb_size + label_height)
+        image = image.convert("RGB")
+        image.thumbnail((thumb_size, thumb_size))
+        x_offset = x + (thumb_size - image.width) // 2
+        y_offset = y + (thumb_size - image.height) // 2
+        sheet.paste(image, (x_offset, y_offset))
+        draw.rectangle((x, y, x + thumb_size - 1, y + thumb_size - 1), outline="gray")
+        draw.text((x + 4, y + thumb_size + 4), label[:42], fill="black")
+    return sheet
+
+
+def _top_csr_column_rows(matrix: csr_matrix, column: int, limit: int) -> list[tuple[int, float]]:
+    col = matrix.getcol(column).tocoo()
+    if col.nnz == 0:
+        return []
+    order = np.argsort(col.data)[-limit:][::-1]
+    return [(int(col.row[idx]), float(col.data[idx])) for idx in order]
+
+
+def _write_visual_word_image_sheets(
+    out_dir: Path,
+    records: list[dict[str, Any]],
+    labels: list[Any],
+    visual_bow: csr_matrix,
+    visual_words: list[int],
+    *,
+    examples_per_word: int,
+    thumb_size: int,
+    columns: int,
+) -> dict[int, str]:
+    visual_word_dir = out_dir / "visual_words"
+    visual_word_dir.mkdir(parents=True, exist_ok=True)
+    paths: dict[int, str] = {}
+    for visual_word in visual_words:
+        cells = []
+        for row_idx, count in _top_csr_column_rows(visual_bow, visual_word, examples_per_word):
+            image = _image_from_vision_record(records[row_idx])
+            label = labels[row_idx] if row_idx < len(labels) else None
+            cells.append((image, f"{row_idx} {label or ''} c={count:g}"))
+        sheet = _make_contact_sheet(
+            cells,
+            thumb_size=thumb_size,
+            columns=columns,
+            title=f"visual_word {visual_word} top images",
+        )
+        path = visual_word_dir / f"visual_word_{visual_word}.jpg"
+        sheet.save(path, quality=90)
+        paths[visual_word] = str(path)
+    return paths
+
+
+def _write_visual_word_patch_sheets(
+    out_dir: Path,
+    records: list[dict[str, Any]],
+    labels: list[Any],
+    tokenizer_cfg: dict[str, Any],
+    centroids: np.ndarray,
+    visual_words: list[int],
+    *,
+    examples_per_word: int,
+    thumb_size: int,
+    columns: int,
+    image_size: int,
+) -> dict[int, str]:
+    from sklearn.metrics import pairwise_distances_argmin
+
+    visual_word_set = set(visual_words)
+    examples: dict[int, list[tuple[float, int, int]]] = {word: [] for word in visual_words}
+    for start, patches in _iter_dinov2_patch_batches(records, tokenizer_cfg):
+        batch_size, patches_per_image, dim = patches.shape
+        flat = patches.reshape(batch_size * patches_per_image, dim)
+        assignments = pairwise_distances_argmin(flat, centroids, metric="euclidean")
+        for flat_idx, word in enumerate(assignments):
+            word = int(word)
+            if word not in visual_word_set:
+                continue
+            patch_vec = flat[flat_idx]
+            distance = float(np.linalg.norm(patch_vec - centroids[word]))
+            local_idx = flat_idx // patches_per_image
+            patch_idx = flat_idx % patches_per_image
+            bucket = examples[word]
+            bucket.append((distance, start + local_idx, patch_idx))
+            bucket.sort(key=lambda item: item[0])
+            del bucket[examples_per_word:]
+
+    patch_dir = out_dir / "visual_word_patches"
+    patch_dir.mkdir(parents=True, exist_ok=True)
+    paths: dict[int, str] = {}
+    for word, bucket in examples.items():
+        cells = []
+        for distance, row_idx, patch_idx in bucket:
+            image = _image_from_vision_record(records[row_idx]).resize((image_size, image_size))
+            grid = int(round(np.sqrt(max(1, len(bucket)))))
+            # The DINO output patch count is not stored per bucket, infer from current tokenizer default.
+            # Recompute a square grid from image_size/14 when possible; DINOv2 ViT-B/14 at 224 is 16x16.
+            grid = int(tokenizer_cfg.get("patch_grid") or max(1, image_size // 14))
+            patch_size = image_size // grid
+            x = (patch_idx % grid) * patch_size
+            y = (patch_idx // grid) * patch_size
+            patch = image.crop((x, y, min(x + patch_size, image_size), min(y + patch_size, image_size)))
+            label = labels[row_idx] if row_idx < len(labels) else None
+            cells.append((patch, f"{row_idx} {label or ''} d={distance:.2f}"))
+        sheet = _make_contact_sheet(
+            cells,
+            thumb_size=thumb_size,
+            columns=columns,
+            title=f"visual_word {word} top patches",
+        )
+        path = patch_dir / f"visual_word_{word}_patches.jpg"
+        sheet.save(path, quality=90)
+        paths[word] = str(path)
+    return paths
+
+
+def run_vision_visualize(config: dict[str, Any]) -> None:
+    """Create human-readable visual topic/contact-sheet artifacts."""
+    cfg = vision_config(config)
+    vis_cfg = dict(cfg.get("visualize") or {})
+    out_dir = vision_out_dir(config)
+    records = load_vision_probe_inputs(cfg)
+    if not records:
+        raise ValueError("vision_visualize needs inputs. Set vision.hf_dataset, inputs, or input_file.")
+
+    visual_bow_path = resolve_path(cfg.get("visual_bow_path")) or out_dir / "visual_bow.npz"
+    visual_bow_meta_path = resolve_path(cfg.get("visual_bow_meta_path")) or (
+        out_dir / "visual_bow_meta.json"
+    )
+    if not visual_bow_path.exists():
+        raise FileNotFoundError(f"Visual BoW not found: {visual_bow_path}")
+    if not visual_bow_meta_path.exists():
+        raise FileNotFoundError(f"Visual BoW metadata not found: {visual_bow_meta_path}")
+    visual_bow = load_npz(visual_bow_path).tocsr()
+    visual_bow_meta = json.loads(visual_bow_meta_path.read_text(encoding="utf-8"))
+    labels = visual_bow_meta.get("labels") or [record.get("label") for record in records]
+
+    default_topic_counts = cfg.get("n_topics") or [50]
+    default_n_topics = (
+        int(default_topic_counts[0])
+        if isinstance(default_topic_counts, list)
+        else int(default_topic_counts)
+    )
+    n_topics = int(vis_cfg.get("n_topics", default_n_topics))
+    topic_dir = out_dir / f"topics_{n_topics}"
+    clusters_path = topic_dir / "clusters.csv"
+    theta_topic_path = topic_dir / "theta_topic_csr.npz"
+    if not clusters_path.exists():
+        raise FileNotFoundError(f"Topic clusters not found: {clusters_path}")
+    if not theta_topic_path.exists():
+        raise FileNotFoundError(f"Topic theta matrix not found: {theta_topic_path}")
+    clusters = list(csv.DictReader(clusters_path.open("r", encoding="utf-8")))
+    theta_topic = load_npz(theta_topic_path).tocsr()
+
+    top_topics = int(vis_cfg.get("top_topics", 20))
+    top_visual_words_per_topic = int(vis_cfg.get("top_visual_words_per_topic", 8))
+    visual_word_examples = int(vis_cfg.get("visual_word_examples", 8))
+    topic_image_examples = int(vis_cfg.get("topic_image_examples", 16))
+    thumb_size = int(vis_cfg.get("thumb_size", 160))
+    columns = int(vis_cfg.get("columns", 4))
+    image_size = int(vis_cfg.get("image_size", 224))
+    patch_representatives = bool(vis_cfg.get("patch_representatives", False))
+
+    selected_clusters = clusters[:top_topics]
+    visual_words: list[int] = []
+    for row in selected_clusters:
+        for visual_word in _parse_visual_word_ids(
+            row.get("top_visual_words", ""),
+            limit=top_visual_words_per_topic,
+        ):
+            if visual_word not in visual_words:
+                visual_words.append(visual_word)
+
+    viz_dir = out_dir / "visualizations" / f"topics_{n_topics}"
+    viz_dir.mkdir(parents=True, exist_ok=True)
+    visual_word_paths = _write_visual_word_image_sheets(
+        viz_dir,
+        records,
+        labels,
+        visual_bow,
+        visual_words,
+        examples_per_word=visual_word_examples,
+        thumb_size=thumb_size,
+        columns=columns,
+    )
+
+    patch_paths: dict[int, str] = {}
+    if patch_representatives:
+        tokenizer_cfg = dict(cfg.get("visual_tokenizer") or {})
+        centroids = _load_visual_centroids(out_dir, cfg)
+        patch_paths = _write_visual_word_patch_sheets(
+            viz_dir,
+            records,
+            labels,
+            tokenizer_cfg,
+            centroids,
+            visual_words,
+            examples_per_word=visual_word_examples,
+            thumb_size=thumb_size,
+            columns=columns,
+            image_size=image_size,
+        )
+
+    topic_rows = []
+    for row in selected_clusters:
+        cluster_id = int(row["cluster_id"])
+        cells = []
+        for row_idx, weight in _top_csr_column_rows(theta_topic, cluster_id, topic_image_examples):
+            image = _image_from_vision_record(records[row_idx])
+            label = labels[row_idx] if row_idx < len(labels) else None
+            cells.append((image, f"{row_idx} {label or ''} w={weight:.3f}"))
+        title = (
+            f"topic {cluster_id} size={row.get('cluster_size')} "
+            f"ratio={float(row.get('cluster_ratio', 0.0)):.3f}"
+        )
+        sheet = _make_contact_sheet(cells, thumb_size=thumb_size, columns=columns, title=title)
+        topic_path = viz_dir / f"topic_{cluster_id}_images.jpg"
+        sheet.save(topic_path, quality=90)
+        topic_rows.append((row, topic_path))
+
+    html_lines = [
+        "<!doctype html>",
+        "<html><head><meta charset='utf-8'><title>Vision Topics</title>",
+        "<style>body{font-family:sans-serif} img{max-width:640px;border:1px solid #ccc} "
+        "table{border-collapse:collapse} td,th{border:1px solid #ccc;padding:6px;vertical-align:top}</style>",
+        "</head><body>",
+        f"<h1>Vision Topics {n_topics}</h1>",
+        f"<p>Top topics shown: {len(topic_rows)}. Patch representatives: {patch_representatives}.</p>",
+        "<table><tr><th>Topic</th><th>Stats</th><th>Top Visual Words</th><th>Images</th></tr>",
+    ]
+    for row, topic_path in topic_rows:
+        words = _parse_visual_word_ids(row.get("top_visual_words", ""), top_visual_words_per_topic)
+        word_links = []
+        for word in words:
+            image_path = Path(visual_word_paths[word]).relative_to(viz_dir)
+            link = f"<a href='{html.escape(str(image_path))}'>vw {word}</a>"
+            if word in patch_paths:
+                patch_path = Path(patch_paths[word]).relative_to(viz_dir)
+                link += f" (<a href='{html.escape(str(patch_path))}'>patches</a>)"
+            word_links.append(link)
+        topic_rel = topic_path.relative_to(viz_dir)
+        html_lines.extend(
+            [
+                "<tr>",
+                f"<td>{html.escape(str(row['cluster_id']))}</td>",
+                "<td>"
+                f"size={html.escape(str(row.get('cluster_size')))}<br>"
+                f"prob={float(row.get('cluster_prob', 0.0)):.4f}<br>"
+                f"ratio={float(row.get('cluster_ratio', 0.0)):.4f}"
+                "</td>",
+                f"<td>{'<br>'.join(word_links)}</td>",
+                f"<td><a href='{html.escape(str(topic_rel))}'><img src='{html.escape(str(topic_rel))}'></a></td>",
+                "</tr>",
+            ]
+        )
+    html_lines.extend(["</table>", "</body></html>"])
+    index_path = viz_dir / "index.html"
+    index_path.write_text("\n".join(html_lines), encoding="utf-8")
+
+    summary = {
+        "n_topics": n_topics,
+        "top_topics": len(topic_rows),
+        "top_visual_words": len(visual_words),
+        "patch_representatives": patch_representatives,
+        "outputs": {
+            "index": str(index_path),
+            "visual_word_image_dir": str(viz_dir / "visual_words"),
+            "visual_word_patch_dir": str(viz_dir / "visual_word_patches"),
+        },
+    }
+    (viz_dir / "vision_visualize_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    console.print(f"Wrote visual topic index to {index_path}")
 
 
 def run_vision_probe(config: dict[str, Any]) -> None:
@@ -2307,6 +2645,8 @@ def run_stage(stage: str, config: dict[str, Any]) -> None:
         run_vision_emission(config)
     elif stage == "vision_topics":
         run_vision_topics(config)
+    elif stage == "vision_visualize":
+        run_vision_visualize(config)
     elif stage == "vision_probe":
         run_vision_probe(config)
     else:
@@ -2322,7 +2662,7 @@ def main(default_stages: list[str] | None = None) -> None:
         default=None,
         help=(
             "Stages to run: chunks embeddings train_sae topics evaluate "
-            "vision_vocab vision_bow vision_emission vision_topics vision_probe. "
+            "vision_vocab vision_bow vision_emission vision_topics vision_visualize vision_probe. "
             "Defaults to pipeline.stages."
         ),
     )

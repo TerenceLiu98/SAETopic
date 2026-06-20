@@ -202,6 +202,10 @@ vision:
   n_topics: [50, 100, 200]
   topic_embedding_sparsity: 0.9
   top_visual_words: 50
+  # Filter weak or near-uniform visual emissions before KMeans topic merging.
+  max_topic_features: 2000
+  min_theta_avg: 0.0
+  min_emission_entropy_gap: 0.5
   device: auto
   visual_tokenizer:
     model: facebook/dinov2-base
@@ -228,6 +232,18 @@ vision:
     top_visual_words: 20
     num_workers: 0
     verbose: true
+  visualize:
+    n_topics: 50
+    top_topics: 20
+    top_visual_words_per_topic: 8
+    visual_word_examples: 8
+    topic_image_examples: 16
+    thumb_size: 160
+    columns: 4
+    image_size: 224
+    # false uses BoVW counts to show representative full images.
+    # true reruns DINOv2 assignment to crop representative visual-word patches.
+    patch_representatives: false
 
 vision_probe:
   # Run with:

@@ -1,5 +1,6 @@
 """Tests for pretraining pipeline orchestration helpers."""
 
+import csv
 import json
 import sys
 from types import SimpleNamespace
@@ -463,6 +464,8 @@ def test_vision_topics_merges_visual_sae_atoms(tmp_path):
             "n_topics": [2],
             "topic_embedding_sparsity": 1.0,
             "top_visual_words": 2,
+            "max_topic_features": 3,
+            "min_emission_entropy_gap": 0.01,
         },
     }
 
@@ -474,7 +477,109 @@ def test_vision_topics_merges_visual_sae_atoms(tmp_path):
     summary = json.loads((topic_dir / "vision_topics_summary.json").read_text(encoding="utf-8"))
 
     assert len(clusters) == 2
-    assert sorted(clusters["cluster_size"].tolist()) == [2, 2]
+    assert sorted(clusters["cluster_size"].tolist()) == [1, 2]
     assert theta_topic.shape == (2, 2)
     assert summary["n_topics"] == 2
+    assert summary["n_active_features"] == 4
+    assert summary["n_topic_features"] == 3
+    assert summary["feature_filtering"]["max_topic_features"] == 3
     assert summary["outputs"]["clusters"].endswith("clusters.csv")
+
+
+def test_vision_visualize_writes_topic_contact_sheets(monkeypatch, tmp_path):
+    image_paths = []
+    for idx in range(3):
+        path = tmp_path / f"image_{idx}.jpg"
+        path.write_bytes(b"fake-image")
+        image_paths.append(path)
+
+    out_dir = tmp_path / "vision"
+    topic_dir = out_dir / "topics_2"
+    topic_dir.mkdir(parents=True)
+    save_npz(
+        out_dir / "visual_bow.npz",
+        csr_matrix(
+            np.asarray(
+                [
+                    [4.0, 0.0, 1.0],
+                    [0.0, 3.0, 1.0],
+                    [2.0, 1.0, 0.0],
+                ],
+                dtype=np.float32,
+            )
+        ),
+    )
+    (out_dir / "visual_bow_meta.json").write_text(
+        json.dumps(
+            {
+                "row_ids": ["a", "b", "c"],
+                "labels": ["alpha", "beta", "alpha"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_npz(
+        topic_dir / "theta_topic_csr.npz",
+        csr_matrix(np.asarray([[0.8, 0.1], [0.0, 0.9], [0.6, 0.0]], dtype=np.float32)),
+    )
+    with (topic_dir / "clusters.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "cluster_id",
+                "cluster_size",
+                "cluster_prob",
+                "cluster_ratio",
+                "top_visual_words",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "cluster_id": 0,
+                "cluster_size": 2,
+                "cluster_prob": 0.7,
+                "cluster_ratio": 0.5,
+                "top_visual_words": "0, 2",
+            }
+        )
+
+    config = {
+        "vision": {
+            "out_dir": str(out_dir),
+            "inputs": [
+                {"id": "a", "image": str(image_paths[0]), "label": "alpha"},
+                {"id": "b", "image": str(image_paths[1]), "label": "beta"},
+                {"id": "c", "image": str(image_paths[2]), "label": "alpha"},
+            ],
+            "visualize": {
+                "n_topics": 2,
+                "top_topics": 1,
+                "top_visual_words_per_topic": 2,
+                "visual_word_examples": 2,
+                "topic_image_examples": 2,
+                "thumb_size": 32,
+                "columns": 2,
+                "patch_representatives": False,
+            },
+        },
+    }
+
+    class FakeSheet:
+        def save(self, path, quality=90):
+            del quality
+            path.write_bytes(b"fake-jpeg")
+
+    monkeypatch.setattr(pretrain_run, "_image_from_vision_record", lambda record: object())
+    monkeypatch.setattr(pretrain_run, "_make_contact_sheet", lambda cells, **kwargs: FakeSheet())
+    pretrain_run.run_vision_visualize(config)
+
+    viz_dir = out_dir / "visualizations" / "topics_2"
+    summary = json.loads((viz_dir / "vision_visualize_summary.json").read_text(encoding="utf-8"))
+
+    assert (viz_dir / "index.html").exists()
+    assert (viz_dir / "topic_0_images.jpg").exists()
+    assert (viz_dir / "visual_words" / "visual_word_0.jpg").exists()
+    assert (viz_dir / "visual_words" / "visual_word_2.jpg").exists()
+    assert summary["top_topics"] == 1
+    assert summary["patch_representatives"] is False
