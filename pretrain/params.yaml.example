@@ -1,8 +1,20 @@
+# Minimal example for the pretrain pipeline.
+#
+# This file intentionally keeps only the parameters most users should edit.
+# The code still supports advanced tuning keys such as num_proc, buffer_size,
+# corpus_adapter_epochs, visual_tokenizer.max_patch_samples, and vLLM knobs.
+# Add those only when you are tuning throughput, memory, or ablation settings.
+
 project:
+  # Base directory for relative outputs.
   output_dir: /home/jovyan/helloworld-datavol-1/SAETopic
+  # Global random seed used by stages that do not define their own seed.
   seed: 42
 
 pipeline:
+  # Default text SAE-TM flow. Override with --stages for partial runs.
+  # Common vision flow:
+  #   [vision_vocab, vision_bow, vision_emission, vision_topics, vision_visualize]
   stages:
     - chunks
     - embeddings
@@ -11,269 +23,142 @@ pipeline:
     - evaluate
 
 embedding_model:
-  name: jinaai/jina-embeddings-v5-omni-nano
-  trust_remote_code: true
+  # Hugging Face model used to encode text chunks and images.
+  name: jinaai/jina-embeddings-v5-omni-small
+  # auto, cuda, cuda:0, cuda:1, cpu.
   device: auto
+  # bfloat16 is a good default on recent NVIDIA GPUs; use float16 if needed.
   dtype: bfloat16
+  # Must match sae.training.input_dim.
   truncate_dim: 768
+  # Maximum tokens per encoded text chunk.
   max_seq_length: 1024
-  attn_implementation: null
+  # Extra kwargs forwarded to Jina encode/document calls.
   model_kwargs:
     default_task: clustering
     modality: text
 
 dataset:
+  # "chunks" means embeddings are read from chunks.path after the chunks stage.
   source: chunks
-  chunks_path: /home/jovyan/helloworld-datavol-1/SAETopic/chunks/finewiki_word384
+  # Hugging Face dataset used by the chunks stage.
   name: HuggingFaceFW/finewiki
+  # Dataset subset/config name. Use null if the dataset has no subset.
   subset: en
+  # Dataset split used for pretraining chunks.
   split: train
+  # Text field to chunk and encode.
   text_column: text
-  streaming: false
-  buffer_size: 32768
-  embedding_batch_size: 2048
-  encode_batch_size: 128
-  encode_device: auto_multi_cuda
-  encode_chunk_size: 128
-  num_chunk_workers: 48
-  chunk_worker_batch_size: 4096
-  prefetch_buffers: 2
-  text_split_strategy: word
-  min_sentences_per_chunk: 1
-  text_chunk_size: 384
-  text_chunk_overlap: 0
-  normalize: true
-  num_proc: 32
+  # Limit source rows for smoke tests; null means use the full split.
   max_samples: null
-  task: clustering
-  # For Jina omni non-retrieval tasks, the model card recommends document
-  # encoding; sanitize_urls prevents FineWiki text links from being treated as
-  # image/video/audio/PDF inputs.
-  encode_method: document
-  sanitize_urls: false
 
 chunks:
+  # Output dataset directory for chunked text.
   path: /home/jovyan/helloworld-datavol-1/SAETopic/chunks/finewiki_word384
-  strategy: word
+  # Number of words per chunk when using the default word chunker.
   chunk_size: 384
-  chunk_overlap: 0
+  # Drop very short chunks.
   min_words: 64
-  sanitize_urls: true
-  num_proc: 64
-  map_batch_size: 2000
+  # Continue an interrupted chunking run when possible.
   resume: true
+  # Set true only when you want to rebuild chunks from scratch.
   overwrite: false
-  max_source_rows: null
 
 embeddings:
-  path: /home/jovyan/helloworld-datavol-1/SAETopic/embeddings/finewiki_word384_omni_embeddings
-  chunk_size: 50000
+  # Output directory for sharded embedding arrays.
+  path: /home/jovyan/helloworld-datavol-1/SAETopic/embeddings/finewiki_word384_omni_small_embeddings
+  # Continue an interrupted embedding run when possible.
   resume: true
 
 sae:
-  normalize_embeddings: false
-  mmap_mode: r
-  val_fraction: 0.05
   training:
-    input_dim: 768
-    expansion_factor: 64
-    top_k: 32
+    # SAE architecture: batch_topk, matryoshka_batch_topk, or ort_batch_topk.
     architecture: batch_topk
-    # For nested multi-granularity dictionaries, use:
-    # architecture: matryoshka_batch_topk
-    # matryoshka_group_fractions: [0.125, 0.125, 0.25, 0.5]
-    # matryoshka_group_weights: null
-    # matryoshka_active_groups: null
-    # For atomic, decorrelated topic atoms (OrtSAE), use:
-    # architecture: ort_batch_topk
-    # orthogonality_weight: 0.25
-    # orthogonality_chunk_size: 8192
-    # orthogonality_freq: 1
-    learning_rate: 0.001
-    batch_size: 256
+    # Embedding dimension consumed by the SAE.
+    input_dim: 768
+    # Number of SAE features is input_dim * expansion_factor unless n_features is set.
+    expansion_factor: 64
+    # Active SAE features per sample for TopK-style SAEs.
+    top_k: 32
+    # Increase this until GPU memory is well used.
+    batch_size: 1024
+    # Number of passes over the embedding dataset.
     n_epochs: 10
-    save_frequency: 1
-    # Resume SAE training from an interrupted run.
+    # Adam learning rate.
+    learning_rate: 0.001
+    # Checkpoints are saved here.
+    output_dir: /home/jovyan/helloworld-datavol-1/SAETopic/checkpoints/jina-v5-omni-small-sae
+    # Continue from the latest checkpoint in output_dir when present.
     resume: true
-    resume_from_checkpoint: null
-    warmup_ratio: 0.1
-    aux_loss_weight: 0.03125
-    early_stopping: true
-    early_stopping_patience: 2
-    early_stopping_min_delta: 0.0001
-    early_stopping_metric: val_reconstruction
-    device: auto
-    seed: 42
-    output_dir: /home/jovyan/helloworld-datavol-1/SAETopic/checkpoints/jina-v5-sae-small
-    checkpoint_name: jina-v5-sae-small
-    dataset_name: HuggingFaceFW/finewiki
-    dataset_license: CC-BY-SA 4.0 / Apache 2.0
 
 topics:
+  # SAE checkpoint to use. null means use sae.training.output_dir.
   checkpoint_path: null
+  # Output directory for text topic artifacts and evaluation inputs.
   out_dir: results/text_topics
+  # Topic-model datasets. Add more entries for multi-dataset evaluation.
   datasets:
-    - key: news20k
-      source: hf
-      hf_dataset: SetFit/20_newsgroups
-      hf_split: train+test
-      remove_metadata: true
     - key: imdb
       hf_dataset: stanfordnlp/imdb
       hf_split: train+test
       text_column: text
       label_column: label
-    - key: yelp
-      hf_dataset: Yelp/yelp_review_full
-      hf_split: train
-      text_column: text
-      label_column: label
-    - key: dailymail
-      hf_dataset: ccdv/cnn_dailymail
-      hf_subset: 3.0.0
-      hf_split: train
-      text_column: article
-      label_column: null
+  # Number of documents per dataset; 0 means all documents.
   n_docs: 0
-  n_topics: [50, 100, 200, 300, 500]
-  save_theta_topic: false
-  corpus_adapter_epochs: 30
-  corpus_adapter_batch_size: 512
-  idf_weighting: true
-  activation_batch_size: 256
-  embedding_batch_size: 64
-  vocabulary_size: 5000
-  min_df: 5
-  max_df: 1.0
-  stop_words: saetm
-  theta_mode: dense
-  max_seq_length: 1024
-  use_ctfidf: false
-  merge_embedding_model: word2vec-google-news-300
-  device: auto
+  # Topic counts to generate.
+  n_topics: [50, 100, 200]
 
 evaluation:
+  # Paths containing top_words.txt. null means topics.out_dir.
   paths: null
+  # JSONL evaluation output.
   out: results/text_topics/saetm_eval_reference.jsonl
+  # SAE-TM-compatible word2vec cache for D/CI/CR metrics.
   word_embeddings_dir: /home/jovyan/gensim-data/w2v
+  # Optional fallback embedding model if word_embeddings_dir is unavailable.
   embedding_model: null
+  # none disables LLM metrics; use vllm for LLM topic rating.
   llm_backend: none
+  # LLM used when llm_backend is vllm.
   llm_model: microsoft/phi-4
-  max_model_len: 4096
-  tensor_parallel_size: 1
-  gpu_memory_utilization: 0.9
-  max_num_seqs: null
-  max_num_batched_tokens: null
-  enforce_eager: false
-  llm_batch_size: 32
-  top_n: 20
-  k: 5
-  n: 4
-  r: 3
-  seed: null
 
 vision:
-  # SAE-TM-style vision pipeline:
+  # SAE-TM-style vision flow:
   # image -> DINOv2 patch KMeans BoVW, image -> SAE theta, then learn B_vis.
   # Run with:
-  # PYTHONPATH=src python pretrain/run.py --config pretrain/params.yaml --stages vision_vocab vision_bow vision_emission vision_topics
-  checkpoint_path: null
-  out_dir: results/vision_topics/mini_imagenet
-  hf_dataset: timm/mini-imagenet
-  hf_subset: null
-  hf_split: test
-  hf_cache_dir: null
-  hf_local_files_only: false
-  image_column: image
-  label_column: label
-  max_samples: null
-  max_per_label: 50
-  input_file: null
-  inputs: []
-  modality: vision
-  task: clustering
-  encode_method: document
-  batch_size: 8
-  activation_batch_size: 256
-  normalize: true
-  truncate_dim: 768
-  theta_mode: dense
-  idf_weighting: true
-  n_topics: [50, 100, 200]
-  topic_embedding_sparsity: 0.9
-  top_visual_words: 50
-  # Filter weak or near-uniform visual emissions before KMeans topic merging.
-  max_topic_features: 2000
-  min_theta_avg: 0.0
-  min_emission_entropy_gap: 0.5
-  device: auto
-  visual_tokenizer:
-    model: facebook/dinov2-base
-    # Set true when the model is already present in the HF cache and network is unavailable.
-    local_files_only: false
-    trust_remote_code: false
-    device: auto
-    dtype: float16
-    image_batch_size: 16
-    codebook_size: 4096
-    max_patch_samples: 1000000
-    # 0 means use all DINOv2 patches from each sampled image.
-    patches_per_image_sample: 0
-    kmeans_batch_size: 8192
-    seed: 42
-    centroids_path: null
-  emission:
-    corpus_adapter_epochs: 30
-    corpus_adapter_batch_size: 512
-    idf_weighting: true
-    theta_mode: dense
-    theta_top_k: 32
-    theta_batch_size: 256
-    top_visual_words: 20
-    num_workers: 0
-    verbose: true
-  visualize:
-    n_topics: 50
-    top_topics: 20
-    top_visual_words_per_topic: 8
-    visual_word_examples: 8
-    topic_image_examples: 16
-    thumb_size: 160
-    columns: 4
-    image_size: 224
-    # false uses BoVW counts to show representative full images.
-    # true reruns DINOv2 assignment to crop representative visual-word patches.
-    patch_representatives: false
+  # PYTHONPATH=src python pretrain/run.py --config pretrain/params.yaml \
+  #   --stages vision_vocab vision_bow vision_emission vision_topics vision_visualize
 
-vision_probe:
-  # Run with:
-  # PYTHONPATH=src python pretrain/run.py --config pretrain/params.yaml --stages vision_probe
+  # SAE checkpoint to use. null means use sae.training.output_dir.
   checkpoint_path: null
-  out_dir: vision_probe/mini_imagenet
-  hf_dataset: timm/mini-imagenet
+  # Output directory for visual vocabulary, BoVW, B_vis, topics, and visualizations.
+  out_dir: results/vision_topics/flickr8k
+  # Hugging Face image dataset.
+  hf_dataset: clip-benchmark/wds_flickr8k
+  # Dataset subset/config name. Use null if the dataset has no subset.
   hf_subset: null
-  hf_split: test
-  hf_cache_dir: null
-  hf_local_files_only: false
+  # Dataset split.
+  hf_split: train
+  # Image column name in the dataset.
   image_column: image
-  label_column: label
+  # Optional class/label column. Use null for caption-only datasets.
+  label_column: null
+  # Limit images for smoke tests; null means use the full split.
   max_samples: null
-  max_per_label: 50
-  input_file: null
-  inputs: []
-  # Inline examples:
-  # inputs:
-  #   - id: car
-  #     image: https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/car.jpg
-  #     label: car
-  modality: vision
-  task: clustering
-  encode_method: document
-  batch_size: 8
-  activation_batch_size: 128
-  # Legacy probe: this writes image x SAE-feature activations, not the BoVW used by vision_emission.
-  top_k: 32
-  activation_mode: sparse
-  normalize: true
-  truncate_dim: 768
-  device: auto
+  # Per-label cap for class-balanced datasets; ignored when label_column is null.
+  max_per_label: null
+  # Topic counts to generate from visual SAE atoms.
+  n_topics: [50, 100, 200]
+
+  visual_tokenizer:
+    # Patch feature model used before KMeans visual-word quantization.
+    model: facebook/dinov2-base
+    # Visual vocabulary size for BoVW.
+    codebook_size: 4096
+
+  visualize:
+    # Which topic count to visualize.
+    n_topics: 50
+    # false shows representative full images for each visual word.
+    # true reruns DINOv2 assignment and crops representative patches.
+    patch_representatives: false
