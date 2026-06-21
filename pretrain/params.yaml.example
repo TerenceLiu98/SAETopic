@@ -1,9 +1,14 @@
-# Minimal example for the pretrain pipeline.
+# Minimal example for the config-driven pretrain pipeline.
 #
 # This file intentionally keeps only the parameters most users should edit.
 # The code still supports advanced tuning keys such as num_proc, buffer_size,
 # corpus_adapter_epochs, visual_tokenizer.max_patch_samples, and vLLM knobs.
 # Add those only when you are tuning throughput, memory, or ablation settings.
+#
+# See:
+# - docs/pretraining.md
+# - docs/vision.md
+# - pretrain/README.md
 
 project:
   # Base directory for relative outputs.

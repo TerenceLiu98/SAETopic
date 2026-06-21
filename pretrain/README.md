@@ -1,11 +1,20 @@
 # Pretrain Workflow
 
-This directory contains the reproducible pretraining workflow. It is separate
-from `examples/`; scripts here should only depend on package code under `src/`.
+`pretrain/` contains the config-driven research workflow. It is separate from
+the package-level `saetopic` CLI:
 
-## 1. Create a local config
+- `saetopic`: fit, inspect, save, load, and retopic fitted models.
+- `saetopic-train`: lower-level embedding and SAE checkpoint training.
+- `pretrain/run.py`: reproducible multi-stage text and vision experiments.
 
-`params.yaml.example` is a machine-specific template. Copy it before editing:
+See also:
+
+- [docs/pretraining.md](../docs/pretraining.md)
+- [docs/vision.md](../docs/vision.md)
+
+## 1. Create a Local Config
+
+`params.yaml.example` is a commented template. Copy it before editing:
 
 ```bash
 cp pretrain/params.yaml.example pretrain/params.yaml
@@ -14,33 +23,87 @@ cp pretrain/params.yaml.example pretrain/params.yaml
 Edit paths and hardware settings in `pretrain/params.yaml`, especially:
 
 - `project.output_dir`
+- `embedding_model.device`
+- `embedding_model.name`
+- `embedding_model.truncate_dim`
 - `chunks.path`
-- `dataset.chunks_path`
 - `embeddings.path`
 - `sae.training.output_dir`
+- `sae.training.batch_size`
 - `evaluation.word_embeddings_dir`
-- `chunks.num_proc`
-- `chunks.map_batch_size`
-- `dataset.encode_batch_size`
-- `dataset.embedding_batch_size`
-- `embeddings.chunk_size`
+- `vision.out_dir`
+- `vision.hf_dataset`
 
-## 2. Prepare gensim / WMD assets
+The example keeps only common parameters. Advanced keys such as `num_proc`,
+`buffer_size`, `encode_batch_size`, `corpus_adapter_epochs`,
+`visual_tokenizer.max_patch_samples`, and vLLM settings are still supported by
+the code but are not expanded in the minimal template.
 
-Topic merging uses the gensim model named in:
+## 2. Current Example Defaults
 
-```yaml
-topics:
-  merge_embedding_model: word2vec-google-news-300
-```
+The current template is aligned around:
 
-Set the gensim data directory when needed:
+- embedding model: `jinaai/jina-embeddings-v5-omni-small`
+- text modality: `model_kwargs.modality: text`
+- task: `clustering`
+- embedding dimension: `truncate_dim: 768`
+- text chunks: FineWiki word chunks of size `384`
+- SAE: `batch_topk`, expansion `64`, top-k `32`
+- text topic dataset example: IMDB
+- vision dataset example: `clip-benchmark/wds_flickr8k`
+- vision visual vocabulary: `facebook/dinov2-base`, codebook size `4096`
+
+If you change the embedding model, also change `embeddings.path` and
+`sae.training.output_dir`. If you change chunking settings, also change
+`chunks.path` and `embeddings.path`.
+
+## 3. Run Text Stages
+
+Run all stages configured in `pipeline.stages`:
 
 ```bash
-export GENSIM_DATA_DIR=/home/jovyan/gensim-data
+PYTHONPATH=src python pretrain/run.py --config pretrain/params.yaml
 ```
 
-Evaluation `D` expects the SAE-TM WMD cache:
+Run individual stages:
+
+```bash
+PYTHONPATH=src python pretrain/run.py --config pretrain/params.yaml --stages chunks
+
+PYTHONPATH=src python pretrain/run.py \
+  --config pretrain/params.yaml \
+  --stages embeddings train_sae
+
+PYTHONPATH=src python pretrain/run.py --config pretrain/params.yaml --stages topics
+
+PYTHONPATH=src python pretrain/run.py --config pretrain/params.yaml --stages evaluate
+```
+
+## 4. Run Vision Stages
+
+The vision pipeline is experimental and config-driven:
+
+```bash
+PYTHONPATH=src python pretrain/run.py \
+  --config pretrain/params.yaml \
+  --stages vision_vocab vision_bow vision_emission vision_topics vision_visualize
+```
+
+The pipeline is:
+
+```text
+image -> DINOv2 patches -> visual vocabulary -> BoVW
+image -> Jina vision embedding -> SAE theta
+theta + BoVW -> B_vis
+B_vis -> visual topics
+```
+
+Set `vision.visualize.patch_representatives: true` when you want cropped patch
+representatives instead of full-image visual-word examples.
+
+## 5. Evaluation Assets
+
+Topic evaluation can use an SAE-TM-compatible WMD cache:
 
 ```text
 /home/jovyan/gensim-data/w2v/
@@ -69,75 +132,17 @@ np.save(out / "embeddings.np.npy", kv.vectors.astype(np.float32, copy=False))
 PY
 ```
 
-## 3. Run stages
-
-Run all stages configured in `pipeline.stages`:
-
-```bash
-PYTHONPATH=src python pretrain/run.py --config pretrain/params.yaml
-```
-
-Build the offline FineWiki text chunks:
-
-```bash
-PYTHONPATH=src python pretrain/run.py \
-  --config pretrain/params.yaml \
-  --stages chunks
-```
-
-Run embedding generation from the saved chunks and then SAE training:
-
-```bash
-PYTHONPATH=src python pretrain/run.py \
-  --config pretrain/params.yaml \
-  --stages embeddings train_sae
-```
-
-Run downstream topic construction:
-
-```bash
-PYTHONPATH=src python pretrain/run.py \
-  --config pretrain/params.yaml \
-  --stages topics
-```
-
-Run topic-word evaluation:
-
-```bash
-PYTHONPATH=src python pretrain/run.py \
-  --config pretrain/params.yaml \
-  --stages evaluate
-```
+`evaluation.llm_backend: none` disables LLM ratings. Set it to `vllm` when you
+want LLM-assisted topic ratings and have the hardware available.
 
 ## Notes
 
-- The default workflow is two-stage preprocessing:
-  `chunks -> embeddings`. The `chunks` stage flattens FineWiki articles into a
-  saved Hugging Face dataset with one row per embedding input. The `embeddings`
-  stage reads that saved chunk dataset and only runs Jina encoding.
-- `dataset.source: chunks` makes embedding generation read
-  `dataset.chunks_path` / `chunks.path`. This avoids re-splitting FineWiki
-  during GPU embedding and makes resume operate on flat chunk rows.
-- `chunks.strategy: word` is the recommended fast path for large FineWiki
-  runs. It uses whitespace word chunks and does not touch the Jina tokenizer
-  during preprocessing. `chunks.strategy: paragraph` is available when you want
-  paragraph-style chunks, but it is much slower.
-- `chunks.sanitize_urls: true` replaces text URLs before saving chunks so Jina
-  omni does not treat FineWiki links as image/video/audio/PDF inputs.
-- Embedding generation can use multiple GPUs when `dataset.encode_device` is
-  `auto_multi_cuda`. SAE training is currently single-device.
-- `embeddings.chunk_size` controls how many embeddings are written per shard.
-  It does not control text chunk size or encoder batch size.
-- `dataset.buffer_size` controls the shuffle buffer over saved text chunks
-  during embedding generation. `dataset.embedding_batch_size` controls how many
-  chunk texts are handed to each dataset yield, while `dataset.encode_batch_size`
-  is forwarded to SentenceTransformers/Jina as the internal encode batch size.
-- The example config uses `jinaai/jina-embeddings-v5-omni-nano` with
-  `model_kwargs.default_task: clustering`, `model_kwargs.modality: text`, and
-  `dataset.encode_method: document` for a FineWiki-only Jina omni SAE.
-- If you change the embedding model, also change `embeddings.path` and
-  `sae.training.output_dir` to avoid mixing old embeddings/checkpoints. If you
-  change chunking settings, also change `chunks.path`, `dataset.chunks_path`,
-  and `embeddings.path`.
-- `evaluation.llm_backend: none` computes only `D`. Set it to `vllm` to compute
-  `CR` and `CI`.
+- `chunks -> embeddings` is the recommended text pretraining path. Chunk once,
+  embed once, and reuse the saved embedding shards for SAE sweeps.
+- `chunks.sanitize_urls: true` prevents Jina omni from treating FineWiki URLs
+  as image/video/audio/PDF inputs.
+- `embeddings.chunk_size` controls embeddings per shard. It does not control
+  text chunk size or encoder batch size.
+- SAE training is single-device. Embedding generation can use multiple GPUs
+  when configured through advanced dataset encoding settings.
+- Resume is supported for chunking, embedding generation, and SAE training.

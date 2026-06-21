@@ -1,160 +1,134 @@
-# SAETopic Product Requirements
+# SAETopic Current Project State
+
+This document records the current product state and near-term requirements. It
+replaces the older training-only milestone notes.
 
 ## Goal
 
-SAETopic provides topic inference on top of sparse autoencoder topic atoms. The
-intended workflow is:
+SAETopic provides topic modeling on top of sparse autoencoder topic atoms:
 
 1. Train reusable SAE topic atoms from large embedding corpora.
-2. Adapt those atoms to a user corpus for interpretable topic words.
-3. Change topic granularity without retraining the SAE.
-
-The current implementation focuses on step 1: memory-aware SAE training from
-large text corpora such as FineWiki.
+2. Adapt those atoms to a user corpus through observable token emissions.
+3. Merge topic atoms into different topic granularities without retraining the
+   SAE.
+4. Expose the workflow through a Python package API and a lightweight CLI.
 
 ## Current Scope
 
 ### Implemented
 
-- Stream Hugging Face text datasets through `create_streaming_dataset`.
-- Split long documents into bounded tokenizer chunks before embedding.
-- Configure SentenceTransformers encode batch size, max sequence length, task,
-  Matryoshka truncation, bf16 loading, and multi-GPU encode devices.
-- Save streamed embeddings to a single `.npy` file with chunked temporary
-  writes, avoiding a full in-memory concatenation.
-- Load `.npy` embeddings with memory mapping for SAE training.
-- Train `standard`, `jumprelu`, `topk`, `batch_topk`, and
-  `matryoshka_batch_topk` SAE variants.
-- Use sparse top-k reconstruction during training to avoid materializing the
-  dense `(batch_size, n_features)` activation tensor.
+Package API:
+
+- `SAETopicModel.from_pretrained`
+- `fit`, `fit_transform`, and `transform`
+- `retopic` / `reduce_topics`
+- `get_topic_info`, `get_topic`, `get_topics`
+- `get_document_info`, `get_representative_docs`
+- `find_topics`
+- `get_cluster_info`, `get_cluster_to_feature_indices`
+- `get_theta_topic_matrix`
+- `save` / `load`
+
+CLI:
+
+- `saetopic fit`
+- `saetopic topics`
+- `saetopic retopic`
+- `saetopic-train embed`
+- `saetopic-train train`
+- `saetopic-train upload`
+
+Training:
+
+- Stream Hugging Face text datasets through embedding pipelines.
+- Split long documents into bounded chunks before embedding.
+- Configure SentenceTransformers/Jina encode batch size, max sequence length,
+  task, truncation, dtype, and multi-GPU encode devices.
+- Save sharded embedding directories with manifests and resume metadata.
+- Train `standard`, `jumprelu`, `topk`, `batch_topk`,
+  `matryoshka_batch_topk`, and `ort_batch_topk` SAE variants.
+- Resume SAE training from latest or explicit checkpoints.
 - Save checkpoints, training metadata, model cards, and file checksums.
 - Upload trained checkpoints to Hugging Face Hub.
 
-### Not Yet Implemented
+Text topic experiments:
 
-- Loading pretrained SAETopic models through `SAETopicModel.from_pretrained`.
-- End-to-end `fit`, `fit_transform`, and `transform` topic modeling.
-- Corpus-specific word interpretation for topic atoms.
-- Retopic/topic merging over fitted topic atoms.
-- Visualization helpers.
-- Evaluation metrics.
-- Vision pretraining.
+- Official-style preprocessing order for SAE-TM document processing.
+- Corpus adaptation from SAE theta and BoW to feature-word emissions.
+- Topic merging with cluster-size-descending export.
+- SAE-TM-style `theta_topic_csr.npz` export.
+- D/CI/CR evaluation plumbing.
 
-## Training Workflow Requirements
+Vision research pipeline:
 
-### Embedding Precomputation
+- DINOv2 patch-token KMeans visual vocabulary.
+- Image BoVW construction from Hugging Face image datasets.
+- Visual emission matrix `B_vis`.
+- Visual topic merging.
+- Full-image visual-word and topic contact-sheet visualization.
+- Optional patch representatives.
 
-Large text corpora should be embedded once and saved before SAE training.
-This keeps the embedding model out of memory during SAE optimization and makes
-hyperparameter sweeps repeatable.
+### Planned
 
-Required behavior:
+- Interactive package visualizations: `visualize_topics`,
+  `visualize_documents`, `visualize_hierarchy`, `visualize_atoms`.
+- Built-in model evaluation wrappers from the package API.
+- First-party pretrained checkpoint releases.
+- Public image API, for example `fit_images` or multimodal `fit`.
+- Documentation site with rendered examples.
 
-- The embedder must process bounded text chunks for long FineWiki-style
-  articles.
-- `encode_batch_size` must directly control SentenceTransformers' internal
-  batch size.
-- Multi-GPU encoding must be opt-in through an explicit device list or
-  `--auto-multi-gpu`.
-- Large-corpus embedding output should support sharded `.npy` directories with
-  a manifest, avoiding a final single-file merge step.
-- Sharded output should update `manifest.partial.json` after each shard and
-  resume from existing partial metadata or contiguous `shard_*.npy` files.
-- Empty streams must fail explicitly instead of writing an invalid output file.
-- Embedding normalization must be explicit: the embed CLI normalizes by default,
-  while `--no-normalize-embeddings` saves raw embedder outputs.
+## Documentation Requirements
 
-### SAE Training
+The repository documentation should keep these layers separate:
 
-Training from saved embeddings is the recommended development path.
+1. `README.md`: package-facing surface, short and runnable.
+2. `docs/quickstart.md`: local demo and checkpoint workflow.
+3. `docs/api.md`: methods, attributes, and key parameters.
+4. `docs/pretraining.md`: SAE training and text research pipeline.
+5. `docs/vision.md`: vision BoVW research workflow.
+6. `docs/model_format.md`: save/load directory format.
+7. `pretrain/README.md`: operational notes for `pretrain/run.py`.
 
-Required behavior:
+README examples should not require unpublished checkpoints. If a checkpoint is
+required, the example must say so explicitly.
 
-- `.npy` files should be memory-mapped by default.
-- Users should be able to skip re-normalization when embeddings were normalized
-  during the embed step.
-- Standard, JumpReLU, TopK, BatchTopK, and Matryoshka BatchTopK SAE training should follow the
-  referenced SAE-TM dictionary-learning trainers: Standard uses dense ReLU
-  activations with L1 sparsity warmup, JumpReLU uses learned thresholds with a
-  target-L0 penalty, TopK/BatchTopK use per-sample or global batch top-k
-  selection with dead-feature aux-k loss, Matryoshka BatchTopK adds nested
-  group-prefix reconstruction losses, and optimizers maintain constrained
-  decoder norms.
-- Step-based training through `TrainingConfig.steps` / `saetopic-train train
-  --steps` should be supported for SAE-TM-style long runs; epoch training is a
-  compatibility path for small local experiments.
-- The training output directory should follow `TrainingConfig.output_dir` unless
-  explicitly overridden.
-- Checkpoints should include model weights, optimizer state, training state,
-  config, model card, and checksums.
-- SAE training should resume from explicit checkpoint directories or the latest
-  checkpoint in the output directory, restoring model, optimizer, scheduler,
-  and training-state counters.
-- Generated model cards should describe the checkpoint as a training artifact
-  until pretrained loading and inference APIs are implemented.
-- The train CLI may upload immediately after training, and the upload CLI should
-  upload an existing self-contained `final` checkpoint without retraining.
-  Both paths should expose repository creation and private repository flags.
-- Sparse training must preserve the same loss semantics as the dense forward
-  path.
+## Near-Term Requirements
 
-## User-Facing CLI
+Package surface:
 
-The `saetopic-train` console script and `saetopic.training.cli` module are the
-supported interfaces for the current training milestone. The top-level
-`saetopic` inference CLI should fail clearly until the inference commands are
-implemented.
+- Keep `SAETopicModel` API stable enough for examples and CLI usage.
+- Maintain a fully offline smoke-test example.
+- Keep save/load roundtrip tests passing.
 
-Primary commands:
+Pretraining:
 
-```bash
-saetopic-train embed \
-  --dataset-name HuggingFaceFW/finewiki \
-  --output data/finewiki_embeddings \
-  --text-chunk-size 512 \
-  --max-seq-length 512 \
-  --encode-batch-size 8 \
-  --seed 42 \
-  --truncate-dim 512
+- Keep `pretrain/params.yaml.example` minimal and commented.
+- Keep advanced parameters supported in code but out of the main example unless
+  they are part of the common workflow.
+- Keep text and vision defaults synchronized across README, docs, and
+  `pretrain/README.md`.
 
-saetopic-train train \
-  --embeddings data/finewiki_embeddings \
-  --no-normalize-embeddings \
-  --input-dim 512 \
-  --expansion-factor 32 \
-  --top-k 32
+Vision:
 
-saetopic-train upload \
-  --checkpoint-dir checkpoints/jina-v5-sae-small/final \
-  --repo-id your-org/jina-v5-sae-small \
-  --create-repo
-```
-
-The CLI should remain aligned with the Python APIs so every memory-sensitive
-training option exposed in examples can also be used from the shell.
-
-## Documentation Policy
-
-The README should present implemented training functionality first and label
-pretrained/inference workflows as planned until the corresponding methods are
-implemented and tested.
-
-Examples should prefer FineWiki-safe defaults:
-
-- `text_chunk_size=512`
-- `text_chunk_overlap=32`
-- `max_seq_length=512`
-- low `encode_batch_size` values for initial runs
-- explicit `seed` values for streaming buffer shuffling
-- precompute embeddings before SAE training
+- Treat vision as a research pipeline until a public image API is implemented.
+- Prefer patch-grounded visual-word explanations for paper-facing experiments.
 
 ## Verification Gates
 
-Before treating the current training milestone as stable, these commands should
-pass:
+Targeted package checks:
 
 ```bash
-uv run --with mypy mypy src
-uv run --with ruff ruff check src tests examples
-uv run --with pytest pytest
+uv run ruff check src/saetopic/cli.py src/saetopic/model.py src/saetopic/serialization.py tests/test_cli.py tests/test_model.py examples/quickstart_local.py
+uv run pytest tests/test_cli.py tests/test_imports.py tests/test_model.py
+python examples/quickstart_local.py
 ```
+
+Full repository checks before release:
+
+```bash
+uv run ruff check src tests examples
+uv run pytest tests
+```
+
+Known caveat: full-suite failures should be triaged separately if they come
+from unrelated streaming-order assumptions or legacy research tests.
