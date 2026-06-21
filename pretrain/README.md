@@ -47,7 +47,7 @@ The current template is aligned around:
 - text modality: `model_kwargs.modality: text`
 - task: `clustering`
 - embedding dimension: `truncate_dim: 768`
-- text chunks: FineWiki word chunks of size `384`
+- text chunks: FineWiki word chunks of size `384` (we randomly select 5M embedding for training)
 - SAE: `batch_topk`, expansion `64`, top-k `32`
 - text topic dataset example: IMDB
 - vision dataset example: `clip-benchmark/wds_flickr8k`
@@ -73,6 +73,8 @@ PYTHONPATH=src python pretrain/run.py --config pretrain/params.yaml --stages chu
 PYTHONPATH=src python pretrain/run.py \
   --config pretrain/params.yaml \
   --stages embeddings train_sae
+PYTHONPATH=src python pretrain/run.py   --config pretrain/params.yaml   --stages train_sae
+# Epoch 5/5 - total: 0.074041  reconstruction: 0.042672  sparsity: 0.000000  auxiliary: 1.003797  r2: 0.939705
 
 PYTHONPATH=src python pretrain/run.py --config pretrain/params.yaml --stages topics
 
