@@ -180,13 +180,19 @@ If you use SAETopic, please cite:
   year = {2026},
   url = {https://github.com/TerenceLiu98/SAETopic}
 }
+
+# The original research paper is 
+@article{girrbach2025sparse,
+  title={Sparse Autoencoders are Topic Models},
+  author={Girrbach, Leander and Akata, Zeynep},
+  journal={arXiv preprint arXiv:2511.16309},
+  year={2025}
+}
 ```
+
+
 
 ## License
 
 Apache-2.0
 
-## Legal Notice
-
-SAETopic is an independent, unofficial implementation. All SAE code and
-checkpoints are trained independently using permissively licensed datasets.
