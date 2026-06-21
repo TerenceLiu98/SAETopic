@@ -98,6 +98,9 @@ class TrainingConfig:
     seed: int = 42
     save_frequency: int = 10
     log_frequency: int = 10
+    dataloader_num_workers: int = 0
+    dataloader_prefetch_factor: int | None = None
+    dataloader_persistent_workers: bool = False
     recon_loss_weight: float = 1.0
     sparsity_loss_weight: float = 1.0
     sparsity_warmup_steps: int | None = 2000
@@ -147,6 +150,11 @@ class TrainingConfig:
             "warmup_steps": self.warmup_steps,
             "architecture": self.architecture,
             "seed": self.seed,
+            "save_frequency": self.save_frequency,
+            "log_frequency": self.log_frequency,
+            "dataloader_num_workers": self.dataloader_num_workers,
+            "dataloader_prefetch_factor": self.dataloader_prefetch_factor,
+            "dataloader_persistent_workers": self.dataloader_persistent_workers,
             "decoder_bias": self.decoder_bias,
             "encoder_bias": self.encoder_bias,
             "normalization": self.normalization,
@@ -386,7 +394,7 @@ class SAETrainer:
 
     def _train_batch(self, batch: Tensor) -> dict[str, Tensor]:
         """Run one SAE-TM training step."""
-        batch = batch.to(self.device)
+        batch = batch.to(self.device, non_blocking=self.device.type == "cuda")
         initialize_decoder_bias = cast(Any, getattr(self.model, "initialize_decoder_bias", None))
         if self.state.global_step == 0 and callable(initialize_decoder_bias):
             initialize_decoder_bias(batch)
@@ -499,7 +507,7 @@ class SAETrainer:
 
         with torch.no_grad():
             for batch in val_loader:
-                batch = batch.to(self.device)
+                batch = batch.to(self.device, non_blocking=self.device.type == "cuda")
                 x_recon, h, topk_values, topk_indices = self.model.forward_sparse(batch)
                 _, losses = self.model.compute_loss_sparse(
                     batch,
@@ -624,21 +632,9 @@ class SAETrainer:
         val_dataset: "EmbeddingDataset | ShardedEmbeddingDataset | None" = None,
     ) -> TrainingState:
         """Train with standard PyTorch Dataset (uses DataLoader)."""
-        train_loader = DataLoader(
-            dataset,
-            batch_size=self.config.batch_size,
-            shuffle=True,
-            num_workers=0,
-            pin_memory=self.device.type == "cuda",
-        )
+        train_loader = DataLoader(dataset, **self._dataloader_kwargs(shuffle=True))
         val_loader = (
-            DataLoader(
-                val_dataset,
-                batch_size=self.config.batch_size,
-                shuffle=False,
-                num_workers=0,
-                pin_memory=self.device.type == "cuda",
-            )
+            DataLoader(val_dataset, **self._dataloader_kwargs(shuffle=False))
             if val_dataset is not None
             else None
         )
@@ -713,6 +709,21 @@ class SAETrainer:
         self.save_metadata()
 
         return self.state
+
+    def _dataloader_kwargs(self, shuffle: bool) -> dict[str, Any]:
+        """Build DataLoader kwargs, enabling prefetch only when workers are active."""
+        num_workers = max(0, int(self.config.dataloader_num_workers))
+        kwargs: dict[str, Any] = {
+            "batch_size": self.config.batch_size,
+            "shuffle": shuffle,
+            "num_workers": num_workers,
+            "pin_memory": self.device.type == "cuda",
+        }
+        if num_workers > 0:
+            if self.config.dataloader_prefetch_factor is not None:
+                kwargs["prefetch_factor"] = self.config.dataloader_prefetch_factor
+            kwargs["persistent_workers"] = bool(self.config.dataloader_persistent_workers)
+        return kwargs
 
     def _resume_early_stopping_state(self) -> tuple[float, int]:
         """Recover early-stopping bookkeeping from saved validation history."""

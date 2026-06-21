@@ -533,6 +533,7 @@ def test_training_config():
     assert config.n_features == 256
     assert config.top_k == 8
     assert config.batch_size == 32
+    assert config.dataloader_num_workers == 0
 
     # Test to_dict
     config_dict = config.to_dict()
@@ -540,6 +541,9 @@ def test_training_config():
     assert config_dict["n_features"] == 256
     assert config_dict["resume"] is True
     assert config_dict["resume_from_checkpoint"] == "checkpoint_epoch_1"
+    assert config_dict["dataloader_num_workers"] == 0
+    assert config_dict["dataloader_prefetch_factor"] is None
+    assert config_dict["dataloader_persistent_workers"] is False
 
 
 def test_training_config_serializes_matryoshka_options():
@@ -1555,6 +1559,46 @@ def test_standard_dataloader_pins_memory_only_for_cuda(tmp_path):
         train_sae_module.DataLoader = original_dataloader
 
     assert captured_kwargs["pin_memory"] is False
+
+
+def test_standard_dataloader_uses_configured_workers(tmp_path):
+    """Configured DataLoader worker settings are forwarded for standard training."""
+    model = TopKSAE(input_dim=16, n_features=32, top_k=4)
+    config = TrainingConfig(
+        input_dim=16,
+        n_features=32,
+        top_k=4,
+        n_epochs=1,
+        batch_size=8,
+        device="cpu",
+        output_dir=str(tmp_path / "dataloader_workers"),
+        dataloader_num_workers=2,
+        dataloader_prefetch_factor=3,
+        dataloader_persistent_workers=True,
+    )
+    trainer = SAETrainer(model, config)
+    dataset = EmbeddingDataset(torch.randn(16, 16))
+
+    import importlib
+
+    train_sae_module = importlib.import_module("saetopic.training.train_sae")
+    original_dataloader = train_sae_module.DataLoader
+    captured_kwargs = {}
+
+    class CapturingDataLoader(original_dataloader):
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+            super().__init__(*args, **kwargs)
+
+    try:
+        train_sae_module.DataLoader = CapturingDataLoader
+        trainer.fit(dataset)
+    finally:
+        train_sae_module.DataLoader = original_dataloader
+
+    assert captured_kwargs["num_workers"] == 2
+    assert captured_kwargs["prefetch_factor"] == 3
+    assert captured_kwargs["persistent_workers"] is True
 
 
 def test_unknown_architecture():

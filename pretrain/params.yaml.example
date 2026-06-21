@@ -87,8 +87,14 @@ sae:
     top_k: 32
     # Increase this until GPU memory is well used.
     batch_size: 1024
+    # Increase when GPU utilization drops to 0% while training from mmap/shards.
+    dataloader_num_workers: 8
+    dataloader_prefetch_factor: 4
+    dataloader_persistent_workers: true
     # Number of passes over the embedding dataset.
     n_epochs: 10
+    # Save a checkpoint every N epochs.
+    save_frequency: 1
     # Adam learning rate.
     learning_rate: 0.001
     # Checkpoints are saved here.
