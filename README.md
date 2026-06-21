@@ -28,7 +28,7 @@ cd SAETopic
 pip install -e ".[dev]"
 ```
 
-When published to PyPI:
+When published to PyPI (**Planened**):
 
 ```bash
 pip install saetopic
