@@ -28,7 +28,7 @@ cd SAETopic
 pip install -e ".[dev]"
 ```
 
-When published to PyPI (**Planened**):
+When published to PyPI (**Planned**):
 
 ```bash
 pip install saetopic
@@ -192,7 +192,9 @@ If you use SAETopic, please cite:
 
 
 
-## License
+## Acknowledgement
 
-Apache-2.0
-
+* [SAE-TM](https://github.com/ExplainableML/SAE-TM)
+* [BERTopic](https://github.com/maartengr/bertopic)
+* [TopMost](https://github.com/bobxwu/topmost)
+* [dictionary_learning](https://github.com/saprmarks/dictionary_learning/)
