@@ -14,9 +14,9 @@
 SAETopic is a Python package for topic modeling with sparse autoencoder
 (SAE) topic atoms. It provides a BERTopic-style interface for fitting topics,
 inspecting topic words, transforming documents, saving/loading fitted models,
-and changing topic granularity without retraining the SAE. It is an
-independent implementation inspired by
-[Sparse Autoencoders are Topic Models](https://arxiv.org/abs/2511.16309).
+and changing topic granularity without retraining the SAE. It is an 
+unofficial implementation inspired by
+[Sparse Autoencoders are Topic Models](https://arxiv.org/abs/2511.16309), and [ExplanableML/SAE-TM](https://github.com/ExplainableML/SAE-TM).
 
 ## Installation
 
