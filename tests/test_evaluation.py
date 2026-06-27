@@ -75,21 +75,24 @@ def test_load_saetm_word2vec_cache(tmp_path):
 
 
 def test_coherence_rating_with_callable_llm():
-    topic_words = {0: ["space", "orbit", "nasa", "moon", "planet", "ignored"]}
+    topic_words = {
+        0: [f"space_{idx}" for idx in range(20)] + ["ignored"],
+    }
 
     def llm(prompt: str) -> str:
-        assert "space" in prompt or "orbit" in prompt or "nasa" in prompt
+        assert "space_0" in prompt
+        assert "space_19" in prompt
         assert "ignored" not in prompt
         return '{"rationale": "coherent", "score": 90}'
 
-    scores = compute_coherence_rating(topic_words, llm=llm, repetitions=2, seed=0)
+    scores = compute_coherence_rating(topic_words, llm=llm, seed=0)
 
     assert scores == {0: 90.0}
     assert summarize_metric(scores) == 90.0
 
 
 def test_coherence_rating_with_batched_llm():
-    topic_words = {0: ["space", "orbit", "nasa", "moon", "planet"]}
+    topic_words = {0: [f"space_{idx}" for idx in range(20)]}
     batches = []
 
     def llm(prompt: str) -> str:
@@ -114,15 +117,16 @@ def test_coherence_rating_with_batched_llm():
 
 def test_intruder_detection_with_callable_llm():
     topic_words = {
-        0: ["space", "orbit", "nasa", "moon", "planet", "ignored"],
-        1: ["car", "engine", "road", "wheel", "drive", "ignored"],
+        0: [f"space_{idx}" for idx in range(20)] + ["ignored_space"],
+        1: [f"car_{idx}" for idx in range(20)] + ["ignored_car"],
     }
 
     def llm(prompt: str) -> str:
-        assert "ignored" not in prompt
-        if "car" in prompt:
-            return "car"
-        return "space"
+        assert "ignored_space" not in prompt
+        assert "ignored_car" not in prompt
+        if "car_" in prompt:
+            return prompt[prompt.index("car_") :].split(".")[0].split(",")[0].strip()
+        return prompt[prompt.index("space_") :].split(".")[0].split(",")[0].strip()
 
     scores = compute_intruder_detection(topic_words, llm=llm, repetitions=1, seed=2)
 
@@ -132,8 +136,8 @@ def test_intruder_detection_with_callable_llm():
 
 def test_intruder_detection_with_batched_llm():
     topic_words = {
-        0: ["space", "orbit", "nasa", "moon", "planet"],
-        1: ["car", "engine", "road", "wheel", "drive"],
+        0: [f"space_{idx}" for idx in range(20)],
+        1: [f"car_{idx}" for idx in range(20)],
     }
     batches = []
 
@@ -144,7 +148,11 @@ def test_intruder_detection_with_batched_llm():
         batches.append(list(prompts))
         responses = []
         for prompt in prompts:
-            responses.append("car" if "car" in prompt else "space")
+            responses.append(
+                prompt[prompt.index("car_") :].split(".")[0].split(",")[0].strip()
+                if "car_" in prompt
+                else prompt[prompt.index("space_") :].split(".")[0].split(",")[0].strip()
+            )
         return responses
 
     scores = compute_intruder_detection(
@@ -162,14 +170,14 @@ def test_intruder_detection_with_batched_llm():
 
 def test_evaluate_topic_words_reports_ci_as_percent():
     topic_words = {
-        0: ["space", "space", "space", "space", "space"],
-        1: ["car", "car", "car", "car", "car"],
+        0: ["space"] * 20,
+        1: ["car"] * 20,
     }
 
     def llm(prompt: str) -> str:
         if "coherence" in prompt:
             return '{"rationale": "coherent", "score": 90}'
-        if prompt.count("space") == 4:
+        if prompt.count("space") == 5:
             return "car"
         return "space"
 

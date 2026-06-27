@@ -17,6 +17,7 @@ import json
 import random
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
+from string import punctuation
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
@@ -291,7 +292,7 @@ def parse_coherence_score(text: str) -> int | None:
 
 
 def _normalize_answer(text: str) -> str:
-    return text.strip().lower()
+    return text.strip().lower().strip(punctuation + " \t\n\r")
 
 
 def compute_coherence_rating(
@@ -299,26 +300,34 @@ def compute_coherence_rating(
     llm: LLMCallable,
     llm_batch: LLMBatchCallable | None = None,
     llm_batch_size: int | None = None,
-    top_n: int | None = None,
-    sample_size: int = 5,
-    repetitions: int = 3,
+    top_n: int = 20,
+    sample_size: int | None = None,
+    repetitions: int = 1,
     seed: int | None = None,
 ) -> dict[int, float]:
-    """Compute CR per topic with an LLM callable."""
+    """Compute CR per topic with an LLM callable.
+
+    The paper-aligned protocol rates the relatedness of a topic's top 20
+    words. ``sample_size`` is retained for diagnostic sampled ratings only;
+    leave it as ``None`` for SAE-TM-compatible evaluation.
+    """
     rng = random if seed is None else random.Random(seed)
-    pool_size = sample_size if top_n is None else top_n
-    topics = normalize_topic_words(topic_words, top_n=None)
+    topics = normalize_topic_words(topic_words, top_n=top_n)
     scores: dict[int, list[int]] = {}
 
     jobs: list[tuple[int, str]] = []
     for topic_id, words in topics.items():
-        if len(words) < pool_size or pool_size < sample_size:
+        if len(words) < top_n:
             continue
-        pool = words[:pool_size]
         for _ in range(repetitions):
-            sample = rng.sample(pool, sample_size)
-            rng.shuffle(sample)
-            jobs.append((topic_id, create_coherence_prompt(sample)))
+            if sample_size is None:
+                prompt_words = list(words[:top_n])
+            else:
+                if top_n < sample_size:
+                    continue
+                prompt_words = rng.sample(words[:top_n], sample_size)
+                rng.shuffle(prompt_words)
+            jobs.append((topic_id, create_coherence_prompt(prompt_words)))
 
     if llm_batch is not None:
         for batch in _iter_batches(jobs, llm_batch_size):
@@ -347,15 +356,18 @@ def compute_intruder_detection(
     llm: LLMCallable,
     llm_batch: LLMBatchCallable | None = None,
     llm_batch_size: int | None = None,
-    top_n: int | None = None,
-    sample_size: int = 4,
+    top_n: int = 20,
+    sample_size: int = 5,
     repetitions: int = 3,
     seed: int | None = None,
 ) -> dict[int, float]:
-    """Compute CI per topic with an LLM callable."""
+    """Compute CI per topic with an LLM callable.
+
+    The paper-aligned protocol repeatedly samples five words from a topic's
+    top 20 words and adds one intruder word from another topic.
+    """
     rng = random if seed is None else random.Random(seed)
-    pool_size = sample_size if top_n is None else top_n
-    topics = normalize_topic_words(topic_words, top_n=None)
+    topics = normalize_topic_words(topic_words, top_n=top_n)
     topic_ids = sorted(topics)
     if len(topic_ids) < 2:
         return {}
@@ -364,15 +376,17 @@ def compute_intruder_detection(
     jobs: list[tuple[int, str, str]] = []
     for topic_id in topic_ids:
         words = topics[topic_id]
-        if len(words) < pool_size or pool_size < sample_size:
+        if len(words) < top_n or top_n < sample_size:
             continue
-        intruder_candidates = [other for other in topic_ids if other != topic_id and topics[other]]
+        intruder_candidates = [
+            other for other in topic_ids if other != topic_id and topics[other]
+        ]
         if not intruder_candidates:
             continue
         for _ in range(repetitions):
             other_id = rng.choice(intruder_candidates)
-            intruder = rng.choice(topics[other_id])
-            sample = rng.sample(words[:pool_size], sample_size)
+            intruder = rng.choice(topics[other_id][:top_n])
+            sample = rng.sample(words[:top_n], sample_size)
             test_words = sample + [intruder]
             rng.shuffle(test_words)
             jobs.append((topic_id, intruder.lower(), create_intruder_prompt(test_words)))
@@ -416,9 +430,10 @@ def evaluate_topic_words(
     word_embeddings: Mapping[str, Sequence[float]] | None = None,
     mean_embedding: Sequence[float] | None = None,
     top_n: int = 20,
-    sample_size: int = 5,
-    intruder_sample_size: int = 4,
+    sample_size: int | None = None,
+    intruder_sample_size: int = 5,
     repetitions: int = 3,
+    coherence_repetitions: int = 1,
     seed: int | None = None,
 ) -> dict[str, float | dict[int, float]]:
     """Compute available paper-aligned metrics for a topic-word mapping."""
@@ -437,9 +452,9 @@ def evaluate_topic_words(
             llm=llm,
             llm_batch=llm_batch,
             llm_batch_size=llm_batch_size,
-            top_n=sample_size,
+            top_n=top_n,
             sample_size=sample_size,
-            repetitions=repetitions,
+            repetitions=coherence_repetitions,
             seed=seed,
         )
         ci = compute_intruder_detection(
@@ -447,7 +462,7 @@ def evaluate_topic_words(
             llm=llm,
             llm_batch=llm_batch,
             llm_batch_size=llm_batch_size,
-            top_n=sample_size,
+            top_n=top_n,
             sample_size=intruder_sample_size,
             repetitions=repetitions,
             seed=seed,

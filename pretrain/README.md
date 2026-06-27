@@ -138,6 +138,10 @@ PY
 `evaluation.llm_backend: none` disables LLM ratings. Set it to `vllm` when you
 want LLM-assisted topic ratings and have the hardware available.
 
+With `llm_backend: vllm`, CI/CR use the SAE-TM paper protocol by default:
+CR rates all top 20 words, and CI samples 5 of the top 20 words plus one
+intruder word from another topic.
+
 ## Notes
 
 - `chunks -> embeddings` is the recommended text pretraining path. Chunk once,

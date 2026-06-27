@@ -132,6 +132,13 @@ evaluation:
   llm_backend: none
   # LLM used when llm_backend is vllm.
   llm_model: microsoft/phi-4
+  # Paper-aligned CI/CR protocol:
+  # - CR rates the full top_n topic words once by default.
+  # - CI samples n words from the top_n words and adds one intruder.
+  top_n: 20
+  n: 5
+  r: 3
+  cr_r: 1
 
 vision:
   # SAE-TM-style vision flow:

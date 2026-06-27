@@ -2576,35 +2576,36 @@ def run_evaluate(config: dict[str, Any]) -> None:
             }
 
             if llm is not None:
-                k = int(eval_cfg.get("k", 5))
-                n = int(eval_cfg.get("n", 4))
+                top_n = int(eval_cfg.get("top_n", 20))
+                n = int(eval_cfg.get("n", 5))
                 r = int(eval_cfg.get("r", 3))
+                cr_r = int(eval_cfg.get("cr_r", 1))
                 llm_batch_size = int(eval_cfg.get("llm_batch_size", 32))
                 seed = eval_cfg.get("seed")
 
-                cr_total = n_coherence_prompts(topic_words, k, r)
+                cr_total = n_coherence_prompts(topic_words, top_n, cr_r)
                 cr_task = progress.add_task("[magenta]CR judge prompts", total=cr_total)
                 cr = compute_coherence_rating(
                     topic_words,
                     llm=llm,
                     llm_batch=progress_batch_callable(getattr(llm, "batch_coherence", None), progress, cr_task),
                     llm_batch_size=llm_batch_size,
-                    top_n=k,
-                    sample_size=k,
-                    repetitions=r,
+                    top_n=top_n,
+                    sample_size=None,
+                    repetitions=cr_r,
                     seed=seed,
                 )
                 progress.update(cr_task, completed=cr_total)
                 progress.remove_task(cr_task)
 
-                ci_total = n_intruder_prompts(topic_words, k, n, r)
+                ci_total = n_intruder_prompts(topic_words, top_n, n, r)
                 ci_task = progress.add_task("[magenta]CI judge prompts", total=ci_total)
                 ci = compute_intruder_detection(
                     topic_words,
                     llm=llm,
                     llm_batch=progress_batch_callable(getattr(llm, "batch_intruder", None), progress, ci_task),
                     llm_batch_size=llm_batch_size,
-                    top_n=k,
+                    top_n=top_n,
                     sample_size=n,
                     repetitions=r,
                     seed=seed,

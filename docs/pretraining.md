@@ -95,6 +95,10 @@ The config-driven evaluator can compute SAE-TM-style topic metrics from
 ratings. Set it to `vllm` when you want LLM-assisted metrics and have the
 hardware available.
 
+The LLM protocol follows the SAE-TM paper: CR rates the full top 20 topic
+words, and CI repeatedly samples 5 words from the top 20 words before adding
+one intruder from a different topic.
+
 `evaluation.word_embeddings_dir` should point to an SAE-TM-compatible WMD
 cache:
 
