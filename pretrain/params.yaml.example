@@ -109,15 +109,38 @@ topics:
   out_dir: results/text_topics
   # Topic-model datasets. Add more entries for multi-dataset evaluation.
   datasets:
+    - key: news20k
+      hf_dataset: SetFit/20_newsgroups
+      hf_split: train+test
+      remove_metadata: true
     - key: imdb
       hf_dataset: stanfordnlp/imdb
       hf_split: train+test
       text_column: text
       label_column: label
+    - key: yelp
+      hf_dataset: Yelp/yelp_review_full
+      hf_split: test
+      text_column: text
+      label_column: label
+    - key: dailymail
+      hf_dataset: abisee/cnn_dailymail
+      hf_subset: 3.0.0
+      hf_split: train
+      text_column: article
+      label_column: null
   # Number of documents per dataset; 0 means all documents.
   n_docs: 0
   # Topic counts to generate.
   n_topics: [50, 100, 200]
+  # Avoid materializing the full n_docs x n_features dense theta matrix.
+  # This is important for Yelp/DailyMail-scale topic runs.
+  low_memory: true
+  # Paper-style top frequent lemmas per dataset. Set to null/0 for unlimited.
+  vocabulary_size: 5000
+  min_df: 1
+  max_df: 1.0
+  stop_words: saetm
 
 evaluation:
   # Paths containing top_words.txt. null means topics.out_dir.

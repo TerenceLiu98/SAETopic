@@ -123,6 +123,7 @@ def _constructor_config(model: "SAETopicModel") -> dict[str, Any]:
         "drop_empty_topics",
         "stop_words",
         "theta_mode",
+        "low_memory",
     ]
     return {key: _json_safe(getattr(model, key)) for key in keys}
 

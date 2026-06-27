@@ -108,6 +108,11 @@ w2v/
   vocabulary.json
 ```
 
+For large text topic datasets, set `topics.low_memory: true`. The topic
+pipeline keeps dense SAE-TM theta semantics, but does not store the full
+`n_docs x n_features` activation matrix; it recomputes theta in batches when
+building document-topic outputs.
+
 ## Output Hygiene
 
 Change output paths when you change:

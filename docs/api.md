@@ -86,6 +86,7 @@ Attributes ending in `_` are fitted state:
 | `n_topics` | Number of merged topics |
 | `idf_weighting` | Whether corpus adaptation uses IDF weighting |
 | `theta_mode` | `"dense"` for SAE-TM-style dense theta, `"sparse_topk"` for true top-k activations |
+| `low_memory` | Recompute theta in batches instead of storing the full document-feature matrix |
 | `merge_embedding_model` | Optional gensim word vectors for semantic topic merging |
 | `use_ctfidf` | Use c-TF-IDF for display ranking |
 | `min_df`, `max_df`, `vocabulary_size` | Vocabulary filtering |

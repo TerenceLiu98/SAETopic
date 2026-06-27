@@ -103,6 +103,10 @@ class SAETopicModel:
         Drop clusters to which no document is assigned (count == 0) and
         renumber the remaining topics. Disabled by default to preserve the
         requested KMeans topic count, matching SAE-TM's cluster export.
+    low_memory : bool, default=False
+        Avoid storing the full dense document-feature activation matrix during
+        fitting. This keeps dense SAE-TM theta semantics, but recomputes theta
+        in batches when building document-topic outputs.
     """
 
     def __init__(
@@ -132,6 +136,7 @@ class SAETopicModel:
         drop_empty_topics: bool = False,
         stop_words: str | None = "english",
         theta_mode: str = "dense",
+        low_memory: bool = False,
     ):
         self.embedding_model = embedding_model
         self.embedding_task = embedding_task
@@ -158,6 +163,7 @@ class SAETopicModel:
         self.drop_empty_topics = drop_empty_topics
         self.stop_words = stop_words
         self.theta_mode = theta_mode
+        self.low_memory = low_memory
 
         # Pipeline components (set during fit)
         self.sae_: Any = None
@@ -236,6 +242,7 @@ class SAETopicModel:
             "drop_empty_topics",
             "stop_words",
             "theta_mode",
+            "low_memory",
         }
         init_kwargs = {k: v for k, v in kwargs.items() if k in init_keys}
         instance = cls(sae_model=model_id, **init_kwargs)
@@ -344,16 +351,20 @@ class SAETopicModel:
                 "embeddings with the matching dimension."
             )
 
-        # 3. Extract SAE feature activations (topic atoms)
-        from saetopic.sae.activations import extract_activations
+        # 3. Extract SAE feature activations (topic atoms), unless the caller
+        # wants to avoid materializing the large n_docs x n_features matrix.
+        if self.low_memory:
+            self.feature_activations_ = None
+        else:
+            from saetopic.sae.activations import extract_activations
 
-        self.feature_activations_ = extract_activations(
-            self.embeddings_,
-            self.sae_,
-            batch_size=self.activation_batch_size,
-            device=self.device,
-            sparse=(self.theta_mode == "sparse_topk"),
-        )
+            self.feature_activations_ = extract_activations(
+                self.embeddings_,
+                self.sae_,
+                batch_size=self.activation_batch_size,
+                device=self.device,
+                sparse=(self.theta_mode == "sparse_topk"),
+            )
 
         # 4. Build corpus vocabulary and bag-of-words
         self.vectorizer_ = self.vectorizer_model or self._build_vectorizer()
@@ -420,21 +431,35 @@ class SAETopicModel:
         from saetopic.merging import TopicMerger
         from saetopic.representation import TopicRepresentation, compute_ctfidf
 
-        theta = np.asarray(self.feature_activations_, dtype=np.float32)
-        row_sums = theta.sum(axis=1, keepdims=True)
-        theta_normalized = np.divide(
-            theta,
-            np.clip(row_sums, 1e-8, None),
-            out=np.zeros_like(theta),
-            where=row_sums > 0,
-        )
-        if self.theta_avg_ is not None and len(self.theta_avg_) == theta.shape[1]:
+        theta_normalized = None
+        if self.feature_activations_ is not None:
+            theta = np.asarray(self.feature_activations_, dtype=np.float32)
+            row_sums = theta.sum(axis=1, keepdims=True)
+            theta_normalized = np.divide(
+                theta,
+                np.clip(row_sums, 1e-8, None),
+                out=np.zeros_like(theta),
+                where=row_sums > 0,
+            )
+
+        if self.theta_avg_ is not None:
             feature_weights = np.asarray(self.theta_avg_, dtype=np.float32).ravel()
-        else:
+            if (
+                self.feature_word_matrix_ is not None
+                and len(feature_weights) != self.feature_word_matrix_.shape[0]
+            ):
+                raise ValueError(
+                    "theta_avg_ length does not match feature_word_matrix_ rows"
+                )
+        elif theta_normalized is not None:
             feature_weights = theta_normalized.mean(axis=0).ravel()
             feature_weight_sum = feature_weights.sum()
             if feature_weight_sum > 0:
                 feature_weights = feature_weights / feature_weight_sum
+        else:
+            raise RuntimeError(
+                "Cannot fit topics without theta_avg_ or feature_activations_"
+            )
 
         self.merger_ = TopicMerger(
             n_topics=n_topics,
@@ -449,7 +474,12 @@ class SAETopicModel:
 
         self.topic_word_matrix_ = self.merger_.topic_word_matrix_
         self.topic_atom_clusters_ = self.merger_.feature_clusters_
-        self.document_topic_matrix_ = self.merger_.transform(theta_normalized)
+        if theta_normalized is not None:
+            self.document_topic_matrix_ = self.merger_.transform(theta_normalized)
+        else:
+            self.document_topic_matrix_ = self._transform_embeddings_to_topic_matrix(
+                normalize=True
+            )
         self.n_topics = self.merger_.n_topics
 
         # c-TF-IDF topic-word scores (distinctiveness-weighted) for display
@@ -476,6 +506,51 @@ class SAETopicModel:
         self.representation_ = TopicRepresentation(
             display_matrix, self.vocab_, self.document_topic_matrix_
         )
+
+    def _iter_normalized_theta_batches(self):
+        """Yield row-normalized SAE theta batches from stored embeddings."""
+        if self.embeddings_ is None:
+            raise RuntimeError("Document embeddings are not available")
+        self._ensure_sae()
+
+        import torch
+
+        if self.device == "auto":
+            dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            dev = torch.device(self.device)
+        sae_dtype = torch.float32 if dev.type == "cpu" else torch.bfloat16
+        sae = self.sae_.to(dev, dtype=sae_dtype).eval()
+
+        with torch.no_grad():
+            for start in range(0, len(self.embeddings_), self.activation_batch_size):
+                batch_np = np.asarray(
+                    self.embeddings_[start : start + self.activation_batch_size],
+                    dtype=np.float32,
+                )
+                batch = torch.from_numpy(batch_np).to(dev, dtype=sae_dtype)
+                if self.theta_mode == "sparse_topk" and hasattr(sae, "activate"):
+                    h = sae.encode(batch)
+                    theta, _ = sae.activate(h)
+                    theta = theta.float()
+                else:
+                    theta = sae.encode(batch).float()
+
+                row_sums = theta.sum(dim=1, keepdim=True).clamp_min(1e-8)
+                theta = theta / row_sums
+                yield theta.cpu().numpy().astype(np.float32, copy=False)
+
+    def _transform_embeddings_to_topic_matrix(self, normalize: bool = True) -> np.ndarray:
+        """Aggregate batched SAE theta into document-topic probabilities."""
+        if self.merger_ is None:
+            raise RuntimeError("TopicMerger must be fitted before transform")
+        chunks = [
+            self.merger_.transform(theta_batch, normalize=normalize)
+            for theta_batch in self._iter_normalized_theta_batches()
+        ]
+        if not chunks:
+            return np.zeros((0, self.n_topics), dtype=np.float32)
+        return np.concatenate(chunks, axis=0).astype(np.float32, copy=False)
 
     def _drop_empty_topics(self) -> None:
         """Remove topics with zero assigned documents and renumber the rest."""
@@ -604,8 +679,12 @@ class SAETopicModel:
         SAETopicModel
             Self with updated topics
         """
-        if self.feature_word_matrix_ is None or self.feature_activations_ is None:
+        if self.feature_word_matrix_ is None:
             raise RuntimeError("Model must be fitted before retopic")
+        if self.feature_activations_ is None and self.embeddings_ is None:
+            raise RuntimeError(
+                "Model must have feature activations or embeddings before retopic"
+            )
         if method is not None:
             self.cluster_method = method
         self._fit_topics(n_topics)
@@ -729,8 +808,44 @@ class SAETopicModel:
         matches SAE-TM's ``theta_topic_csr.npz`` construction.
         """
         self._require_fitted()
-        if self.feature_activations_ is None or self.topic_atom_clusters_ is None:
-            raise RuntimeError("Feature activations and clusters are not available")
+        if self.topic_atom_clusters_ is None:
+            raise RuntimeError("Feature clusters are not available")
+
+        if self.feature_activations_ is None:
+            from scipy import sparse as sp
+
+            if not sparse:
+                return self._transform_embeddings_to_topic_matrix(normalize=normalize)
+
+            clusters = np.asarray(self.topic_atom_clusters_, dtype=np.int32)
+            valid_features = np.where(clusters >= 0)[0].astype(np.int32)
+            mapping_cols = clusters[valid_features]
+            n_features = len(clusters)
+            mapping = sp.csr_matrix(
+                (
+                    np.ones(len(valid_features), dtype=np.float32),
+                    (valid_features, mapping_cols),
+                ),
+                shape=(n_features, self.n_topics),
+            )
+            rows = [
+                sp.csr_matrix(theta_batch) @ mapping
+                for theta_batch in self._iter_normalized_theta_batches()
+            ]
+            theta_topic = sp.vstack(rows).tocsr() if rows else sp.csr_matrix((0, self.n_topics))
+            if normalize:
+                row_sums = np.asarray(theta_topic.sum(axis=1)).ravel()
+                inv = np.divide(
+                    1.0,
+                    row_sums,
+                    out=np.zeros_like(row_sums, dtype=np.float32),
+                    where=row_sums > 0,
+                )
+                theta_topic = sp.diags(inv) @ theta_topic
+            return theta_topic
+
+        if self.feature_activations_ is None:
+            raise RuntimeError("Feature activations are not available")
 
         theta = np.asarray(self.feature_activations_, dtype=np.float32)
         row_sums = theta.sum(axis=1, keepdims=True)

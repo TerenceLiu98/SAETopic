@@ -146,6 +146,10 @@ intruder word from another topic.
 
 - `chunks -> embeddings` is the recommended text pretraining path. Chunk once,
   embed once, and reuse the saved embedding shards for SAE sweeps.
+- For large topic datasets such as Yelp and DailyMail, keep
+  `topics.low_memory: true`. This avoids storing the full dense
+  `n_docs x n_features` theta matrix; theta is recomputed in batches when
+  writing document-topic outputs and when calling `retopic`.
 - `chunks.sanitize_urls: true` prevents Jina omni from treating FineWiki URLs
   as image/video/audio/PDF inputs.
 - `embeddings.chunk_size` controls embeddings per shard. It does not control

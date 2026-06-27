@@ -42,6 +42,7 @@ def test_build_topic_model_forwards_topics_idf_weighting(monkeypatch, tmp_path):
             "theta_mode": "dense",
             "max_seq_length": 1024,
             "use_ctfidf": False,
+            "low_memory": True,
             "merge_embedding_model": "word2vec-google-news-300",
             "device": "cpu",
         },
@@ -50,6 +51,7 @@ def test_build_topic_model_forwards_topics_idf_weighting(monkeypatch, tmp_path):
     pretrain_run.build_topic_model(config, n_topics=100)
 
     assert captured["kwargs"]["idf_weighting"] is True
+    assert captured["kwargs"]["low_memory"] is True
 
 
 def test_save_topic_outputs_orders_topics_by_cluster_size(tmp_path):

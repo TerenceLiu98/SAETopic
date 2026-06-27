@@ -2301,6 +2301,7 @@ def build_topic_model(config: dict[str, Any], n_topics: int) -> SAETopicModel:
         max_seq_length=int(topic_cfg.get("max_seq_length", 512)),
         use_ctfidf=bool(topic_cfg.get("use_ctfidf", False)),
         drop_empty_topics=False,
+        low_memory=bool(topic_cfg.get("low_memory", True)),
         random_state=get_seed(config),
         device=topic_cfg.get("device", "auto"),
     )

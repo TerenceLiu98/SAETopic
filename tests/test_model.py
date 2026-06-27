@@ -133,6 +133,41 @@ def test_fit_transform_shapes():
     assert model.document_topic_matrix_.shape == (n_docs, 5)
 
 
+def test_low_memory_fit_skips_full_feature_activations():
+    """low_memory avoids storing n_docs x n_features theta but keeps outputs."""
+    sae = BatchTopKSAE(input_dim=DIM, n_features=NFEAT, top_k=TOPK)
+    sae.eval()
+    model = SAETopicModel(
+        embedding_model=_fake_embedder_factory(),
+        sae_model=sae,
+        n_topics=5,
+        corpus_adapter_epochs=2,
+        corpus_adapter_batch_size=32,
+        activation_batch_size=16,
+        min_df=1,
+        drop_empty_topics=False,
+        low_memory=True,
+        device="cpu",
+    )
+    docs = _docs()
+
+    topics, probs = model.fit_transform(docs)
+
+    assert len(topics) == len(docs)
+    assert probs.shape == (len(docs), 5)
+    assert model.feature_activations_ is None
+    assert model.theta_avg_.shape == (NFEAT,)
+    assert model.document_topic_matrix_.shape == (len(docs), 5)
+
+    dense = model.get_theta_topic_matrix(normalize=False, sparse=False)
+    sparse = model.get_theta_topic_matrix(normalize=False, sparse=True)
+    assert sparse.shape == dense.shape == (len(docs), 5)
+    assert np.allclose(sparse.toarray(), dense, atol=1e-6)
+
+    model.retopic(n_topics=3)
+    assert model.document_topic_matrix_.shape == (len(docs), 3)
+
+
 def test_fit_returns_self():
     """fit returns the fitted model instance."""
     model = _make_model(n_topics=4)
